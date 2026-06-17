@@ -3,6 +3,19 @@ import subprocess
 import shutil
 import time
 import sys
+import serial
+import csv
+
+def save_benchmark_result(name, duration_ms):
+    filename = "pqc_benchmark_results.csv"
+    file_exists = os.path.isfile(filename)
+    
+    with open(filename, 'a', newline='') as f:
+        writer = csv.writer(f)
+        if not file_exists:
+            writer.writerow(["Benchmark_Name", "Duration_MS", "Timestamp"])
+        writer.writerow([name, duration_ms, time.strftime("%Y-%m-%d %H:%M:%S")])
+    print(f"[DATA] Result saved to {filename}")
 
 # ====================================================================
 # CONFIGURATION
@@ -19,28 +32,28 @@ BROKER_CONTAINER_NAME = "mosquitto_pqc"
 # Lock the output dir strictly to your peripheral folder
 OUTPUT_DIR = os.path.join(NRF_PROJECT_DIR, "generated_certs")
 
-BENCHMARK_SUITE = [
-    # The Control
-    #{"name": "diag_1_control_768", "macro": "WOLFSSL_P384_ML_KEM_768", "openssl_group": "p384_mlkem768"}, 
-    
-    # The Pure P-521 Curve
-    #{"name": "diag_2_pure_p521", "macro": "WOLFSSL_ECC_SECP521R1", "openssl_group": "P-521"},    
-    
-    # The Pure Level 5 KEM
-    {"name": "diag_3_pure_kem1024", "macro": "WOLFSSL_ML_KEM_1024", "openssl_group": "mlkem1024"},   
-    
-    # The Pure Level 3 KEM
-    #{"name": "diag_4_pure_kem768", "macro": "WOLFSSL_ML_KEM_768", "openssl_group": "mlkem768"}     
+KEMS = [
+    {"name": "MLKEM512", "macro": "WOLFSSL_ML_KEM_512", "group": "mlkem512"},
+    {"name": "MLKEM768", "macro": "WOLFSSL_ML_KEM_768", "group": "mlkem768"},
+    {"name": "MLKEM1024", "macro": "WOLFSSL_ML_KEM_1024", "group": "mlkem1024"},
 ]
 
-ALGO_CONFIG = {
-    # Map all diagnostic tests to the known-working Level 2 Certificate
-    "diag_1_control_768":  {"prefix": "diag1", "key_type": "mldsa44"},
-    "diag_2_pure_p521":    {"prefix": "diag2", "key_type": "mldsa44"},
-    "diag_3_pure_kem1024": {"prefix": "diag3", "key_type": "mldsa44"},
-    "diag_4_pure_kem768":  {"prefix": "diag4", "key_type": "mldsa44"}
-}
+SIGS = [
+    {"name": "ML-DSA-44", "key_type": "mldsa44"},
+    #{"name": "ML-DSA-65", "key_type": "mldsa65"},
+    {"name": "ML-DSA-87", "key_type": "mldsa87"},
+]
 
+# Generate the full matrix
+BENCHMARK_SUITE = []
+for kem in KEMS:
+    for sig in SIGS:
+        BENCHMARK_SUITE.append({
+            "name": f"{kem['name']}_{sig['name']}",
+            "macro": kem['macro'],
+            "openssl_group": f"{kem['group']}:{sig['key_type']}",
+            "key_type": sig['key_type']
+        })
 
 # ====================================================================
 
@@ -99,7 +112,7 @@ def format_pem_to_c_header(pem_filepath, header_filepath, var_name, include_guar
                 f.write(f'"{clean_line}\\n"\n')
         f.write(";\n\n#endif\n")
 
-def generate_certificates(algo_name):
+def generate_certificates(algo_entry):
     # Lookup parameters
 
     if os.path.exists(OUTPUT_DIR):
@@ -107,14 +120,9 @@ def generate_certificates(algo_name):
             if f.endswith(('.crt', '.key', '.csr')):
                 os.remove(os.path.join(OUTPUT_DIR, f))
 
-    params = ALGO_CONFIG.get(algo_name)
-    if not params:
-        print(f"[ERROR] {algo_name} not found in ALGO_CONFIG!")
-        exit(1)
-        
-    prefix = params['prefix']
-    
-    print(f"\n--- STEP 1: GENERATING {algo_name.upper()} CERTIFICATES ---")
+    key_type = algo_entry['key_type']
+
+    print(f"\n--- STEP 1: GENERATING {algo_entry['name'].upper()} CERTIFICATES ---")
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     
     run_cmd(["docker", "rm", "-f", CERT_CONTAINER_NAME], ignore_errors=True)
@@ -122,17 +130,17 @@ def generate_certificates(algo_name):
     
     try:
 
-        print(f"Generating {algo_name} Certificates...")
+        print(f"Generating {algo_entry['name']} Certificates...")
         # CA
-        run_cmd(["docker", "exec", CERT_CONTAINER_NAME, "openssl", "req", "-x509", "-new", "-newkey", params['key_type'], 
+        run_cmd(["docker", "exec", CERT_CONTAINER_NAME, "openssl", "req", "-x509", "-new", "-newkey", key_type,
                  "-keyout", "/tmp/ca.key", "-out", "/tmp/ca.crt", "-nodes", "-subj", "/CN=PQC_Root", "-days", "365"])
         # Client
-        run_cmd(["docker", "exec", CERT_CONTAINER_NAME, "openssl", "req", "-new", "-newkey", params['key_type'], 
+        run_cmd(["docker", "exec", CERT_CONTAINER_NAME, "openssl", "req", "-new", "-newkey", key_type,
                  "-keyout", "/tmp/client.key", "-out", "/tmp/client.csr", "-nodes", "-subj", "/CN=nrf5340"])
         run_cmd(["docker", "exec", CERT_CONTAINER_NAME, "openssl", "x509", "-req", "-in", "/tmp/client.csr", 
                  "-CA", "/tmp/ca.crt", "-CAkey", "/tmp/ca.key", "-CAcreateserial", "-out", "/tmp/client.crt", "-days", "365"])
         # Server
-        run_cmd(["docker", "exec", CERT_CONTAINER_NAME, "openssl", "req", "-new", "-newkey", params['key_type'], 
+        run_cmd(["docker", "exec", CERT_CONTAINER_NAME, "openssl", "req", "-new", "-newkey", key_type,
                  "-keyout", "/tmp/server.key", "-out", "/tmp/server.csr", "-nodes", "-subj", "/CN=localhost"])
         run_cmd(["docker", "exec", CERT_CONTAINER_NAME, "openssl", "x509", "-req", "-in", "/tmp/server.csr", 
                  "-CA", "/tmp/ca.crt", "-CAkey", "/tmp/ca.key", "-CAcreateserial", "-out", "/tmp/server.crt", "-days", "365"])
@@ -144,10 +152,7 @@ def generate_certificates(algo_name):
     finally:
         run_cmd(["docker", "rm", "-f", CERT_CONTAINER_NAME], ignore_errors=True)
 
-def update_nrf_source(algo_name):
-    # Lookup prefix safely
-    prefix = ALGO_CONFIG[algo_name]['prefix']
-    
+def update_nrf_source():
     cert_pem_path = os.path.join(OUTPUT_DIR, "client.crt")
     key_pem_path = os.path.join(OUTPUT_DIR, "client.key")
     cert_h_path = os.path.join(SRC_DIR, "client_cert.h")
@@ -155,7 +160,7 @@ def update_nrf_source(algo_name):
     
     format_pem_to_c_header(cert_pem_path, cert_h_path, "client_pem", "CLIENT_CERT_H")
     format_pem_to_c_header(key_pem_path, key_h_path, "client_key_pem", "CLIENT_KEY_H")
-    print(f"[SUCCESS] Updated {cert_h_path} and {key_h_path} for {prefix}")
+    print(f"[SUCCESS] Updated {cert_h_path} and {key_h_path}")
 
 def generate_openssl_conf(openssl_group_string):
     """Dynamically writes an openssl.cnf file to force Mosquitto to allow specific math."""
@@ -265,7 +270,7 @@ def build_and_flash(pqc_macro):
 
 if __name__ == "__main__":
     ensure_docker_running()
-    
+
     # Ensure BENCHMARK_SUITE is a list of dictionaries
     for algo in BENCHMARK_SUITE:
         # Check if 'algo' is actually a dict
@@ -277,16 +282,63 @@ if __name__ == "__main__":
         print(f"🚀 RUNNING BENCHMARK: {algo['name']}")
         print(f"========================================================")
         
-        generate_certificates(algo['name']) 
-        update_nrf_source(algo['name'])
+        generate_certificates(algo) 
+        update_nrf_source()
         generate_openssl_conf(algo['openssl_group'])
         start_mosquitto_broker()
         build_and_flash(algo['macro'])
-        xcode_app_proc = subprocess.Popen(["/Users/vbalves/Library/Developer/Xcode/DerivedData/BLE_MQTT_Proxy-cngfofzxuvkznrbiaybihnftqwuz/Build/Products/Debug/BLE_MQTT_Proxy"])
-        input(">>> Press ENTER to start the benchmark, or Ctrl+C to abort...")
+        
+        # 1. THE USB BOUNCE DELAY
+        # Give the board 5 seconds to boot Zephyr and re-mount its USB drive to macOS
+        print("\n[WAITING] Allowing nRF5340 to boot and USB to enumerate...")
+        time.sleep(5) 
+        
+        # 2. OPEN THE SERIAL PORT FIRST (Before starting the handshake!)
+        ser = None
+        for attempt in range(5):
+            try:
+                ser = serial.Serial('/dev/tty.usbmodem0010500327223', 115200, timeout=5)
+                break 
+            except serial.SerialException as e:
+                print(f"[-] Serial port not ready, retrying in 2 seconds... ({e})")
+                time.sleep(2)
+                
+        if not ser:
+            print("[CRITICAL] Could not open serial port after 5 attempts. Skipping...")
+            continue
 
-        # Send the disconnect command to the nRF5340 via Mosquitto
-        print("Sending disconnect signal to nRF5340...")
+        # Clear any garbage binary from the boot sequence
+        ser.reset_input_buffer()
+
+        # 3. NOW LAUNCH THE MAC GATEWAY TO START THE HANDSHAKE
+        print("[LAUNCHING] Starting Swift BLE Proxy...")
+        xcode_app_proc = subprocess.Popen(["/Users/vbalves/Library/Developer/Xcode/DerivedData/BLE_MQTT_Proxy-cngfofzxuvkznrbiaybihnftqwuz/Build/Products/Debug/BLE_MQTT_Proxy"])
+
+        # 4. CAPTURE THE RESULT
+        print("\n[LISTENING] Waiting for Zephyr to finish the handshake...")
+        handshake_time = "TIMEOUT/CRASH"
+        start_wait = time.time()
+        
+        while time.time() - start_wait < 60:
+            try:
+                line = ser.readline().decode('utf-8', errors='ignore').strip()
+                
+                if line:
+                    print(f"[NRF5340] {line}")
+                    
+                # THE FIX: Match the exact string from your Zephyr C-Code
+                if "Handshake_Time_MS:" in line: 
+                    handshake_time = line.split(":")[1].strip()
+                    break
+            except serial.SerialException:
+                print("[-] Board disconnected mid-read! It likely suffered a HardFault.")
+                break
+
+        # 5. SAVE AND CLEANUP
+        save_benchmark_result(algo['name'], handshake_time)
+        ser.close()
+
+        print("\nSending disconnect signal to nRF5340...")
         run_cmd([
             "docker", "exec", BROKER_CONTAINER_NAME, "mosquitto_pub",
             "-h", "localhost", "-p", "8883",
@@ -294,7 +346,12 @@ if __name__ == "__main__":
             "--cert", "/mosquitto/config/server.crt",
             "--key", "/mosquitto/config/server.key",
             "-t", "nrf5340/cmd", "-m", "disconnect"
-        ])
-        time.sleep(5) # Give the board 5s to close the channel
+        ], ignore_errors=True)
+        
+        time.sleep(5) 
         xcode_app_proc.terminate()
+        
         print(f"✅ {algo['name']} Benchmark Complete.")
+        
+        print("Cooling down radio before next test...\n")
+        time.sleep(8)

@@ -69,7 +69,8 @@
 #undef NO_SHA
 #define HAVE_RSA
 #define WOLFSSL_SHA1
-#define HAVE_ED25519
+/* #define HAVE_ED25519 */
+#define HAVE_ECC521
 
 #define HAVE_PQC
 #define HAVE_DILITHIUM
