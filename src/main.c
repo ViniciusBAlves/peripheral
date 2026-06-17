@@ -47,6 +47,10 @@ static const struct gpio_dt_spec led = GPIO_DT_SPEC_GET(LED0_NODE, gpios);
 #define HAS_STATUS_LED 0
 #endif
 
+#ifndef TARGET_PQC_GROUP
+    #define TARGET_PQC_GROUP WOLFSSL_P384_MLKEM_768 // Default fallback
+#endif
+
 #define HEARTBEAT_INTERVAL_MS 30000 // 30 Seconds
 #define TIMEOUT_THRESHOLD_MS  45000 // 45 Seconds
 
@@ -74,10 +78,13 @@ static struct net_buf *my_l2cap_alloc_buf(struct bt_l2cap_chan *chan) {
 }
 
 static int my_l2cap_recv(struct bt_l2cap_chan *chan, struct net_buf *buf) {
+    printk("[L2CAP RX] Hardware received %d bytes from Mac!\n", buf->len);
+    
     uint32_t written = ring_buf_put(&my_rx_ringbuf, buf->data, buf->len);
     if (written < buf->len) {
-        printk("Warning: RX ring buffer overflowed!\n");
+        printk(">>> WARNING: RX ring buffer overflowed! Lost %d bytes <<<\n", buf->len - written);
     }
+    
     k_sem_give(&rx_sem);
     return 0; /* Return 0 to indicate we consumed the data */
 }
@@ -119,9 +126,14 @@ static void handle_command(const byte *payload, word32 len)
 		}
 #endif
 	}
-    // else if (strcmp(msg, "ping") == 0) {
-	//	ping_requested = true;
-	// }
+    else if (strcmp(msg, "disconnect") == 0) {
+        printk(">>> Graceful disconnect command received. Closing L2CAP...\n");
+        bt_l2cap_chan_disconnect(&my_chan.chan);
+
+        if (my_chan.chan.conn) {
+            bt_conn_disconnect(my_chan.chan.conn, BT_HCI_ERR_REMOTE_USER_TERM_CONN);
+        }
+    }
 }
 
 static int my_l2cap_accept(struct bt_conn *conn, struct bt_l2cap_server *server, struct bt_l2cap_chan **chan);
@@ -227,14 +239,15 @@ void start_secure_mqtt_session(struct bt_l2cap_chan *chan) {
     ctx = wolfSSL_CTX_new(wolfTLSv1_3_client_method());
     if (!ctx) return;
 
-    wolfSSL_Debugging_ON();
+    //wolfSSL_Debugging_ON();
 
     /* Security: Ensure we are using modern PQC/ECC ciphers */
     wolfSSL_CTX_set_verify(ctx, WOLFSSL_VERIFY_NONE, NULL);
 
-    int pqc_groups[] = { WOLFSSL_P384_ML_KEM_768 };
-    
-    ret = wolfSSL_CTX_set_groups(ctx, pqc_groups, 1);
+    int pqc_groups[] = { TARGET_PQC_GROUP, WOLFSSL_ECC_SECP256R1 };
+
+    ret = wolfSSL_CTX_set_groups(ctx, pqc_groups, 2);
+
     if (ret != WOLFSSL_SUCCESS) {
         printk("Failed to set PQC Key Exchange group!\n");
     }
@@ -262,6 +275,8 @@ void start_secure_mqtt_session(struct bt_l2cap_chan *chan) {
     
     ssl = wolfSSL_new(ctx);
     if (!ssl) { wolfSSL_CTX_free(ctx); return; }
+
+    wolfSSL_UseSNI(ssl, WOLFSSL_SNI_HOST_NAME, "localhost", 9);
 
     wolfSSL_SetIOReadCtx(ssl, chan);
     wolfSSL_SetIOWriteCtx(ssl, chan);
@@ -302,7 +317,7 @@ void start_secure_mqtt_session(struct bt_l2cap_chan *chan) {
 
     wolfSSL_write(ssl, mqtt_connect_pkt, sizeof(mqtt_connect_pkt));
 
-    /* Active Application Loop */
+/* Active Application Loop */
     unsigned char rx_buf[128];
     int64_t last_activity = k_uptime_get();
 
@@ -313,9 +328,12 @@ void start_secure_mqtt_session(struct bt_l2cap_chan *chan) {
         if (bytes_read > 0) {
             last_activity = k_uptime_get(); // Reset timer on any data
             
-            /* 1. Catch CONNACK and send SUBSCRIBE */
+            printk("[MQTT RX] Decrypted %d bytes: [0x%02X 0x%02X 0x%02X 0x%02X]\n", 
+                   bytes_read, rx_buf[0], rx_buf[1], rx_buf[2], rx_buf[3]);
+            
+            /* 1. Catch CONNACK (0x20) and send SUBSCRIBE */
             if (rx_buf[0] == 0x20) {
-                printk("Broker accepted connection! Subscribing to topic...\n");
+                printk(">>> Broker accepted connection! Subscribing to topic...\n");
                 
                 unsigned char mqtt_subscribe_pkt[] = {
                     0x82, 0x10,                 // Header: Subscribe (0x82), Length 16
@@ -327,8 +345,8 @@ void start_secure_mqtt_session(struct bt_l2cap_chan *chan) {
                 wolfSSL_write(ssl, mqtt_subscribe_pkt, sizeof(mqtt_subscribe_pkt));
             } 
             /* 2. Catch PUBLISH (Incoming Commands) */
-            else if (rx_buf[0] == 0x30) {
-                printk("Received command from broker!\n");
+            else if ((rx_buf[0] & 0xF0) == 0x30) {
+                printk(">>> Received command from broker!\n");
                 
                 // Parse the payload out of the packet
                 uint16_t topic_len = (rx_buf[2] << 8) | rx_buf[3];
@@ -339,7 +357,7 @@ void start_secure_mqtt_session(struct bt_l2cap_chan *chan) {
             } 
             /* 3. Catch PINGRESP */
             else if (rx_buf[0] == 0xD0) {
-                printk("Ping acknowledged.\n");
+                printk(">>> Ping acknowledged by broker.\n");
             }
         }
         else if (bytes_read < 0) {
@@ -366,7 +384,8 @@ void start_secure_mqtt_session(struct bt_l2cap_chan *chan) {
             break;
         }
 
-        k_sleep(K_MSEC(100));
+        /* Yield the CPU to allow the BT stack to process incoming L2CAP frames */
+        k_sleep(K_MSEC(50));
     }
 
     printk("Closing Secure Session.\n");

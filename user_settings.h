@@ -71,7 +71,14 @@
 #define WOLFSSL_SHA1
 #define HAVE_ED25519
 
-#define DEBUG_WOLFSSL
+#define HAVE_PQC
+#define HAVE_DILITHIUM
+#define HAVE_MLDSA
+#define WOLFSSL_HAVE_MLDSA
+#define WOLFSSL_MLDSA
+#define HAVE_SNI
+
+/* #define DEBUG_WOLFSSL */
 
 /* Safely undefine min/max for wolfSSL files (Will no longer break Zephyr) */
 #undef min
