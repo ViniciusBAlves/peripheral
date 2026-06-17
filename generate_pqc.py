@@ -20,16 +20,25 @@ BROKER_CONTAINER_NAME = "mosquitto_pqc"
 OUTPUT_DIR = os.path.join(NRF_PROJECT_DIR, "generated_certs")
 
 BENCHMARK_SUITE = [
-    {"name": "mldsa_kem768", "macro": "WOLFSSL_P384_ML_KEM_768"},
-    {"name": "mldsa_kem1024", "macro": "WOLFSSL_P521_ML_KEM_1024"},
-    {"name": "mlkem_512", "macro": "WOLFSSL_KYBER_LEVEL1"}
+    # The Control
+    #{"name": "diag_1_control_768", "macro": "WOLFSSL_P384_ML_KEM_768", "openssl_group": "p384_mlkem768"}, 
+    
+    # The Pure P-521 Curve
+    #{"name": "diag_2_pure_p521", "macro": "WOLFSSL_ECC_SECP521R1", "openssl_group": "P-521"},    
+    
+    # The Pure Level 5 KEM
+    {"name": "diag_3_pure_kem1024", "macro": "WOLFSSL_ML_KEM_1024", "openssl_group": "mlkem1024"},   
+    
+    # The Pure Level 3 KEM
+    #{"name": "diag_4_pure_kem768", "macro": "WOLFSSL_ML_KEM_768", "openssl_group": "mlkem768"}     
 ]
 
 ALGO_CONFIG = {
-    "mldsa_kem768":  {"prefix": "mldsa", "key_type": "mldsa44"},
-    "mldsa_kem1024": {"prefix": "mldsa", "key_type": "mldsa44"},
-    "mlkem_512":     {"prefix": "mlkem", "key_type": "mlkem512"},
-    "ed25519":       {"prefix": "ed",    "key_type": "ed25519"}
+    # Map all diagnostic tests to the known-working Level 2 Certificate
+    "diag_1_control_768":  {"prefix": "diag1", "key_type": "mldsa44"},
+    "diag_2_pure_p521":    {"prefix": "diag2", "key_type": "mldsa44"},
+    "diag_3_pure_kem1024": {"prefix": "diag3", "key_type": "mldsa44"},
+    "diag_4_pure_kem768":  {"prefix": "diag4", "key_type": "mldsa44"}
 }
 
 
@@ -148,19 +157,56 @@ def update_nrf_source(algo_name):
     format_pem_to_c_header(key_pem_path, key_h_path, "client_key_pem", "CLIENT_KEY_H")
     print(f"[SUCCESS] Updated {cert_h_path} and {key_h_path} for {prefix}")
 
+def generate_openssl_conf(openssl_group_string):
+    """Dynamically writes an openssl.cnf file to force Mosquitto to allow specific math."""
+    conf_path = os.path.join(OUTPUT_DIR, "openssl.cnf")
+    print(f"[CONFIG] Generating custom openssl.cnf for group: {openssl_group_string}")
+    
+    conf_content = f"""openssl_conf = openssl_init
+
+[openssl_init]
+providers = provider_sect
+ssl_conf = ssl_sect
+
+[provider_sect]
+default = default_sect
+oqsprovider = oqsprovider_sect
+
+[default_sect]
+activate = 1
+
+[oqsprovider_sect]
+activate = 1
+
+[ssl_sect]
+system_default = system_default_sect
+
+[system_default_sect]
+MinProtocol = TLSv1.3
+Groups = {openssl_group_string}
+"""
+    with open(conf_path, "w") as f:
+        f.write(conf_content)
+
 def start_mosquitto_broker():
     print("\n--- STEP 3: STARTING PQC MOSQUITTO BROKER ---")
     run_cmd(["docker", "rm", "-f", BROKER_CONTAINER_NAME], ignore_errors=True)
     
-    # All paths now point to generic filenames
     run_cmd([
         "docker", "run", "-d", "--name", BROKER_CONTAINER_NAME,
         "-p", "8883:8883",
+        
+        # THE BACKDOOR: Tell OpenSSL where to find our custom rules
+        "-e", "OPENSSL_CONF=/mosquitto/config/openssl.cnf",
+        
+        # Map all the standard certs PLUS our new openssl.cnf
         "-v", f"{os.path.join(OUTPUT_DIR, 'mosquitto.conf')}:/mosquitto/config/mosquitto.conf",
         "-v", f"{os.path.join(OUTPUT_DIR, 'passwd')}:/mosquitto/config/passwd",
         "-v", f"{os.path.join(OUTPUT_DIR, 'ca.crt')}:/mosquitto/config/ca.crt",
         "-v", f"{os.path.join(OUTPUT_DIR, 'server.crt')}:/mosquitto/config/server.crt",
         "-v", f"{os.path.join(OUTPUT_DIR, 'server.key')}:/mosquitto/config/server.key",
+        "-v", f"{os.path.join(OUTPUT_DIR, 'openssl.cnf')}:/mosquitto/config/openssl.cnf",
+        
         "openquantumsafe/mosquitto", 
         "mosquitto", "-c", "/mosquitto/config/mosquitto.conf", "-v"
     ])
@@ -179,6 +225,23 @@ def build_and_flash(pqc_macro):
     env = os.environ.copy()
     env["ZEPHYR_BASE"] = zephyr_base
     
+    # ================================================================
+    # DYNAMIC INJECTION LOGIC
+    # ================================================================
+    # 1. Start with the baseline macro
+    extra_cflags = f"-DTARGET_PQC_GROUP={pqc_macro}"
+    
+    if "521" in pqc_macro:
+        print("[INFO] Target is Level 5 Security. Injecting -DHAVE_ECC521...")
+        extra_cflags += " -DHAVE_ECC521"
+    elif "384" in pqc_macro:
+        print("[INFO] Target is Level 3 Security. Injecting -DHAVE_ECC384...")
+        extra_cflags += " -DHAVE_ECC384"        
+    if "ed25519" in pqc_macro.lower():
+        print("[INFO] Target is Ed25519. Injecting -DHAVE_ED25519...")
+        extra_cflags += " -DHAVE_ED25519 -DHAVE_CURVE25519"
+    # ================================================================
+    
     build_cmd = [
         nordic_python, "-m", "west", "-z", zephyr_base, "build",
         "-p", "always",
@@ -186,7 +249,7 @@ def build_and_flash(pqc_macro):
         "--sysbuild",
         "--", 
         f"-DEXTRA_CONF_FILE=sysbuild/hci_ipc.conf",
-        f"-DEXTRA_CFLAGS=-DTARGET_PQC_GROUP={pqc_macro}" # This injects the C-macro
+        f"-DEXTRA_CFLAGS={extra_cflags}" # Pass the fully constructed flag string
     ]
     
     print(f"\n[RUNNING] {' '.join(build_cmd)}")
@@ -216,6 +279,7 @@ if __name__ == "__main__":
         
         generate_certificates(algo['name']) 
         update_nrf_source(algo['name'])
+        generate_openssl_conf(algo['openssl_group'])
         start_mosquitto_broker()
         build_and_flash(algo['macro'])
         xcode_app_proc = subprocess.Popen(["/Users/vbalves/Library/Developer/Xcode/DerivedData/BLE_MQTT_Proxy-cngfofzxuvkznrbiaybihnftqwuz/Build/Products/Debug/BLE_MQTT_Proxy"])

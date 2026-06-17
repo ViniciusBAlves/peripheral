@@ -171,6 +171,8 @@ int my_l2cap_wolfssl_send(WOLFSSL* ssl, char* buf, int sz, void* ctx) {
     uint16_t mtu = le_chan->tx.mtu;
     if (mtu == 0) mtu = 23; 
 
+    printk("[WOLFSSL TX] Attempting to send TLS payload of %d bytes...\n", sz);
+
     while (sent < sz) {
         int chunk = sz - sent;
         if (chunk > mtu) { chunk = mtu; }
@@ -198,6 +200,7 @@ int my_l2cap_wolfssl_send(WOLFSSL* ssl, char* buf, int sz, void* ctx) {
             
             if (err == -EAGAIN || err == -ENOMEM) {
                 /* The radio is full. We lost tx_buf. Sleep and rebuild it. */
+                printk("[TX WARNING] BLE Queue Full. Waiting to retry...\n");
                 k_sleep(K_MSEC(10));
             } else if (err < 0) {
                 /* Fatal error, connection likely dead */
