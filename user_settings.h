@@ -80,6 +80,8 @@
 #define HAVE_SNI
 
 /* #define DEBUG_WOLFSSL */
+#define WOLFSSL_DEBUG_MEMORY
+#define WOLFSSL_TRACK_MEMORY
 
 /* Safely undefine min/max for wolfSSL files (Will no longer break Zephyr) */
 #undef min

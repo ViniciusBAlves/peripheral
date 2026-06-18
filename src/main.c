@@ -317,6 +317,7 @@ void start_secure_mqtt_session(struct bt_l2cap_chan *chan) {
         ret = wolfSSL_connect(ssl);
         if (ret != WOLFSSL_SUCCESS) {
             int err = wolfSSL_get_error(ssl, ret);
+            printk("wolfSSL error = %d\n", err);
             if (err == WOLFSSL_ERROR_WANT_READ || err == WOLFSSL_ERROR_WANT_WRITE) {
                 wait_counter++;
                 if (wait_counter % 20 == 0) {

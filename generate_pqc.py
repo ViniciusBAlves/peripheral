@@ -39,9 +39,12 @@ KEMS = [
 ]
 
 SIGS = [
-    {"name": "ML-DSA-44", "key_type": "mldsa44"},
-    #{"name": "ML-DSA-65", "key_type": "mldsa65"},
-    {"name": "ML-DSA-87", "key_type": "mldsa87"},
+    # Classical Baseline Signatures
+    {"name": "ECDSA-P-256", "key_gen": "ec:prime256v1", "ssl_group": "P-256"},
+    # Post-Quantum Signatures
+    {"name": "ML-DSA-44", "key_gen": "mldsa44", "ssl_group": "mldsa44"},
+    {"name": "ML-DSA-65", "key_gen": "mldsa65", "ssl_group": "mldsa65"},
+    {"name": "ML-DSA-87", "key_gen": "mldsa87", "ssl_group": "mldsa87"},
 ]
 
 # Generate the full matrix
@@ -51,8 +54,10 @@ for kem in KEMS:
         BENCHMARK_SUITE.append({
             "name": f"{kem['name']}_{sig['name']}",
             "macro": kem['macro'],
-            "openssl_group": f"{kem['group']}:{sig['key_type']}",
-            "key_type": sig['key_type']
+            # This safely writes "mlkem512:P-256" into the mosquitto openssl.cnf
+            "openssl_group": f"{kem['group']}:{sig['ssl_group']}",
+            # This safely passes "ec:prime256v1" to the docker openssl req commands
+            "key_type": sig['key_gen'] 
         })
 
 # ====================================================================
@@ -113,14 +118,20 @@ def format_pem_to_c_header(pem_filepath, header_filepath, var_name, include_guar
         f.write(";\n\n#endif\n")
 
 def generate_certificates(algo_entry):
-    # Lookup parameters
-
     if os.path.exists(OUTPUT_DIR):
         for f in os.listdir(OUTPUT_DIR):
             if f.endswith(('.crt', '.key', '.csr')):
                 os.remove(os.path.join(OUTPUT_DIR, f))
 
     key_type = algo_entry['key_type']
+
+    # --- THE FIX: OpenSSL 3.0 Classical Curve Handling ---
+    if key_type.startswith("ec:"):
+        curve_name = key_type.split(":")[1] # Extracts 'prime256v1'
+        key_args = ["-newkey", "ec", "-pkeyopt", f"ec_paramgen_curve:{curve_name}"]
+    else:
+        # Passes PQC keys (like 'mldsa44') normally
+        key_args = ["-newkey", key_type]
 
     print(f"\n--- STEP 1: GENERATING {algo_entry['name'].upper()} CERTIFICATES ---")
     os.makedirs(OUTPUT_DIR, exist_ok=True)
@@ -129,18 +140,18 @@ def generate_certificates(algo_entry):
     run_cmd(["docker", "run", "-d", "--name", CERT_CONTAINER_NAME, DOCKER_IMAGE, "tail", "-f", "/dev/null"])
     
     try:
-
         print(f"Generating {algo_entry['name']} Certificates...")
+        
         # CA
-        run_cmd(["docker", "exec", CERT_CONTAINER_NAME, "openssl", "req", "-x509", "-new", "-newkey", key_type,
+        run_cmd(["docker", "exec", CERT_CONTAINER_NAME, "openssl", "req", "-x509", "-new"] + key_args + [
                  "-keyout", "/tmp/ca.key", "-out", "/tmp/ca.crt", "-nodes", "-subj", "/CN=PQC_Root", "-days", "365"])
         # Client
-        run_cmd(["docker", "exec", CERT_CONTAINER_NAME, "openssl", "req", "-new", "-newkey", key_type,
+        run_cmd(["docker", "exec", CERT_CONTAINER_NAME, "openssl", "req", "-new"] + key_args + [
                  "-keyout", "/tmp/client.key", "-out", "/tmp/client.csr", "-nodes", "-subj", "/CN=nrf5340"])
         run_cmd(["docker", "exec", CERT_CONTAINER_NAME, "openssl", "x509", "-req", "-in", "/tmp/client.csr", 
                  "-CA", "/tmp/ca.crt", "-CAkey", "/tmp/ca.key", "-CAcreateserial", "-out", "/tmp/client.crt", "-days", "365"])
         # Server
-        run_cmd(["docker", "exec", CERT_CONTAINER_NAME, "openssl", "req", "-new", "-newkey", key_type,
+        run_cmd(["docker", "exec", CERT_CONTAINER_NAME, "openssl", "req", "-new"] + key_args + [
                  "-keyout", "/tmp/server.key", "-out", "/tmp/server.csr", "-nodes", "-subj", "/CN=localhost"])
         run_cmd(["docker", "exec", CERT_CONTAINER_NAME, "openssl", "x509", "-req", "-in", "/tmp/server.csr", 
                  "-CA", "/tmp/ca.crt", "-CAkey", "/tmp/ca.key", "-CAcreateserial", "-out", "/tmp/server.crt", "-days", "365"])
