@@ -23,6 +23,14 @@ def save_benchmark_result(name, duration_ms):
 NRF_PROJECT_DIR = "/Users/vbalves/nordic/peripheral"
 SRC_DIR = os.path.join(NRF_PROJECT_DIR, "src")
 BUILD_DIR = os.path.join(NRF_PROJECT_DIR, "build")
+NRF5340_SERIAL = "/dev/tty.usbmodem0010500327223"
+NRF52840_SERIAL = "/dev/tty.usbmodem0010502058091"
+default_board = ("nrf5340dk/nrf5340/cpuapp" if os.path.exists(NRF5340_SERIAL)
+                 else "nrf52840dk/nrf52840")
+default_serial = NRF5340_SERIAL if os.path.exists(NRF5340_SERIAL) else NRF52840_SERIAL
+BOARD = os.environ.get("BOARD", default_board)
+SERIAL_PORT = os.environ.get("SERIAL_PORT", default_serial)
+BLE_PROXY = "/Users/vbalves/Library/Developer/Xcode/DerivedData/BLE_MQTT_Proxy-cngfofzxuvkznrbiaybihnftqwuz/Build/Products/Debug/BLE_MQTT_Proxy"
 
 # Docker config
 DOCKER_IMAGE = "openquantumsafe/curl:latest"
@@ -47,8 +55,9 @@ SIGS = [
     {"name": "ML-DSA-87", "key_gen": "mldsa87", "ssl_group": "mldsa87"},
     # Post-Quantum Signatures (Hash-Based - FIPS 205)
     # 's' = Small signatures (slower CPU signing), 'f' = Fast CPU signing (massive signatures)
-    {"name": "SLH-DSA-128s", "key_gen": "slh-dsa-sha2-128s", "ssl_group": "slh-dsa-sha2-128s"},
-    {"name": "SLH-DSA-128f", "key_gen": "slh-dsa-sha2-128f", "ssl_group": "slh-dsa-sha2-128f"},
+    #{"name": "SLH-DSA-SHAKE-128s", "key_gen": "slh-dsa-shake-128s", "ssl_group": "slh-dsa-shake-128s"},
+    #{"name": "SLH-DSA-SHAKE-192s", "key_gen": "slh-dsa-shake-192s", "ssl_group": "slh-dsa-shake-192s"},
+    #{"name": "SLH-DSA-SHAKE-256s", "key_gen": "slh-dsa-shake-256s", "ssl_group": "slh-dsa-shake-256s"},
 ]
 
 # Generate the full matrix
@@ -63,6 +72,12 @@ for kem in KEMS:
             # This safely passes "ec:prime256v1" to the docker openssl req commands
             "key_type": sig['key_gen'] 
         })
+
+requested_benchmarks = os.environ.get("PQC_BENCHMARKS")
+if requested_benchmarks:
+    requested = {name.strip() for name in requested_benchmarks.split(",")}
+    BENCHMARK_SUITE = [entry for entry in BENCHMARK_SUITE
+                       if entry["name"] in requested]
 
 # ====================================================================
 
@@ -260,6 +275,15 @@ def build_and_flash(pqc_macro):
     # We must inject ZEPHYR_BASE so both west and CMake know where the OS is
     env = os.environ.copy()
     env["ZEPHYR_BASE"] = zephyr_base
+    env.setdefault("ZEPHYR_TOOLCHAIN_VARIANT", "zephyr")
+    env.setdefault("ZEPHYR_SDK_INSTALL_DIR",
+                   "/opt/nordic/ncs/toolchains/0c0f19d91c/opt/zephyr-sdk")
+    toolchain_root = "/opt/nordic/ncs/toolchains/0c0f19d91c"
+    env["PATH"] = os.pathsep.join([
+        os.path.join(toolchain_root, "nrfutil", "bin"),
+        os.path.join(toolchain_root, "bin"),
+        env.get("PATH", ""),
+    ])
     
     # ================================================================
     # DYNAMIC INJECTION LOGIC
@@ -281,10 +305,9 @@ def build_and_flash(pqc_macro):
     build_cmd = [
         nordic_python, "-m", "west", "-z", zephyr_base, "build",
         "-p", "always",
-        "-b", "nrf52840dk/nrf52840",
+        "-b", BOARD,
         "--sysbuild",
         "--", 
-        f"-DEXTRA_CONF_FILE=sysbuild/hci_ipc.conf",
         f"-DEXTRA_CFLAGS={extra_cflags}" # Pass the fully constructed flag string
     ]
     
@@ -294,13 +317,19 @@ def build_and_flash(pqc_macro):
         print(f"[ERROR] Build failed with return code {result.returncode}")
         exit(1)
     
-    print("\n[FLASHING] Uploading to nRF52840...")
+    print(f"\n[FLASHING] Uploading to {BOARD}...")
     flash_cmd = [nordic_python, "-m", "west", "-z", zephyr_base, "flash"]
     print(f"\n[RUNNING] {' '.join(flash_cmd)}")
-    subprocess.run(flash_cmd, cwd=NRF_PROJECT_DIR, env=env)
+    result = subprocess.run(flash_cmd, cwd=NRF_PROJECT_DIR, env=env)
+    if result.returncode != 0:
+        print(f"[ERROR] Flash failed with return code {result.returncode}")
+        exit(1)
 
 if __name__ == "__main__":
     ensure_docker_running()
+
+    # Interrupted benchmark runs otherwise leave a proxy holding the BLE link.
+    subprocess.run(["pkill", "-f", BLE_PROXY], capture_output=True)
 
     # Ensure BENCHMARK_SUITE is a list of dictionaries
     for algo in BENCHMARK_SUITE:
@@ -328,7 +357,7 @@ if __name__ == "__main__":
         ser = None
         for attempt in range(5):
             try:
-                ser = serial.Serial('/dev/tty.usbmodem0010502058091', 115200, timeout=5)
+                ser = serial.Serial(SERIAL_PORT, 115200, timeout=5)
                 break 
             except serial.SerialException as e:
                 print(f"[-] Serial port not ready, retrying in 2 seconds... ({e})")
@@ -343,7 +372,7 @@ if __name__ == "__main__":
 
         # 3. NOW LAUNCH THE MAC GATEWAY TO START THE HANDSHAKE
         print("[LAUNCHING] Starting Swift BLE Proxy...")
-        xcode_app_proc = subprocess.Popen(["/Users/vbalves/Library/Developer/Xcode/DerivedData/BLE_MQTT_Proxy-cngfofzxuvkznrbiaybihnftqwuz/Build/Products/Debug/BLE_MQTT_Proxy"])
+        xcode_app_proc = subprocess.Popen([BLE_PROXY])
 
         # 4. CAPTURE THE RESULT
         print("\n[LISTENING] Waiting for Zephyr to finish the handshake...")

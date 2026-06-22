@@ -6,12 +6,68 @@
 #include <zephyr/bluetooth/conn.h>
 #include <time.h>
 #include <wolfssl/ssl.h>
+#include <wolfssl/wolfcrypt/memory.h>
 #include <zephyr/drivers/gpio.h>
 #include "client_cert.h"
 #include "client_key.h"
 
 #define L2CAP_SDU_MTU 2000
-#define TLS_RX_RINGBUF_SIZE 18432
+#define TLS_RX_RINGBUF_SIZE 16384
+
+/*
+ * Keep wolfSSL's short-lived PQC allocations out of picolibc's process-wide
+ * arena.  ML-DSA verification has a high transient peak and needs one large,
+ * non-fragmented heap.  The nRF5340 application core has twice the SRAM of
+ * the nRF52840 used by the development harness.
+ */
+#if defined(CONFIG_SOC_NRF5340_CPUAPP)
+#define WOLFSSL_HEAP_SIZE (300 * 1024)
+#else
+#define WOLFSSL_HEAP_SIZE (150 * 1024)
+#endif
+
+K_HEAP_DEFINE(wolfssl_heap, WOLFSSL_HEAP_SIZE);
+
+static void wolfssl_heap_report(const char *where)
+{
+    struct sys_memory_stats stats;
+
+    if (sys_heap_runtime_stats_get(&wolfssl_heap.heap, &stats) == 0) {
+        printk("[WOLFSSL HEAP] %s: used=%u peak=%u free=%u/%u\n",
+               where, (unsigned int)stats.allocated_bytes,
+               (unsigned int)stats.max_allocated_bytes,
+               (unsigned int)stats.free_bytes, WOLFSSL_HEAP_SIZE);
+    }
+}
+
+static void *wolfssl_malloc(size_t size)
+{
+    void *ptr = k_heap_alloc(&wolfssl_heap, size, K_NO_WAIT);
+
+    if (ptr == NULL) {
+        printk("[WOLFSSL HEAP] allocation failed: requested=%u\n",
+               (unsigned int)size);
+        wolfssl_heap_report("OOM");
+    }
+    return ptr;
+}
+
+static void wolfssl_free(void *ptr)
+{
+    k_heap_free(&wolfssl_heap, ptr);
+}
+
+static void *wolfssl_realloc(void *ptr, size_t size)
+{
+    void *new_ptr = k_heap_realloc(&wolfssl_heap, ptr, size, K_NO_WAIT);
+
+    if (new_ptr == NULL && size != 0) {
+        printk("[WOLFSSL HEAP] realloc failed: requested=%u\n",
+               (unsigned int)size);
+        wolfssl_heap_report("OOM");
+    }
+    return new_ptr;
+}
 
 RING_BUF_DECLARE(rx_ringbuf, TLS_RX_RINGBUF_SIZE);
 K_SEM_DEFINE(rx_sem, 0, 1);
@@ -62,8 +118,8 @@ static void update_led(bool on)
 }
 
 /* --- BLUETOOTH L2CAP BRIDGE --- */
-NET_BUF_POOL_DEFINE(l2cap_tx_pool, 5, BT_L2CAP_BUF_SIZE(L2CAP_SDU_MTU), 8, NULL);
-NET_BUF_POOL_DEFINE(l2cap_rx_pool, 5, BT_L2CAP_BUF_SIZE(L2CAP_SDU_MTU), 8, NULL);
+NET_BUF_POOL_DEFINE(l2cap_tx_pool, 2, BT_L2CAP_BUF_SIZE(L2CAP_SDU_MTU), 8, NULL);
+NET_BUF_POOL_DEFINE(l2cap_rx_pool, 3, BT_L2CAP_BUF_SIZE(L2CAP_SDU_MTU), 8, NULL);
 
 static struct bt_l2cap_le_chan l2cap_chan;
 static volatile bool l2cap_rx_overflow;
@@ -257,7 +313,10 @@ void start_secure_mqtt_session(struct bt_l2cap_chan *chan) {
     int ret;
 
     ctx = wolfSSL_CTX_new(wolfTLSv1_3_client_method());
-    if (!ctx) return;
+    if (!ctx) {
+        wolfssl_heap_report("wolfSSL_CTX_new failed");
+        return;
+    }
 
     wolfSSL_Debugging_ON();
 
@@ -291,6 +350,7 @@ void start_secure_mqtt_session(struct bt_l2cap_chan *chan) {
     if (key_ret != WOLFSSL_SUCCESS) {
         printk("Failed to load Client Private Key! Error: %d\n", key_ret);
     }
+    wolfssl_heap_report("certificate and key loaded");
 
     wolfSSL_CTX_SetIOSend(ctx, l2cap_wolfssl_send);
     wolfSSL_CTX_SetIORecv(ctx, l2cap_wolfssl_recv);
@@ -330,6 +390,7 @@ void start_secure_mqtt_session(struct bt_l2cap_chan *chan) {
     } while (ret != WOLFSSL_SUCCESS);
     int64_t end_time = k_uptime_get();
     printk(">>> TLS Handshake Successful! <<<\n");
+    wolfssl_heap_report("handshake complete");
     printk("\n[BENCHMARK_RESULT] Handshake_Time_MS: %lld\n", (end_time - start_time));
     /* Send initial MQTT CONNECT packet */
     /* MQTT CONNECT Packet with Auth Flags */
@@ -450,7 +511,9 @@ int main(void) {
         return 0;
     }
 
+    wolfSSL_SetAllocators(wolfssl_malloc, wolfssl_free, wolfssl_realloc);
     wolfSSL_Init();
+    wolfssl_heap_report("initialized");
 
     settings_load();
 
