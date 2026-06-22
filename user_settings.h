@@ -22,11 +22,11 @@
  * ======================================================== */
 #define NO_DEV_RANDOM
 #define CUSTOM_RAND_GENERATE_BLOCK(buf, len) (sys_rand_get((void*)(buf), (len)), 0)
-#define XTIME my_time_sec
-#define XTIME_MS my_time_ms
+#define XTIME time_sec
+#define XTIME_MS time_ms
 
 /* ========================================================
- * 3. TLS 1.3 & CRYPTO
+ * 4. TLS 1.3 & MODERN CRYPTO
  * ======================================================== */
 #define WOLFSSL_TLS13
 #define HAVE_TLS_EXTENSIONS
@@ -44,7 +44,7 @@
 #define HAVE_FFDHE_2048
 
 /* ========================================================
- * 4. POST-QUANTUM (ML-KEM / DILITHIUM)
+ * 5. POST-QUANTUM (ML-KEM / ML-DSA)
  * ======================================================== */
 #define WOLFSSL_EXPERIMENTAL_SETTINGS
 #define WOLFSSL_HAVE_MLKEM
@@ -56,7 +56,7 @@
 #define WOLFSSL_SHAKE256
 
 /* ========================================================
- * 5. MISC FIXES
+ * 6. MISC FIXES
  * ======================================================== */
 #define XSTRCASECMP wc_strcasecmp
 #define USE_WOLF_STRCASECMP
@@ -79,11 +79,6 @@
 #define WOLFSSL_MLDSA
 #define HAVE_SNI
 
-/* #define DEBUG_WOLFSSL */
-#define WOLFSSL_DEBUG_MEMORY
-#define WOLFSSL_TRACK_MEMORY
-
-/* Safely undefine min/max for wolfSSL files (Will no longer break Zephyr) */
 #undef min
 #undef max
 

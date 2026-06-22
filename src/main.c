@@ -10,19 +10,15 @@
 #include "client_cert.h"
 #include "client_key.h"
 
-/*
- * TLS 1.3 with PQC certificates can deliver a large server flight before
- * wolfSSL has a chance to drain the socket callback again.
- */
 #define L2CAP_SDU_MTU 2000
-#define TLS_RX_RINGBUF_SIZE 32768
+#define TLS_RX_RINGBUF_SIZE 18432
 
-RING_BUF_DECLARE(my_rx_ringbuf, TLS_RX_RINGBUF_SIZE);
+RING_BUF_DECLARE(rx_ringbuf, TLS_RX_RINGBUF_SIZE);
 K_SEM_DEFINE(rx_sem, 0, 1);
 K_SEM_DEFINE(l2cap_connected_sem, 0, 1);
 
 /* --- WOLFSSL TIME HOOKS --- */
-time_t my_time_sec(time_t *timer) {
+time_t time_sec(time_t *timer) {
     /* * Unix timestamp for mid-2026. 
      * This tricks wolfSSL into thinking it is the modern day
      * so it doesn't reject the Mosquitto certificate's activation date.
@@ -36,7 +32,7 @@ time_t my_time_sec(time_t *timer) {
     return t;
 }
 
-int my_time_ms(int *timer) {
+int time_ms(int *timer) {
     int t = (int)k_uptime_get_32();
     if (timer) *timer = t;
     return t;
@@ -66,21 +62,20 @@ static void update_led(bool on)
 }
 
 /* --- BLUETOOTH L2CAP BRIDGE --- */
-/* FIX 1: We need both TX and RX pools for large TLS records */
-NET_BUF_POOL_DEFINE(my_l2cap_tx_pool, 10, BT_L2CAP_BUF_SIZE(L2CAP_SDU_MTU), 8, NULL);
-NET_BUF_POOL_DEFINE(my_l2cap_rx_pool, 10, BT_L2CAP_BUF_SIZE(L2CAP_SDU_MTU), 8, NULL);
+NET_BUF_POOL_DEFINE(l2cap_tx_pool, 5, BT_L2CAP_BUF_SIZE(L2CAP_SDU_MTU), 8, NULL);
+NET_BUF_POOL_DEFINE(l2cap_rx_pool, 5, BT_L2CAP_BUF_SIZE(L2CAP_SDU_MTU), 8, NULL);
 
-static struct bt_l2cap_le_chan my_chan;
+static struct bt_l2cap_le_chan l2cap_chan;
 static volatile bool l2cap_rx_overflow;
 static volatile bool l2cap_peer_disconnected;
 
 /* FIX 2: Provide an allocation callback so Zephyr doesn't drop incoming data */
-static struct net_buf *my_l2cap_alloc_buf(struct bt_l2cap_chan *chan) {
-    return net_buf_alloc(&my_l2cap_rx_pool, K_MSEC(100));
+static struct net_buf *l2cap_alloc_buf(struct bt_l2cap_chan *chan) {
+    return net_buf_alloc(&l2cap_rx_pool, K_MSEC(100));
 }
 
-static int my_l2cap_recv(struct bt_l2cap_chan *chan, struct net_buf *buf) {
-    uint32_t written = ring_buf_put(&my_rx_ringbuf, buf->data, buf->len);
+static int l2cap_recv(struct bt_l2cap_chan *chan, struct net_buf *buf) {
+    uint32_t written = ring_buf_put(&rx_ringbuf, buf->data, buf->len);
     if (written < buf->len) {
         l2cap_rx_overflow = true;
         printk("[L2CAP RX] RX ring buffer overflowed: kept %u/%u bytes\n",
@@ -92,7 +87,7 @@ static int my_l2cap_recv(struct bt_l2cap_chan *chan, struct net_buf *buf) {
     return 0; /* Return 0 to indicate we consumed the data */
 }
 
-static void my_l2cap_connected(struct bt_l2cap_chan *chan) {
+static void l2cap_connected(struct bt_l2cap_chan *chan) {
     struct bt_l2cap_le_chan *le_chan =
         CONTAINER_OF(chan, struct bt_l2cap_le_chan, chan);
 
@@ -104,22 +99,22 @@ static void my_l2cap_connected(struct bt_l2cap_chan *chan) {
     k_sem_give(&l2cap_connected_sem);
 }
 
-static void my_l2cap_disconnected(struct bt_l2cap_chan *chan) {
+static void l2cap_disconnected(struct bt_l2cap_chan *chan) {
     printk("[L2CAP] Disconnected.\n");
     l2cap_peer_disconnected = true;
     k_sem_give(&rx_sem); /* Wake up any waiting read operations to fail gracefully */
 }
 
-static struct bt_l2cap_chan_ops my_l2cap_ops = {
-    .alloc_buf = my_l2cap_alloc_buf,
-    .connected = my_l2cap_connected,
-    .recv = my_l2cap_recv,
-    .disconnected = my_l2cap_disconnected,
+static struct bt_l2cap_chan_ops l2cap_ops = {
+    .alloc_buf = l2cap_alloc_buf,
+    .connected = l2cap_connected,
+    .recv = l2cap_recv,
+    .disconnected = l2cap_disconnected,
 };
 
 static const struct bt_data ad[] = {
     BT_DATA_BYTES(BT_DATA_FLAGS, (BT_LE_AD_GENERAL | BT_LE_AD_NO_BREDR)),
-    BT_DATA_BYTES(BT_DATA_NAME_COMPLETE, 'n','R','F','-','P','Q','C')
+    BT_DATA_BYTES(BT_DATA_NAME_COMPLETE, 'Z', 'e', 'p', 'h', 'y', 'r')
 };
 
 static void handle_command(const byte *payload, word32 len)
@@ -148,34 +143,34 @@ static void handle_command(const byte *payload, word32 len)
 	// }
 }
 
-static int my_l2cap_accept(struct bt_conn *conn, struct bt_l2cap_server *server, struct bt_l2cap_chan **chan);
+static int l2cap_accept(struct bt_conn *conn, struct bt_l2cap_server *server, struct bt_l2cap_chan **chan);
 
-static struct bt_l2cap_server my_l2cap_server = {
+static struct bt_l2cap_server l2cap_server = {
     .psm = 0x0080,
     .sec_level = BT_SECURITY_L1,
-    .accept = my_l2cap_accept,
+    .accept = l2cap_accept,
 };
 
-static int my_l2cap_accept(struct bt_conn *conn, struct bt_l2cap_server *server, struct bt_l2cap_chan **chan) {
+static int l2cap_accept(struct bt_conn *conn, struct bt_l2cap_server *server, struct bt_l2cap_chan **chan) {
     char addr[BT_ADDR_LE_STR_LEN];
     bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
     printk("[L2CAP] Connection request received from: %s\n", addr);
 
-    if (my_chan.chan.conn) {
+    if (l2cap_chan.chan.conn) {
         printk("[-] Rejecting request: L2CAP channel is already in use!\n");
         return -ENOMEM; 
     }
 
-    my_chan.chan.ops = &my_l2cap_ops;
+    l2cap_chan.chan.ops = &l2cap_ops;
     
-    my_chan.rx.mtu = L2CAP_SDU_MTU;
+    l2cap_chan.rx.mtu = L2CAP_SDU_MTU;
     
-    *chan = &my_chan.chan;
+    *chan = &l2cap_chan.chan;
     printk("[L2CAP] Connection accepted; waiting for channel setup.\n");
     return 0;
 }
 
-int my_l2cap_wolfssl_send(WOLFSSL* ssl, char* buf, int sz, void* ctx) {
+int l2cap_wolfssl_send(WOLFSSL* ssl, char* buf, int sz, void* ctx) {
     struct bt_l2cap_chan *chan = (struct bt_l2cap_chan *)ctx;
     struct bt_l2cap_le_chan *le_chan = CONTAINER_OF(chan, struct bt_l2cap_le_chan, chan);
     int sent = 0;
@@ -198,7 +193,7 @@ int my_l2cap_wolfssl_send(WOLFSSL* ssl, char* buf, int sz, void* ctx) {
 
             /* 2. ALLOCATE FRESH EVERY TIME. 
                If it fails, wait 10ms for pool to drain and continue loop. */
-            struct net_buf *tx_buf = net_buf_alloc(&my_l2cap_tx_pool, K_MSEC(10));
+            struct net_buf *tx_buf = net_buf_alloc(&l2cap_tx_pool, K_MSEC(10));
             if (!tx_buf) {
                 k_sleep(K_MSEC(10));
                 continue; 
@@ -226,7 +221,7 @@ int my_l2cap_wolfssl_send(WOLFSSL* ssl, char* buf, int sz, void* ctx) {
 }
 
 /* FIX 5: Safely wait for data without locking up wolfSSL */
-int my_l2cap_wolfssl_recv(WOLFSSL* ssl, char* buf, int sz, void* ctx) {
+int l2cap_wolfssl_recv(WOLFSSL* ssl, char* buf, int sz, void* ctx) {
     struct bt_l2cap_chan *chan = (struct bt_l2cap_chan *)ctx;
     
     if (!chan || !chan->conn || l2cap_peer_disconnected) {
@@ -238,7 +233,7 @@ int my_l2cap_wolfssl_recv(WOLFSSL* ssl, char* buf, int sz, void* ctx) {
         return WOLFSSL_CBIO_ERR_GENERAL;
     }
 
-    uint32_t read_bytes = ring_buf_get(&my_rx_ringbuf, (uint8_t*)buf, sz);
+    uint32_t read_bytes = ring_buf_get(&rx_ringbuf, (uint8_t*)buf, sz);
     if (read_bytes > 0) {
         printk("[WOLFSSL RX] delivering %u bytes to wolfSSL\n", read_bytes);
         return read_bytes;
@@ -246,7 +241,7 @@ int my_l2cap_wolfssl_recv(WOLFSSL* ssl, char* buf, int sz, void* ctx) {
 
     /* Wait briefly. If nothing arrives, tell wolfSSL we want to read later. */
     if (k_sem_take(&rx_sem, K_MSEC(50)) == 0) {
-        read_bytes = ring_buf_get(&my_rx_ringbuf, (uint8_t*)buf, sz);
+        read_bytes = ring_buf_get(&rx_ringbuf, (uint8_t*)buf, sz);
         if (read_bytes > 0) {
             printk("[WOLFSSL RX] delivering %u bytes to wolfSSL\n", read_bytes);
             return read_bytes;
@@ -279,26 +274,26 @@ void start_secure_mqtt_session(struct bt_l2cap_chan *chan) {
         printk("Configured wolfSSL TLS group id: %d\n", pqc_groups[0]);
     }
 
-    /* 1. Load the PEM string directly. Use sizeof() to get exact string length */
+/* 1. Load the binary DER array */
     int cert_ret = wolfSSL_CTX_use_certificate_buffer(ctx, 
-                                                      (const unsigned char*)client_pem, 
-                                                      sizeof(client_pem), 
-                                                      WOLFSSL_FILETYPE_PEM);
+                                                      client_der, 
+                                                      client_der_len, // Use the generated length variable
+                                                      WOLFSSL_FILETYPE_ASN1); 
     if (cert_ret != WOLFSSL_SUCCESS) {
         printk("Failed to load Client Certificate! Error: %d\n", cert_ret);
     }
 
-    /* 2. Load the PEM Private Key */
+    /* 2. Load the binary DER Private Key */
     int key_ret = wolfSSL_CTX_use_PrivateKey_buffer(ctx, 
-                                                    (const unsigned char*)client_key_pem, 
-                                                    sizeof(client_key_pem), 
-                                                    WOLFSSL_FILETYPE_PEM);
+                                                    client_key_der, 
+                                                    client_key_der_len, // Use the generated length variable
+                                                    WOLFSSL_FILETYPE_ASN1); 
     if (key_ret != WOLFSSL_SUCCESS) {
         printk("Failed to load Client Private Key! Error: %d\n", key_ret);
     }
 
-    wolfSSL_CTX_SetIOSend(ctx, my_l2cap_wolfssl_send);
-    wolfSSL_CTX_SetIORecv(ctx, my_l2cap_wolfssl_recv);
+    wolfSSL_CTX_SetIOSend(ctx, l2cap_wolfssl_send);
+    wolfSSL_CTX_SetIORecv(ctx, l2cap_wolfssl_recv);
     
     ssl = wolfSSL_new(ctx);
     if (!ssl) { 
@@ -463,14 +458,14 @@ int main(void) {
     bt_addr_le_from_str("F8:69:5E:1E:CE:2F", "random", &addr);
     bt_id_create(&addr, NULL);
 
-    bt_l2cap_server_register(&my_l2cap_server);
-    printk("Registering L2CAP server with PSM: 0x%04x\n", my_l2cap_server.psm);    
+    bt_l2cap_server_register(&l2cap_server);
+    printk("Registering L2CAP server with PSM: 0x%04x\n", l2cap_server.psm);    
     
     k_msleep(100);
 
     /* FIX 6: The Infinite Reconnection Loop */
     while (1) {
-        ring_buf_reset(&my_rx_ringbuf);
+        ring_buf_reset(&rx_ringbuf);
         k_sem_reset(&rx_sem);
         k_sem_reset(&l2cap_connected_sem);
         l2cap_peer_disconnected = false;
@@ -489,13 +484,13 @@ int main(void) {
         /* Stop advertising while connected to save power */
         bt_le_adv_stop();
 
-        start_secure_mqtt_session(&my_chan.chan);
+        start_secure_mqtt_session(&l2cap_chan.chan);
         
         printk("Session ended. Re-arming for next connection...\n");
         
         /* 1. Only request disconnect if the peer hasn't already dropped us */
-        if (my_chan.chan.conn && !l2cap_peer_disconnected) {
-            bt_conn_disconnect(my_chan.chan.conn, BT_HCI_ERR_REMOTE_USER_TERM_CONN);
+        if (l2cap_chan.chan.conn && !l2cap_peer_disconnected) {
+            bt_conn_disconnect(l2cap_chan.chan.conn, BT_HCI_ERR_REMOTE_USER_TERM_CONN);
         }
 
         /* 2. Wait for the Zephyr BT stack to fully process the teardown */
@@ -504,7 +499,7 @@ int main(void) {
         }
 
         /* 3. Erase the ghost pointer so Zephyr frees the Bluetooth context */
-        my_chan.chan.conn = NULL;
+        l2cap_chan.chan.conn = NULL;
         
         /* 4. Brief cooldown before firing up the radio again */
         k_sleep(K_SECONDS(1));

@@ -45,6 +45,10 @@ SIGS = [
     {"name": "ML-DSA-44", "key_gen": "mldsa44", "ssl_group": "mldsa44"},
     {"name": "ML-DSA-65", "key_gen": "mldsa65", "ssl_group": "mldsa65"},
     {"name": "ML-DSA-87", "key_gen": "mldsa87", "ssl_group": "mldsa87"},
+    # Post-Quantum Signatures (Hash-Based - FIPS 205)
+    # 's' = Small signatures (slower CPU signing), 'f' = Fast CPU signing (massive signatures)
+    {"name": "SLH-DSA-128s", "key_gen": "slh-dsa-sha2-128s", "ssl_group": "slh-dsa-sha2-128s"},
+    {"name": "SLH-DSA-128f", "key_gen": "slh-dsa-sha2-128f", "ssl_group": "slh-dsa-sha2-128f"},
 ]
 
 # Generate the full matrix
@@ -101,36 +105,43 @@ def ensure_docker_running():
     print("\n[ERROR] Timed out waiting for Docker to start.")
     exit(1)
 
-def format_pem_to_c_header(pem_filepath, header_filepath, var_name, include_guard):
-    """Reads a PEM file and writes it as a null-terminated C-string header."""
-    print(f"[FORMATTING] {pem_filepath} -> {header_filepath}")
-    with open(pem_filepath, 'r') as f:
-        lines = f.readlines()
+def format_der_to_c_header(der_filepath, header_filepath, var_name, include_guard):
+    """Reads a binary DER file and writes it as a C unsigned char array."""
+    print(f"[FORMATTING] {der_filepath} -> {header_filepath}")
+    with open(der_filepath, 'rb') as f:
+        data = f.read()
 
     with open(header_filepath, 'w') as f:
         f.write(f"#ifndef {include_guard}\n")
         f.write(f"#define {include_guard}\n\n")
-        f.write(f"const char {var_name}[] = \n")
-        for line in lines:
-            clean_line = line.strip()
-            if clean_line:
-                f.write(f'"{clean_line}\\n"\n')
-        f.write(";\n\n#endif\n")
+        f.write(f"const unsigned char {var_name}[] = {{\n")
+        
+        # Format the raw bytes as hex (e.g., 0x30, 0x82)
+        hex_array = [f"0x{b:02x}" for b in data]
+        
+        # Wrap the text nicely at 12 bytes per line
+        for i in range(0, len(hex_array), 12):
+            f.write("    " + ", ".join(hex_array[i:i+12]))
+            if i + 12 < len(hex_array):
+                f.write(",")
+            f.write("\n")
+            
+        f.write("};\n\n")
+        f.write(f"const unsigned int {var_name}_len = {len(data)};\n\n")
+        f.write(f"#endif\n")
 
 def generate_certificates(algo_entry):
     if os.path.exists(OUTPUT_DIR):
         for f in os.listdir(OUTPUT_DIR):
-            if f.endswith(('.crt', '.key', '.csr')):
+            if f.endswith(('.crt', '.key', '.csr', '.der')):
                 os.remove(os.path.join(OUTPUT_DIR, f))
 
     key_type = algo_entry['key_type']
 
-    # --- THE FIX: OpenSSL 3.0 Classical Curve Handling ---
     if key_type.startswith("ec:"):
-        curve_name = key_type.split(":")[1] # Extracts 'prime256v1'
+        curve_name = key_type.split(":")[1] 
         key_args = ["-newkey", "ec", "-pkeyopt", f"ec_paramgen_curve:{curve_name}"]
     else:
-        # Passes PQC keys (like 'mldsa44') normally
         key_args = ["-newkey", key_type]
 
     print(f"\n--- STEP 1: GENERATING {algo_entry['name'].upper()} CERTIFICATES ---")
@@ -145,11 +156,16 @@ def generate_certificates(algo_entry):
         # CA
         run_cmd(["docker", "exec", CERT_CONTAINER_NAME, "openssl", "req", "-x509", "-new"] + key_args + [
                  "-keyout", "/tmp/ca.key", "-out", "/tmp/ca.crt", "-nodes", "-subj", "/CN=PQC_Root", "-days", "365"])
-        # Client
+        # Client (Generates der for the CA signing process)
         run_cmd(["docker", "exec", CERT_CONTAINER_NAME, "openssl", "req", "-new"] + key_args + [
-                 "-keyout", "/tmp/client.key", "-out", "/tmp/client.csr", "-nodes", "-subj", "/CN=nrf5340"])
+                 "-keyout", "/tmp/client.key", "-out", "/tmp/client.csr", "-nodes", "-subj", "/CN=nrf52840"])
         run_cmd(["docker", "exec", CERT_CONTAINER_NAME, "openssl", "x509", "-req", "-in", "/tmp/client.csr", 
                  "-CA", "/tmp/ca.crt", "-CAkey", "/tmp/ca.key", "-CAcreateserial", "-out", "/tmp/client.crt", "-days", "365"])
+        
+        # --- THE FIX: Convert Client ders to DER format using the OQS Provider ---
+        run_cmd(["docker", "exec", CERT_CONTAINER_NAME, "openssl", "x509", "-in", "/tmp/client.crt", "-outform", "DER", "-out", "/tmp/client_cert.der"])
+        run_cmd(["docker", "exec", CERT_CONTAINER_NAME, "openssl", "pkey", "-in", "/tmp/client.key", "-outform", "DER", "-out", "/tmp/client_key.der"])
+
         # Server
         run_cmd(["docker", "exec", CERT_CONTAINER_NAME, "openssl", "req", "-new"] + key_args + [
                  "-keyout", "/tmp/server.key", "-out", "/tmp/server.csr", "-nodes", "-subj", "/CN=localhost"])
@@ -157,20 +173,24 @@ def generate_certificates(algo_entry):
                  "-CA", "/tmp/ca.crt", "-CAkey", "/tmp/ca.key", "-CAcreateserial", "-out", "/tmp/server.crt", "-days", "365"])
 
         print("\nExtracting files to local directory...")
-        for ext in ["ca.crt", "client.crt", "client.key", "server.crt", "server.key"]:
+        # Include the new .der files in the extraction loop
+        for ext in ["ca.crt", "client.crt", "client.key", "server.crt", "server.key", "client_cert.der", "client_key.der"]:
             run_cmd(["docker", "cp", f"{CERT_CONTAINER_NAME}:/tmp/{ext}", os.path.join(OUTPUT_DIR, ext)])
 
     finally:
         run_cmd(["docker", "rm", "-f", CERT_CONTAINER_NAME], ignore_errors=True)
 
 def update_nrf_source():
-    cert_pem_path = os.path.join(OUTPUT_DIR, "client.crt")
-    key_pem_path = os.path.join(OUTPUT_DIR, "client.key")
+    # Read the new DER files
+    cert_der_path = os.path.join(OUTPUT_DIR, "client_cert.der")
+    key_der_path = os.path.join(OUTPUT_DIR, "client_key.der")
+    
     cert_h_path = os.path.join(SRC_DIR, "client_cert.h")
     key_h_path = os.path.join(SRC_DIR, "client_key.h")
     
-    format_pem_to_c_header(cert_pem_path, cert_h_path, "client_pem", "CLIENT_CERT_H")
-    format_pem_to_c_header(key_pem_path, key_h_path, "client_key_pem", "CLIENT_KEY_H")
+    # Write the binary hex arrays to the headers
+    format_der_to_c_header(cert_der_path, cert_h_path, "client_der", "CLIENT_CERT_H")
+    format_der_to_c_header(key_der_path, key_h_path, "client_key_der", "CLIENT_KEY_H")
     print(f"[SUCCESS] Updated {cert_h_path} and {key_h_path}")
 
 def generate_openssl_conf(openssl_group_string):
@@ -261,7 +281,7 @@ def build_and_flash(pqc_macro):
     build_cmd = [
         nordic_python, "-m", "west", "-z", zephyr_base, "build",
         "-p", "always",
-        "-b", "nrf5340dk/nrf5340/cpuapp",
+        "-b", "nrf52840dk/nrf52840",
         "--sysbuild",
         "--", 
         f"-DEXTRA_CONF_FILE=sysbuild/hci_ipc.conf",
@@ -274,7 +294,7 @@ def build_and_flash(pqc_macro):
         print(f"[ERROR] Build failed with return code {result.returncode}")
         exit(1)
     
-    print("\n[FLASHING] Uploading to nRF5340...")
+    print("\n[FLASHING] Uploading to nRF52840...")
     flash_cmd = [nordic_python, "-m", "west", "-z", zephyr_base, "flash"]
     print(f"\n[RUNNING] {' '.join(flash_cmd)}")
     subprocess.run(flash_cmd, cwd=NRF_PROJECT_DIR, env=env)
@@ -301,14 +321,14 @@ if __name__ == "__main__":
         
         # 1. THE USB BOUNCE DELAY
         # Give the board 5 seconds to boot Zephyr and re-mount its USB drive to macOS
-        print("\n[WAITING] Allowing nRF5340 to boot and USB to enumerate...")
+        print("\n[WAITING] Allowing nRF52840 to boot and USB to enumerate...")
         time.sleep(5) 
         
         # 2. OPEN THE SERIAL PORT FIRST (Before starting the handshake!)
         ser = None
         for attempt in range(5):
             try:
-                ser = serial.Serial('/dev/tty.usbmodem0010500327223', 115200, timeout=5)
+                ser = serial.Serial('/dev/tty.usbmodem0010502058091', 115200, timeout=5)
                 break 
             except serial.SerialException as e:
                 print(f"[-] Serial port not ready, retrying in 2 seconds... ({e})")
@@ -335,7 +355,7 @@ if __name__ == "__main__":
                 line = ser.readline().decode('utf-8', errors='ignore').strip()
                 
                 if line:
-                    print(f"[NRF5340] {line}")
+                    print(f"[NRF52840] {line}")
                     
                 # THE FIX: Match the exact string from your Zephyr C-Code
                 if "Handshake_Time_MS:" in line: 
@@ -349,14 +369,14 @@ if __name__ == "__main__":
         save_benchmark_result(algo['name'], handshake_time)
         ser.close()
 
-        print("\nSending disconnect signal to nRF5340...")
+        print("\nSending disconnect signal to nRF52840...")
         run_cmd([
             "docker", "exec", BROKER_CONTAINER_NAME, "mosquitto_pub",
             "-h", "localhost", "-p", "8883",
             "--cafile", "/mosquitto/config/ca.crt",
             "--cert", "/mosquitto/config/server.crt",
             "--key", "/mosquitto/config/server.key",
-            "-t", "nrf5340/cmd", "-m", "disconnect"
+            "-t", "nrf52840/cmd", "-m", "disconnect"
         ], ignore_errors=True)
         
         time.sleep(5) 
