@@ -30,10 +30,13 @@ default_board = ("nrf5340dk/nrf5340/cpuapp" if os.path.exists(NRF5340_SERIAL)
 default_serial = NRF5340_SERIAL if os.path.exists(NRF5340_SERIAL) else NRF52840_SERIAL
 BOARD = os.environ.get("BOARD", default_board)
 SERIAL_PORT = os.environ.get("SERIAL_PORT", default_serial)
+DEVICE_CN = os.environ.get("DEVICE_CN", BOARD.replace("/", "_"))
 BLE_PROXY = "/Users/vbalves/Library/Developer/Xcode/DerivedData/BLE_MQTT_Proxy-cngfofzxuvkznrbiaybihnftqwuz/Build/Products/Debug/BLE_MQTT_Proxy"
+HANDSHAKE_TIMEOUT = int(os.environ.get("HANDSHAKE_TIMEOUT", "300"))
 
 # Docker config
-DOCKER_IMAGE = "openquantumsafe/curl:latest"
+DOCKER_IMAGE = "pqc-openssl:3.5"
+DOCKERFILE_DIR = os.path.join(NRF_PROJECT_DIR, "docker", "pqc-openssl")
 CERT_CONTAINER_NAME = "pqc_auto_gen"
 BROKER_CONTAINER_NAME = "mosquitto_pqc"
 
@@ -41,23 +44,27 @@ BROKER_CONTAINER_NAME = "mosquitto_pqc"
 OUTPUT_DIR = os.path.join(NRF_PROJECT_DIR, "generated_certs")
 
 KEMS = [
-    {"name": "MLKEM512", "macro": "WOLFSSL_ML_KEM_512", "group": "mlkem512"},
-    {"name": "MLKEM768", "macro": "WOLFSSL_ML_KEM_768", "group": "mlkem768"},
-    {"name": "MLKEM1024", "macro": "WOLFSSL_ML_KEM_1024", "group": "mlkem1024"},
+    #{"name": "MLKEM512", "macro": "WOLFSSL_ML_KEM_512", "group": "MLKEM512"},
+    {"name": "MLKEM768", "macro": "WOLFSSL_ML_KEM_768", "group": "MLKEM768"},
+    {"name": "MLKEM1024", "macro": "WOLFSSL_ML_KEM_1024", "group": "MLKEM1024"},
 ]
 
 SIGS = [
     # Classical Baseline Signatures
-    {"name": "ECDSA-P-256", "key_gen": "ec:prime256v1", "ssl_group": "P-256"},
+    #{"name": "ECDSA-P-256", "key_gen": "ec:prime256v1", "ssl_group": "P-256"},
     # Post-Quantum Signatures
-    {"name": "ML-DSA-44", "key_gen": "mldsa44", "ssl_group": "mldsa44"},
-    {"name": "ML-DSA-65", "key_gen": "mldsa65", "ssl_group": "mldsa65"},
-    {"name": "ML-DSA-87", "key_gen": "mldsa87", "ssl_group": "mldsa87"},
+    #{"name": "ML-DSA-44", "key_gen": "ML-DSA-44"},
+    #{"name": "ML-DSA-65", "key_gen": "ML-DSA-65"},
+    {"name": "ML-DSA-87", "key_gen": "ML-DSA-87"},
     # Post-Quantum Signatures (Hash-Based - FIPS 205)
-    # 's' = Small signatures (slower CPU signing), 'f' = Fast CPU signing (massive signatures)
-    #{"name": "SLH-DSA-SHAKE-128s", "key_gen": "slh-dsa-shake-128s", "ssl_group": "slh-dsa-shake-128s"},
-    #{"name": "SLH-DSA-SHAKE-192s", "key_gen": "slh-dsa-shake-192s", "ssl_group": "slh-dsa-shake-192s"},
-    #{"name": "SLH-DSA-SHAKE-256s", "key_gen": "slh-dsa-shake-256s", "ssl_group": "slh-dsa-shake-256s"},
+    # TLS has no standardized SLH-DSA CertificateVerify scheme. SLH-DSA signs
+    # ECDSA leaf certificates, so both peers verify FIPS-205 chain signatures.
+    {"name": "SLH-DSA-SHAKE-128s", "key_gen": "SLH-DSA-SHAKE-128s",
+     "leaf_key_gen": "ec:prime256v1"},
+    {"name": "SLH-DSA-SHAKE-192s", "key_gen": "SLH-DSA-SHAKE-192s",
+     "leaf_key_gen": "ec:prime256v1"},
+    {"name": "SLH-DSA-SHAKE-256s", "key_gen": "SLH-DSA-SHAKE-256s",
+     "leaf_key_gen": "ec:prime256v1"},
 ]
 
 # Generate the full matrix
@@ -67,10 +74,9 @@ for kem in KEMS:
         BENCHMARK_SUITE.append({
             "name": f"{kem['name']}_{sig['name']}",
             "macro": kem['macro'],
-            # This safely writes "mlkem512:P-256" into the mosquitto openssl.cnf
-            "openssl_group": f"{kem['group']}:{sig['ssl_group']}",
-            # This safely passes "ec:prime256v1" to the docker openssl req commands
-            "key_type": sig['key_gen'] 
+            "openssl_group": kem['group'],
+            "issuer_key_type": sig['key_gen'],
+            "leaf_key_type": sig.get('leaf_key_gen', sig['key_gen']),
         })
 
 requested_benchmarks = os.environ.get("PQC_BENCHMARKS")
@@ -120,6 +126,20 @@ def ensure_docker_running():
     print("\n[ERROR] Timed out waiting for Docker to start.")
     exit(1)
 
+def ensure_pqc_image():
+    """Build the OpenSSL 3.5 image once and verify native SLH-DSA support."""
+    result = subprocess.run(["docker", "image", "inspect", DOCKER_IMAGE],
+                            capture_output=True)
+    if result.returncode != 0:
+        run_cmd(["docker", "build", "-t", DOCKER_IMAGE, DOCKERFILE_DIR])
+
+    checks = (
+        "openssl version && "
+        "openssl list -signature-algorithms | "
+        "grep -q SLH-DSA-SHAKE-256s"
+    )
+    run_cmd(["docker", "run", "--rm", DOCKER_IMAGE, "sh", "-c", checks])
+
 def format_der_to_c_header(der_filepath, header_filepath, var_name, include_guard):
     """Reads a binary DER file and writes it as a C unsigned char array."""
     print(f"[FORMATTING] {der_filepath} -> {header_filepath}")
@@ -151,13 +171,19 @@ def generate_certificates(algo_entry):
             if f.endswith(('.crt', '.key', '.csr', '.der')):
                 os.remove(os.path.join(OUTPUT_DIR, f))
 
-    key_type = algo_entry['key_type']
+    def make_key_args(key_type):
+        if not key_type.startswith("ec:"):
+            return ["-newkey", key_type]
+        curve_name = key_type.split(":", 1)[1]
+        return ["-newkey", "ec", "-pkeyopt",
+                f"ec_paramgen_curve:{curve_name}"]
 
-    if key_type.startswith("ec:"):
-        curve_name = key_type.split(":")[1] 
-        key_args = ["-newkey", "ec", "-pkeyopt", f"ec_paramgen_curve:{curve_name}"]
-    else:
-        key_args = ["-newkey", key_type]
+    issuer_key_args = make_key_args(algo_entry['issuer_key_type'])
+    leaf_key_args = make_key_args(algo_entry['leaf_key_type'])
+
+    if algo_entry['issuer_key_type'] != algo_entry['leaf_key_type']:
+        print("[INFO] SLH-DSA signs ECDSA TLS leaf certificates; "
+              "TLS CertificateVerify remains ECDSA.")
 
     print(f"\n--- STEP 1: GENERATING {algo_entry['name'].upper()} CERTIFICATES ---")
     os.makedirs(OUTPUT_DIR, exist_ok=True)
@@ -169,27 +195,29 @@ def generate_certificates(algo_entry):
         print(f"Generating {algo_entry['name']} Certificates...")
         
         # CA
-        run_cmd(["docker", "exec", CERT_CONTAINER_NAME, "openssl", "req", "-x509", "-new"] + key_args + [
+        run_cmd(["docker", "exec", CERT_CONTAINER_NAME, "openssl", "req", "-x509", "-new"] + issuer_key_args + [
                  "-keyout", "/tmp/ca.key", "-out", "/tmp/ca.crt", "-nodes", "-subj", "/CN=PQC_Root", "-days", "365"])
         # Client (Generates der for the CA signing process)
-        run_cmd(["docker", "exec", CERT_CONTAINER_NAME, "openssl", "req", "-new"] + key_args + [
-                 "-keyout", "/tmp/client.key", "-out", "/tmp/client.csr", "-nodes", "-subj", "/CN=nrf52840"])
+        run_cmd(["docker", "exec", CERT_CONTAINER_NAME, "openssl", "req", "-new"] + leaf_key_args + [
+                 "-keyout", "/tmp/client.key", "-out", "/tmp/client.csr", "-nodes", "-subj", f"/CN={DEVICE_CN}"])
         run_cmd(["docker", "exec", CERT_CONTAINER_NAME, "openssl", "x509", "-req", "-in", "/tmp/client.csr", 
                  "-CA", "/tmp/ca.crt", "-CAkey", "/tmp/ca.key", "-CAcreateserial", "-out", "/tmp/client.crt", "-days", "365"])
         
         # --- THE FIX: Convert Client ders to DER format using the OQS Provider ---
         run_cmd(["docker", "exec", CERT_CONTAINER_NAME, "openssl", "x509", "-in", "/tmp/client.crt", "-outform", "DER", "-out", "/tmp/client_cert.der"])
         run_cmd(["docker", "exec", CERT_CONTAINER_NAME, "openssl", "pkey", "-in", "/tmp/client.key", "-outform", "DER", "-out", "/tmp/client_key.der"])
+        run_cmd(["docker", "exec", CERT_CONTAINER_NAME, "openssl", "x509", "-in", "/tmp/ca.crt", "-outform", "DER", "-out", "/tmp/ca_cert.der"])
 
         # Server
-        run_cmd(["docker", "exec", CERT_CONTAINER_NAME, "openssl", "req", "-new"] + key_args + [
+        run_cmd(["docker", "exec", CERT_CONTAINER_NAME, "openssl", "req", "-new"] + leaf_key_args + [
                  "-keyout", "/tmp/server.key", "-out", "/tmp/server.csr", "-nodes", "-subj", "/CN=localhost"])
         run_cmd(["docker", "exec", CERT_CONTAINER_NAME, "openssl", "x509", "-req", "-in", "/tmp/server.csr", 
                  "-CA", "/tmp/ca.crt", "-CAkey", "/tmp/ca.key", "-CAcreateserial", "-out", "/tmp/server.crt", "-days", "365"])
 
         print("\nExtracting files to local directory...")
         # Include the new .der files in the extraction loop
-        for ext in ["ca.crt", "client.crt", "client.key", "server.crt", "server.key", "client_cert.der", "client_key.der"]:
+        for ext in ["ca.crt", "client.crt", "client.key", "server.crt", "server.key",
+                    "ca_cert.der", "client_cert.der", "client_key.der"]:
             run_cmd(["docker", "cp", f"{CERT_CONTAINER_NAME}:/tmp/{ext}", os.path.join(OUTPUT_DIR, ext)])
 
     finally:
@@ -199,13 +227,16 @@ def update_nrf_source():
     # Read the new DER files
     cert_der_path = os.path.join(OUTPUT_DIR, "client_cert.der")
     key_der_path = os.path.join(OUTPUT_DIR, "client_key.der")
+    ca_der_path = os.path.join(OUTPUT_DIR, "ca_cert.der")
     
     cert_h_path = os.path.join(SRC_DIR, "client_cert.h")
     key_h_path = os.path.join(SRC_DIR, "client_key.h")
+    ca_h_path = os.path.join(SRC_DIR, "ca_cert.h")
     
     # Write the binary hex arrays to the headers
     format_der_to_c_header(cert_der_path, cert_h_path, "client_der", "CLIENT_CERT_H")
     format_der_to_c_header(key_der_path, key_h_path, "client_key_der", "CLIENT_KEY_H")
+    format_der_to_c_header(ca_der_path, ca_h_path, "ca_der", "CA_CERT_H")
     print(f"[SUCCESS] Updated {cert_h_path} and {key_h_path}")
 
 def generate_openssl_conf(openssl_group_string):
@@ -216,18 +247,7 @@ def generate_openssl_conf(openssl_group_string):
     conf_content = f"""openssl_conf = openssl_init
 
 [openssl_init]
-providers = provider_sect
 ssl_conf = ssl_sect
-
-[provider_sect]
-default = default_sect
-oqsprovider = oqsprovider_sect
-
-[default_sect]
-activate = 1
-
-[oqsprovider_sect]
-activate = 1
 
 [ssl_sect]
 system_default = system_default_sect
@@ -258,7 +278,7 @@ def start_mosquitto_broker():
         "-v", f"{os.path.join(OUTPUT_DIR, 'server.key')}:/mosquitto/config/server.key",
         "-v", f"{os.path.join(OUTPUT_DIR, 'openssl.cnf')}:/mosquitto/config/openssl.cnf",
         
-        "openquantumsafe/mosquitto", 
+        DOCKER_IMAGE,
         "mosquitto", "-c", "/mosquitto/config/mosquitto.conf", "-v"
     ])
 
@@ -327,6 +347,7 @@ def build_and_flash(pqc_macro):
 
 if __name__ == "__main__":
     ensure_docker_running()
+    ensure_pqc_image()
 
     # Interrupted benchmark runs otherwise leave a proxy holding the BLE link.
     subprocess.run(["pkill", "-f", BLE_PROXY], capture_output=True)
@@ -379,7 +400,7 @@ if __name__ == "__main__":
         handshake_time = "TIMEOUT/CRASH"
         start_wait = time.time()
         
-        while time.time() - start_wait < 60:
+        while time.time() - start_wait < HANDSHAKE_TIMEOUT:
             try:
                 line = ser.readline().decode('utf-8', errors='ignore').strip()
                 

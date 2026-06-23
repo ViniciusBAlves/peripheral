@@ -10,6 +10,7 @@
 #include <zephyr/drivers/gpio.h>
 #include "client_cert.h"
 #include "client_key.h"
+#include "ca_cert.h"
 
 #define L2CAP_SDU_MTU 2000
 #define TLS_RX_RINGBUF_SIZE 16384
@@ -23,7 +24,7 @@
 #if defined(CONFIG_SOC_NRF5340_CPUAPP)
 #define WOLFSSL_HEAP_SIZE (300 * 1024)
 #else
-#define WOLFSSL_HEAP_SIZE (150 * 1024)
+#define WOLFSSL_HEAP_SIZE (170 * 1024)
 #endif
 
 K_HEAP_DEFINE(wolfssl_heap, WOLFSSL_HEAP_SIZE);
@@ -321,7 +322,15 @@ void start_secure_mqtt_session(struct bt_l2cap_chan *chan) {
     wolfSSL_Debugging_ON();
 
     /* Security: Ensure we are using modern PQC/ECC ciphers */
-    wolfSSL_CTX_set_verify(ctx, WOLFSSL_VERIFY_NONE, NULL);
+    wolfSSL_CTX_set_verify(ctx, WOLFSSL_VERIFY_PEER, NULL);
+
+    int ca_ret = wolfSSL_CTX_load_verify_buffer(ctx, ca_der, ca_der_len,
+                                                WOLFSSL_FILETYPE_ASN1);
+    if (ca_ret != WOLFSSL_SUCCESS) {
+        printk("Failed to load CA Certificate! Error: %d\n", ca_ret);
+        wolfSSL_CTX_free(ctx);
+        return;
+    }
 
     int pqc_groups[] = { TARGET_PQC_GROUP, WOLFSSL_ECC_SECP256R1 };
 

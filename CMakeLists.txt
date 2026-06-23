@@ -3,14 +3,31 @@ cmake_minimum_required(VERSION 3.20.0)
 find_package(Zephyr REQUIRED HINTS $ENV{ZEPHYR_BASE})
 project(peripheral)
 
-set(WOLFSSL_ROOT_DIR "/opt/nordic/ncs/external/wolfssl")
+# SLH-DSA X.509 support landed after wolfSSL 5.9.1. Pin the reviewed upstream
+# revision so pristine builds are reproducible while avoiding changes to NCS.
+include(FetchContent)
+if(POLICY CMP0169)
+    cmake_policy(SET CMP0169 OLD)
+endif()
+set(FETCHCONTENT_BASE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/.cache")
+FetchContent_Declare(wolfssl_upstream
+    URL https://github.com/wolfSSL/wolfssl/archive/dd6da70d395a0cb26446326f329678fe3bfb212c.tar.gz
+    URL_HASH SHA256=087ac84de980da83e7f1a3014dd241358f64d9a330dec74c6eb1404495ad2cf7
+    DOWNLOAD_EXTRACT_TIMESTAMP FALSE
+)
+FetchContent_GetProperties(wolfssl_upstream)
+if(NOT wolfssl_upstream_POPULATED)
+    FetchContent_Populate(wolfssl_upstream)
+endif()
+set(WOLFSSL_ROOT_DIR "${wolfssl_upstream_SOURCE_DIR}")
 
 # 1. Bind EVERYTHING directly to the 'app' target
 target_sources(app PRIVATE src/main.c
     # --- Post Quantum Math ---
     ${WOLFSSL_ROOT_DIR}/wolfcrypt/src/wc_mlkem.c
     ${WOLFSSL_ROOT_DIR}/wolfcrypt/src/wc_mlkem_poly.c
-    ${WOLFSSL_ROOT_DIR}/wolfcrypt/src/dilithium.c
+    ${WOLFSSL_ROOT_DIR}/wolfcrypt/src/wc_mldsa.c
+    ${WOLFSSL_ROOT_DIR}/wolfcrypt/src/wc_slhdsa.c
     
     # --- Core Cryptography & Hashes ---
     ${WOLFSSL_ROOT_DIR}/wolfcrypt/src/random.c
