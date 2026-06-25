@@ -5,6 +5,8 @@ import time
 import sys
 import serial
 import csv
+import shlex
+import glob
 
 def save_benchmark_result(name, duration_ms):
     filename = "pqc_benchmark_results.csv"
@@ -33,6 +35,27 @@ SERIAL_PORT = os.environ.get("SERIAL_PORT", default_serial)
 DEVICE_CN = os.environ.get("DEVICE_CN", BOARD.replace("/", "_"))
 BLE_PROXY = "/Users/vbalves/Library/Developer/Xcode/DerivedData/BLE_MQTT_Proxy-cngfofzxuvkznrbiaybihnftqwuz/Build/Products/Debug/BLE_MQTT_Proxy"
 HANDSHAKE_TIMEOUT = int(os.environ.get("HANDSHAKE_TIMEOUT", "300"))
+SERVER_BACKEND = os.environ.get("SERVER_BACKEND", "raspberry_pi")
+MQTT_CMD_TOPIC = os.environ.get("MQTT_CMD_TOPIC", "nrf52840/cmd")
+
+# Raspberry Pi server config
+PI_USER = os.environ.get("PI_USER", "vini")
+PI_HOST = os.environ.get("PI_HOST", "10.12.194.1")
+PI_PASSWORD = os.environ.get("PI_PASSWORD", "rasppi")
+PI_WORKDIR = os.environ.get("PI_WORKDIR", f"/home/{PI_USER}/pqc_ble_mqtt")
+PI_MOSQUITTO = os.environ.get("PI_MOSQUITTO", "/usr/sbin/mosquitto")
+PI_MOSQUITTO_PUB = os.environ.get("PI_MOSQUITTO_PUB", "/usr/bin/mosquitto_pub")
+PI_OFFLINE_DEBS_DIR = os.environ.get(
+    "PI_OFFLINE_DEBS_DIR",
+    os.path.join(NRF_PROJECT_DIR, "raspberry_pi", "offline_debs"),
+)
+PI_ADAPTER = os.environ.get("PI_ADAPTER", "hci0")
+BLE_DEVICE_NAME = os.environ.get("BLE_DEVICE_NAME", "PQC52840")
+BLE_DEVICE_ADDR = os.environ.get("BLE_DEVICE_ADDR", "")
+BLE_DEVICE_ADDR_TYPE = os.environ.get("BLE_DEVICE_ADDR_TYPE", "random")
+L2CAP_PSM = os.environ.get("L2CAP_PSM", "0x0080")
+BRIDGE_MTU = int(os.environ.get("BRIDGE_MTU", "672"))
+PI_GATEWAY_IMPL = os.environ.get("PI_GATEWAY_IMPL", "python")
 
 # Docker config
 DOCKER_IMAGE = "pqc-openssl:3.5"
@@ -44,27 +67,27 @@ BROKER_CONTAINER_NAME = "mosquitto_pqc"
 OUTPUT_DIR = os.path.join(NRF_PROJECT_DIR, "generated_certs")
 
 KEMS = [
-    #{"name": "MLKEM512", "macro": "WOLFSSL_ML_KEM_512", "group": "MLKEM512"},
-    {"name": "MLKEM768", "macro": "WOLFSSL_ML_KEM_768", "group": "MLKEM768"},
-    {"name": "MLKEM1024", "macro": "WOLFSSL_ML_KEM_1024", "group": "MLKEM1024"},
+    {"name": "MLKEM512", "macro": "WOLFSSL_ML_KEM_512", "group": "MLKEM512"},
+    #{"name": "MLKEM768", "macro": "WOLFSSL_ML_KEM_768", "group": "MLKEM768"},
+    #{"name": "MLKEM1024", "macro": "WOLFSSL_ML_KEM_1024", "group": "MLKEM1024"},
 ]
 
 SIGS = [
     # Classical Baseline Signatures
     #{"name": "ECDSA-P-256", "key_gen": "ec:prime256v1", "ssl_group": "P-256"},
     # Post-Quantum Signatures
-    #{"name": "ML-DSA-44", "key_gen": "ML-DSA-44"},
+    {"name": "ML-DSA-44", "key_gen": "ML-DSA-44"},
     #{"name": "ML-DSA-65", "key_gen": "ML-DSA-65"},
-    {"name": "ML-DSA-87", "key_gen": "ML-DSA-87"},
+    #{"name": "ML-DSA-87", "key_gen": "ML-DSA-87"},
     # Post-Quantum Signatures (Hash-Based - FIPS 205)
     # TLS has no standardized SLH-DSA CertificateVerify scheme. SLH-DSA signs
     # ECDSA leaf certificates, so both peers verify FIPS-205 chain signatures.
-    {"name": "SLH-DSA-SHAKE-128s", "key_gen": "SLH-DSA-SHAKE-128s",
-     "leaf_key_gen": "ec:prime256v1"},
-    {"name": "SLH-DSA-SHAKE-192s", "key_gen": "SLH-DSA-SHAKE-192s",
-     "leaf_key_gen": "ec:prime256v1"},
-    {"name": "SLH-DSA-SHAKE-256s", "key_gen": "SLH-DSA-SHAKE-256s",
-     "leaf_key_gen": "ec:prime256v1"},
+    #{"name": "SLH-DSA-SHAKE-128s", "key_gen": "SLH-DSA-SHAKE-128s",
+    # "leaf_key_gen": "ec:prime256v1"},
+    #{"name": "SLH-DSA-SHAKE-192s", "key_gen": "SLH-DSA-SHAKE-192s",
+    # "leaf_key_gen": "ec:prime256v1"},
+    #{"name": "SLH-DSA-SHAKE-256s", "key_gen": "SLH-DSA-SHAKE-256s",
+    # "leaf_key_gen": "ec:prime256v1"},
 ]
 
 # Generate the full matrix
@@ -93,6 +116,102 @@ def run_cmd(cmd, cwd=None, ignore_errors=False):
     if result.returncode != 0 and not ignore_errors:
         print(f"[ERROR] Command failed with return code {result.returncode}")
         exit(1)
+    return result
+
+def run_password_cmd(cmd, ignore_errors=False, popen=False):
+    """Run ssh/scp through expect when a password is configured."""
+    if not PI_PASSWORD:
+        if popen:
+            return subprocess.Popen(cmd)
+        result = subprocess.run(cmd)
+        if result.returncode != 0 and not ignore_errors:
+            print(f"[ERROR] Command failed with return code {result.returncode}")
+            exit(1)
+        return result
+
+    def tcl_word(value):
+        return "{" + value.replace("\\", "\\\\").replace("{", "\\{").replace("}", "\\}") + "}"
+
+    tcl_cmd = " ".join(tcl_word(part) for part in cmd)
+    expect_script = "set cmd [list " + tcl_cmd + r''']
+set timeout -1
+log_user 1
+spawn {*}$cmd
+expect {
+    -re "(?i)are you sure.*yes/no.*" {
+        send "yes\r"
+        exp_continue
+    }
+    -re "(?i)password:" {
+        send "$env(PI_PASSWORD)\r"
+        exp_continue
+    }
+    eof
+}
+catch wait result
+exit [lindex $result 3]
+'''
+    env = os.environ.copy()
+    env["PI_PASSWORD"] = PI_PASSWORD
+    wrapped = ["expect", "-c", expect_script]
+
+    if popen:
+        return subprocess.Popen(wrapped, env=env)
+
+    result = subprocess.run(wrapped, env=env)
+    if result.returncode != 0 and not ignore_errors:
+        print(f"[ERROR] Command failed with return code {result.returncode}")
+        exit(1)
+    return result
+
+def pi_ssh_cmd(remote_cmd):
+    return [
+        "ssh",
+        "-o", "StrictHostKeyChecking=accept-new",
+        "-o", "ServerAliveInterval=15",
+        "-o", "ServerAliveCountMax=4",
+        f"{PI_USER}@{PI_HOST}",
+        remote_cmd,
+    ]
+
+def run_pi_cmd(remote_cmd, ignore_errors=False):
+    print(f"\n[PI RUNNING] ssh {PI_USER}@{PI_HOST} {remote_cmd}")
+    return run_password_cmd(pi_ssh_cmd(remote_cmd), ignore_errors=ignore_errors)
+
+def popen_pi_cmd(remote_cmd):
+    print(f"\n[PI LAUNCHING] ssh {PI_USER}@{PI_HOST} {remote_cmd}")
+    return run_password_cmd(pi_ssh_cmd(remote_cmd), popen=True)
+
+def scp_to_pi(local_path, remote_path):
+    print(f"\n[PI COPYING] {local_path} -> {PI_USER}@{PI_HOST}:{remote_path}")
+    cmd = [
+        "scp",
+        "-o", "StrictHostKeyChecking=accept-new",
+        "-r",
+        local_path,
+        f"{PI_USER}@{PI_HOST}:{remote_path}",
+    ]
+    return run_password_cmd(cmd)
+
+def build_offline_pi_debs():
+    """Build an arm64 .deb bundle when the Pi has no internet route."""
+    print("\n[PI OFFLINE] Building arm64 Debian package bundle locally...")
+    if os.path.exists(PI_OFFLINE_DEBS_DIR):
+        shutil.rmtree(PI_OFFLINE_DEBS_DIR)
+    os.makedirs(PI_OFFLINE_DEBS_DIR, exist_ok=True)
+
+    package_list = "libbluetooth-dev mosquitto mosquitto-clients"
+    run_cmd([
+        "docker", "run", "--rm", "--platform", "linux/arm64",
+        "-v", f"{PI_OFFLINE_DEBS_DIR}:/debs",
+        "debian:trixie-slim",
+        "sh", "-lc",
+        "echo 'deb [trusted=yes] http://archive.raspberrypi.com/debian trixie main' "
+        "> /etc/apt/sources.list.d/raspberrypi.list && "
+        "apt-get update && "
+        f"apt-get install --download-only -y {package_list} && "
+        "cp /var/cache/apt/archives/*.deb /debs/"
+    ])
 
 def ensure_docker_running():
     """Checks if Docker is running, and auto-starts it on macOS if it isn't."""
@@ -259,7 +378,26 @@ Groups = {openssl_group_string}
     with open(conf_path, "w") as f:
         f.write(conf_content)
 
-def start_mosquitto_broker():
+def write_mosquitto_conf(config_dir, output_path):
+    conf_content = f"""listener 8883
+allow_anonymous false
+password_file {config_dir}/passwd
+cafile {config_dir}/ca.crt
+certfile {config_dir}/server.crt
+keyfile {config_dir}/server.key
+require_certificate true
+use_identity_as_username true
+"""
+    with open(output_path, "w") as f:
+        f.write(conf_content)
+
+def generate_mosquitto_confs():
+    write_mosquitto_conf("/mosquitto/config",
+                         os.path.join(OUTPUT_DIR, "mosquitto.conf"))
+    write_mosquitto_conf(f"{PI_WORKDIR}/certs",
+                         os.path.join(OUTPUT_DIR, "mosquitto.pi.conf"))
+
+def start_local_mosquitto_broker():
     print("\n--- STEP 3: STARTING PQC MOSQUITTO BROKER ---")
     run_cmd(["docker", "rm", "-f", BROKER_CONTAINER_NAME], ignore_errors=True)
     
@@ -281,6 +419,162 @@ def start_mosquitto_broker():
         DOCKER_IMAGE,
         "mosquitto", "-c", "/mosquitto/config/mosquitto.conf", "-v"
     ])
+
+def ensure_raspberry_pi_ready():
+    print("\n--- STEP 2B: PREPARING RASPBERRY PI SERVER ---")
+    q_workdir = shlex.quote(PI_WORKDIR)
+    run_pi_cmd(f"mkdir -p {q_workdir}/certs {q_workdir}/logs")
+    scp_to_pi(os.path.join(NRF_PROJECT_DIR, "raspberry_pi", "ble_mqtt_bridge.c"),
+              f"{PI_WORKDIR}/ble_mqtt_bridge.c")
+    scp_to_pi(os.path.join(NRF_PROJECT_DIR, "raspberry_pi", "setup_raspberry_pi.sh"),
+              f"{PI_WORKDIR}/setup_raspberry_pi.sh")
+    scp_to_pi(os.path.join(NRF_PROJECT_DIR, "scripts", "ble_l2cap_gateway.py"),
+              f"{PI_WORKDIR}/ble_l2cap_gateway.py")
+    setup_cmd = f"chmod +x {q_workdir}/setup_raspberry_pi.sh && cd {q_workdir} && ./setup_raspberry_pi.sh"
+    result = run_pi_cmd(setup_cmd, ignore_errors=True)
+    if result.returncode != 0:
+        print("[PI OFFLINE] Online apt setup failed; trying offline .deb bundle.")
+        build_offline_pi_debs()
+        run_pi_cmd(f"rm -rf {q_workdir}/offline_debs && mkdir -p {q_workdir}/offline_debs")
+        for deb_path in glob.glob(os.path.join(PI_OFFLINE_DEBS_DIR, "*.deb")):
+            scp_to_pi(deb_path, f"{PI_WORKDIR}/offline_debs/")
+        run_pi_cmd(
+            f"cd {q_workdir}/offline_debs && "
+            f"sudo dpkg -i ./*.deb || sudo apt-get -f install -y",
+            ignore_errors=True,
+        )
+        run_pi_cmd(setup_cmd)
+
+    run_pi_cmd(
+        "sudo sed -i -E "
+        "'s/^#?MinConnectionInterval=.*/MinConnectionInterval=12/; "
+        "s/^#?MaxConnectionInterval=.*/MaxConnectionInterval=12/; "
+        "s/^#?ConnectionLatency=.*/ConnectionLatency=0/; "
+        "s/^#?ConnectionSupervisionTimeout=.*/ConnectionSupervisionTimeout=400/' "
+        "/etc/bluetooth/main.conf && "
+        "sudo systemctl restart bluetooth && "
+        f"chmod +x {q_workdir}/ble_l2cap_gateway.py"
+    )
+
+def deploy_raspberry_pi_assets():
+    print("\n--- STEP 3: DEPLOYING CERTS AND CONFIG TO RASPBERRY PI ---")
+    cert_files = [
+        "ca.crt",
+        "client.crt",
+        "client.key",
+        "server.crt",
+        "server.key",
+        "openssl.cnf",
+        "passwd",
+    ]
+    for filename in cert_files:
+        scp_to_pi(os.path.join(OUTPUT_DIR, filename), f"{PI_WORKDIR}/certs/{filename}")
+    scp_to_pi(os.path.join(OUTPUT_DIR, "mosquitto.pi.conf"),
+              f"{PI_WORKDIR}/certs/mosquitto.conf")
+    run_pi_cmd(
+        f"chmod 600 {shlex.quote(PI_WORKDIR)}/certs/*.key && "
+        f"ls -l {shlex.quote(PI_WORKDIR)}/certs"
+    )
+
+def stop_raspberry_pi_services():
+    q_workdir = shlex.quote(PI_WORKDIR)
+    mosquitto_conf_pattern = f"[/]{PI_WORKDIR.lstrip('/')}/certs/mosquitto.conf"
+    run_pi_cmd(
+        f"if [ -f {q_workdir}/mosquitto.pid ]; then "
+        f"sudo kill $(cat {q_workdir}/mosquitto.pid) || true; "
+        f"rm -f {q_workdir}/mosquitto.pid; fi; "
+        f"pkill -f '{PI_WORKDIR}/ble_mqtt_bridg[e]' 2>/dev/null || true; "
+        f"pkill -f '{PI_WORKDIR}/ble_l2cap_gatewa[y].py' 2>/dev/null || true; "
+        f"pids=$(pgrep -f {shlex.quote(mosquitto_conf_pattern)} || true); "
+        "if [ -n \"$pids\" ]; then sudo kill $pids || true; fi",
+        ignore_errors=True,
+    )
+
+def start_raspberry_pi_mosquitto():
+    print("\n--- STEP 3B: STARTING RASPBERRY PI MOSQUITTO ---")
+    stop_raspberry_pi_services()
+    q_workdir = shlex.quote(PI_WORKDIR)
+    run_pi_cmd(
+        f"cd {q_workdir} && "
+        f"setsid -f env OPENSSL_CONF={q_workdir}/certs/openssl.cnf "
+        f"{shlex.quote(PI_MOSQUITTO)} -c {q_workdir}/certs/mosquitto.conf -v "
+        f"> {q_workdir}/logs/mosquitto.log 2>&1 < /dev/null; "
+        f"sleep 1; "
+        f"pgrep -n -f 'mosquitto -c {PI_WORKDIR}/certs/mosquitto.conf' > {q_workdir}/mosquitto.pid || true; "
+        f"tail -30 {q_workdir}/logs/mosquitto.log"
+    )
+
+def start_legacy_raspberry_pi_bridge():
+    bridge_args = [
+        f"--adapter {shlex.quote(PI_ADAPTER)}",
+        f"--name {shlex.quote(BLE_DEVICE_NAME)}",
+        f"--psm {shlex.quote(L2CAP_PSM)}",
+        "--tcp-host 127.0.0.1",
+        "--tcp-port 8883",
+        f"--mtu {BRIDGE_MTU}",
+    ]
+    if BLE_DEVICE_ADDR:
+        bridge_args.append(f"--addr {shlex.quote(BLE_DEVICE_ADDR)}")
+        bridge_args.append(f"--addr-type {shlex.quote(BLE_DEVICE_ADDR_TYPE)}")
+
+    q_workdir = shlex.quote(PI_WORKDIR)
+    remote_cmd = (
+        f"cd {q_workdir} && "
+        f"sudo {q_workdir}/ble_mqtt_bridge {' '.join(bridge_args)}"
+    )
+    return popen_pi_cmd(remote_cmd)
+
+def start_raspberry_pi_bridge():
+    if PI_GATEWAY_IMPL == "legacy_c":
+        return start_legacy_raspberry_pi_bridge()
+    if PI_GATEWAY_IMPL != "python":
+        raise ValueError(
+            f"Unsupported PI_GATEWAY_IMPL={PI_GATEWAY_IMPL!r}; use 'python' or 'legacy_c'"
+        )
+
+    bridge_args = [
+        f"--name {shlex.quote(BLE_DEVICE_NAME)}",
+        f"--addr-type {shlex.quote(BLE_DEVICE_ADDR_TYPE)}",
+        f"--psm {shlex.quote(L2CAP_PSM)}",
+        "--broker-host 127.0.0.1",
+        "--broker-port 8883",
+        f"--l2cap-mtu {BRIDGE_MTU}",
+        f"--ble-write-chunk {BRIDGE_MTU}",
+        "--scan-seconds 8",
+        "--retries 60",
+        "--connect-timeout 10",
+    ]
+    if BLE_DEVICE_ADDR:
+        bridge_args.append(f"--addr {shlex.quote(BLE_DEVICE_ADDR)}")
+
+    q_workdir = shlex.quote(PI_WORKDIR)
+    remote_cmd = (
+        f"cd {q_workdir} && "
+        f"sudo python3 -u {q_workdir}/ble_l2cap_gateway.py {' '.join(bridge_args)}"
+    )
+    return popen_pi_cmd(remote_cmd)
+
+def publish_disconnect():
+    if SERVER_BACKEND == "raspberry_pi":
+        q_workdir = shlex.quote(PI_WORKDIR)
+        run_pi_cmd(
+            f"{shlex.quote(PI_MOSQUITTO_PUB)} -h localhost -p 8883 "
+            f"--cafile {q_workdir}/certs/ca.crt "
+            f"--cert {q_workdir}/certs/server.crt "
+            f"--key {q_workdir}/certs/server.key "
+            f"-t {shlex.quote(MQTT_CMD_TOPIC)} -m disconnect",
+            ignore_errors=True,
+        )
+        return
+
+    run_cmd([
+        "docker", "exec", BROKER_CONTAINER_NAME, "mosquitto_pub",
+        "-h", "localhost", "-p", "8883",
+        "--cafile", "/mosquitto/config/ca.crt",
+        "--cert", "/mosquitto/config/server.crt",
+        "--key", "/mosquitto/config/server.key",
+        "-t", MQTT_CMD_TOPIC, "-m", "disconnect"
+    ], ignore_errors=True)
 
 def build_and_flash(pqc_macro):
     print("\n--- STEP 4: WEST BUILD & FLASH ---")
@@ -350,7 +644,11 @@ if __name__ == "__main__":
     ensure_pqc_image()
 
     # Interrupted benchmark runs otherwise leave a proxy holding the BLE link.
-    subprocess.run(["pkill", "-f", BLE_PROXY], capture_output=True)
+    if SERVER_BACKEND == "raspberry_pi":
+        ensure_raspberry_pi_ready()
+        stop_raspberry_pi_services()
+    else:
+        subprocess.run(["pkill", "-f", BLE_PROXY], capture_output=True)
 
     # Ensure BENCHMARK_SUITE is a list of dictionaries
     for algo in BENCHMARK_SUITE:
@@ -366,12 +664,17 @@ if __name__ == "__main__":
         generate_certificates(algo) 
         update_nrf_source()
         generate_openssl_conf(algo['openssl_group'])
-        start_mosquitto_broker()
+        generate_mosquitto_confs()
+        if SERVER_BACKEND == "raspberry_pi":
+            deploy_raspberry_pi_assets()
+            start_raspberry_pi_mosquitto()
+        else:
+            start_local_mosquitto_broker()
         build_and_flash(algo['macro'])
         
         # 1. THE USB BOUNCE DELAY
         # Give the board 5 seconds to boot Zephyr and re-mount its USB drive to macOS
-        print("\n[WAITING] Allowing nRF52840 to boot and USB to enumerate...")
+        print(f"\n[WAITING] Allowing {BOARD} to boot and USB to enumerate...")
         time.sleep(5) 
         
         # 2. OPEN THE SERIAL PORT FIRST (Before starting the handshake!)
@@ -388,12 +691,20 @@ if __name__ == "__main__":
             print("[CRITICAL] Could not open serial port after 5 attempts. Skipping...")
             continue
 
-        # Clear any garbage binary from the boot sequence
-        ser.reset_input_buffer()
+        print("\n[BOOT LOG] Draining queued serial output before launching bridge...")
+        boot_log_deadline = time.time() + 2
+        while time.time() < boot_log_deadline:
+            line = ser.readline().decode('utf-8', errors='ignore').strip()
+            if line:
+                print(f"[{BOARD}] {line}")
 
-        # 3. NOW LAUNCH THE MAC GATEWAY TO START THE HANDSHAKE
-        print("[LAUNCHING] Starting Swift BLE Proxy...")
-        xcode_app_proc = subprocess.Popen([BLE_PROXY])
+        # 3. NOW LAUNCH THE GATEWAY TO START THE HANDSHAKE
+        if SERVER_BACKEND == "raspberry_pi":
+            print(f"[LAUNCHING] Starting Raspberry Pi BLE/L2CAP {PI_GATEWAY_IMPL} bridge...")
+            gateway_proc = start_raspberry_pi_bridge()
+        else:
+            print("[LAUNCHING] Starting Swift BLE Proxy...")
+            gateway_proc = subprocess.Popen([BLE_PROXY])
 
         # 4. CAPTURE THE RESULT
         print("\n[LISTENING] Waiting for Zephyr to finish the handshake...")
@@ -405,7 +716,7 @@ if __name__ == "__main__":
                 line = ser.readline().decode('utf-8', errors='ignore').strip()
                 
                 if line:
-                    print(f"[NRF52840] {line}")
+                    print(f"[{BOARD}] {line}")
                     
                 # THE FIX: Match the exact string from your Zephyr C-Code
                 if "Handshake_Time_MS:" in line: 
@@ -419,18 +730,17 @@ if __name__ == "__main__":
         save_benchmark_result(algo['name'], handshake_time)
         ser.close()
 
-        print("\nSending disconnect signal to nRF52840...")
-        run_cmd([
-            "docker", "exec", BROKER_CONTAINER_NAME, "mosquitto_pub",
-            "-h", "localhost", "-p", "8883",
-            "--cafile", "/mosquitto/config/ca.crt",
-            "--cert", "/mosquitto/config/server.crt",
-            "--key", "/mosquitto/config/server.key",
-            "-t", "nrf52840/cmd", "-m", "disconnect"
-        ], ignore_errors=True)
+        print(f"\nSending disconnect signal to {MQTT_CMD_TOPIC}...")
+        publish_disconnect()
         
         time.sleep(5) 
-        xcode_app_proc.terminate()
+        gateway_proc.terminate()
+        try:
+            gateway_proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            gateway_proc.kill()
+        if SERVER_BACKEND == "raspberry_pi":
+            stop_raspberry_pi_services()
         
         print(f"✅ {algo['name']} Benchmark Complete.")
         

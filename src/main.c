@@ -12,7 +12,7 @@
 #include "client_key.h"
 #include "ca_cert.h"
 
-#define L2CAP_SDU_MTU 2000
+#define L2CAP_SDU_MTU 672
 #define TLS_RX_RINGBUF_SIZE 16384
 
 /*
@@ -169,9 +169,14 @@ static struct bt_l2cap_chan_ops l2cap_ops = {
     .disconnected = l2cap_disconnected,
 };
 
-static const struct bt_data ad[] = {
+static const struct bt_data ad_l2cap_ok[] = {
     BT_DATA_BYTES(BT_DATA_FLAGS, (BT_LE_AD_GENERAL | BT_LE_AD_NO_BREDR)),
-    BT_DATA_BYTES(BT_DATA_NAME_COMPLETE, 'Z', 'e', 'p', 'h', 'y', 'r')
+    BT_DATA_BYTES(BT_DATA_NAME_COMPLETE, 'P', 'Q', 'C', '5', '2', '8', '4', '0')
+};
+
+static const struct bt_data ad_l2cap_error[] = {
+    BT_DATA_BYTES(BT_DATA_FLAGS, (BT_LE_AD_GENERAL | BT_LE_AD_NO_BREDR)),
+    BT_DATA_BYTES(BT_DATA_NAME_COMPLETE, 'P', 'Q', 'C', '-', 'L', '2', 'E', 'R', 'R')
 };
 
 static void handle_command(const byte *payload, word32 len)
@@ -437,8 +442,8 @@ void start_secure_mqtt_session(struct bt_l2cap_chan *chan) {
                 unsigned char mqtt_subscribe_pkt[] = {
                     0x82, 0x10,                 // Header: Subscribe (0x82), Length 16
                     0x00, 0x01,                 // Packet Identifier: 1
-                    0x00, 0x0B,                 // Topic Length: 11
-                    'n', 'r', 'f', '5', '3', '4', '0', '/', 'c', 'm', 'd', // Topic String
+                    0x00, 0x0C,                 // Topic Length: 12
+                    'n', 'r', 'f', '5', '2', '8', '4', '0', '/', 'c', 'm', 'd', // Topic String
                     0x00                        // Requested QoS: 0
                 };
                 wolfSSL_write(ssl, mqtt_subscribe_pkt, sizeof(mqtt_subscribe_pkt));
@@ -492,10 +497,25 @@ void start_secure_mqtt_session(struct bt_l2cap_chan *chan) {
 }
 
 static const struct bt_le_adv_param adv_param = {
-    .options = 0x0001 | 0x0002, /* CONNECTABLE | USE_NAME */
+    .options = BT_LE_ADV_OPT_CONN | BT_LE_ADV_OPT_USE_IDENTITY,
     .interval_min = 0x0100,
     .interval_max = 0x0150,
 };
+
+static void print_local_identities(void)
+{
+    bt_addr_le_t addrs[CONFIG_BT_ID_MAX];
+    size_t count = ARRAY_SIZE(addrs);
+
+    bt_id_get(addrs, &count);
+    for (size_t i = 0; i < count; i++) {
+        char addr_str[BT_ADDR_LE_STR_LEN];
+
+        bt_addr_le_to_str(&addrs[i], addr_str, sizeof(addr_str));
+        printk("[BLE] Local identity %u: %s%s\n", (unsigned int)i, addr_str,
+               i == BT_ID_DEFAULT ? " (advertising default)" : "");
+    }
+}
 
 int main(void) {
 #if HAS_STATUS_LED
@@ -525,13 +545,16 @@ int main(void) {
     wolfssl_heap_report("initialized");
 
     settings_load();
+    print_local_identities();
 
-    bt_addr_le_t addr;
-    bt_addr_le_from_str("F8:69:5E:1E:CE:2F", "random", &addr);
-    bt_id_create(&addr, NULL);
-
-    bt_l2cap_server_register(&l2cap_server);
-    printk("Registering L2CAP server with PSM: 0x%04x\n", l2cap_server.psm);    
+    int l2cap_err = bt_l2cap_server_register(&l2cap_server);
+    if (l2cap_err) {
+        printk("L2CAP server registration failed for PSM 0x%04x: %d\n",
+               l2cap_server.psm, l2cap_err);
+    } else {
+        printk("L2CAP server registered with PSM: 0x%04x\n",
+               l2cap_server.psm);
+    }
     
     k_msleep(100);
 
@@ -543,7 +566,9 @@ int main(void) {
         l2cap_peer_disconnected = false;
         l2cap_rx_overflow = false;
         
-        int err = bt_le_adv_start(&adv_param, ad, ARRAY_SIZE(ad), NULL, 0);
+        const struct bt_data *active_ad = l2cap_err ? ad_l2cap_error : ad_l2cap_ok;
+        size_t active_ad_len = l2cap_err ? ARRAY_SIZE(ad_l2cap_error) : ARRAY_SIZE(ad_l2cap_ok);
+        int err = bt_le_adv_start(&adv_param, active_ad, active_ad_len, NULL, 0);
         if (err && err != -EALREADY) {
             printk("Advertising failed to start (err %d)\n", err);
         } else {
