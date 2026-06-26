@@ -55,7 +55,8 @@ BLE_DEVICE_ADDR = os.environ.get("BLE_DEVICE_ADDR", "")
 BLE_DEVICE_ADDR_TYPE = os.environ.get("BLE_DEVICE_ADDR_TYPE", "random")
 L2CAP_PSM = os.environ.get("L2CAP_PSM", "0x0080")
 BRIDGE_MTU = int(os.environ.get("BRIDGE_MTU", "672"))
-PI_GATEWAY_IMPL = os.environ.get("PI_GATEWAY_IMPL", "python")
+PI_GATEWAY_IMPL = os.environ.get("PI_GATEWAY_IMPL", "legacy_c")
+PI_DISABLE_WIFI_DURING_BLE = os.environ.get("PI_DISABLE_WIFI_DURING_BLE", "1") not in ("0", "false", "False", "no", "NO")
 
 # Docker config
 DOCKER_IMAGE = "pqc-openssl:3.5"
@@ -447,8 +448,8 @@ def ensure_raspberry_pi_ready():
 
     run_pi_cmd(
         "sudo sed -i -E "
-        "'s/^#?MinConnectionInterval=.*/MinConnectionInterval=12/; "
-        "s/^#?MaxConnectionInterval=.*/MaxConnectionInterval=12/; "
+        "'s/^#?MinConnectionInterval=.*/MinConnectionInterval=24/; "
+        "s/^#?MaxConnectionInterval=.*/MaxConnectionInterval=40/; "
         "s/^#?ConnectionLatency=.*/ConnectionLatency=0/; "
         "s/^#?ConnectionSupervisionTimeout=.*/ConnectionSupervisionTimeout=400/' "
         "/etc/bluetooth/main.conf && "
@@ -479,6 +480,10 @@ def deploy_raspberry_pi_assets():
 def stop_raspberry_pi_services():
     q_workdir = shlex.quote(PI_WORKDIR)
     mosquitto_conf_pattern = f"[/]{PI_WORKDIR.lstrip('/')}/certs/mosquitto.conf"
+    wifi_restore_cmd = (
+        "sudo nmcli radio wifi on 2>/dev/null || "
+        "sudo ip link set wlan0 up 2>/dev/null || true"
+    ) if PI_DISABLE_WIFI_DURING_BLE else "true"
     run_pi_cmd(
         f"if [ -f {q_workdir}/mosquitto.pid ]; then "
         f"sudo kill $(cat {q_workdir}/mosquitto.pid) || true; "
@@ -486,7 +491,8 @@ def stop_raspberry_pi_services():
         f"pkill -f '{PI_WORKDIR}/ble_mqtt_bridg[e]' 2>/dev/null || true; "
         f"pkill -f '{PI_WORKDIR}/ble_l2cap_gatewa[y].py' 2>/dev/null || true; "
         f"pids=$(pgrep -f {shlex.quote(mosquitto_conf_pattern)} || true); "
-        "if [ -n \"$pids\" ]; then sudo kill $pids || true; fi",
+        "if [ -n \"$pids\" ]; then sudo kill $pids || true; fi; "
+        f"{wifi_restore_cmd}",
         ignore_errors=True,
     )
 
@@ -512,7 +518,12 @@ def start_legacy_raspberry_pi_bridge():
         "--tcp-host 127.0.0.1",
         "--tcp-port 8883",
         f"--mtu {BRIDGE_MTU}",
+        "--scan-timeout 2",
+        "--forget-cache",
+        "--no-acl-prime",
     ]
+    if PI_DISABLE_WIFI_DURING_BLE:
+        bridge_args.append("--disable-wifi")
     if BLE_DEVICE_ADDR:
         bridge_args.append(f"--addr {shlex.quote(BLE_DEVICE_ADDR)}")
         bridge_args.append(f"--addr-type {shlex.quote(BLE_DEVICE_ADDR_TYPE)}")

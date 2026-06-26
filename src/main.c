@@ -126,6 +126,45 @@ static struct bt_l2cap_le_chan l2cap_chan;
 static volatile bool l2cap_rx_overflow;
 static volatile bool l2cap_peer_disconnected;
 
+static void bt_connected(struct bt_conn *conn, uint8_t err)
+{
+    char addr[BT_ADDR_LE_STR_LEN];
+
+    bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
+    if (err) {
+        printk("[BLE] ACL connection to %s failed: err=0x%02x\n", addr, err);
+        return;
+    }
+
+    printk("[BLE] ACL connected: %s\n", addr);
+}
+
+static void bt_disconnected(struct bt_conn *conn, uint8_t reason)
+{
+    char addr[BT_ADDR_LE_STR_LEN];
+
+    bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
+    printk("[BLE] ACL disconnected: %s reason=0x%02x\n", addr, reason);
+    l2cap_peer_disconnected = true;
+    k_sem_give(&rx_sem);
+}
+
+static void bt_le_param_updated(struct bt_conn *conn, uint16_t interval,
+                                uint16_t latency, uint16_t timeout)
+{
+    char addr[BT_ADDR_LE_STR_LEN];
+
+    bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
+    printk("[BLE] Params updated for %s: interval=%u latency=%u timeout=%u\n",
+           addr, interval, latency, timeout);
+}
+
+BT_CONN_CB_DEFINE(conn_callbacks) = {
+    .connected = bt_connected,
+    .disconnected = bt_disconnected,
+    .le_param_updated = bt_le_param_updated,
+};
+
 /* FIX 2: Provide an allocation callback so Zephyr doesn't drop incoming data */
 static struct net_buf *l2cap_alloc_buf(struct bt_l2cap_chan *chan) {
     return net_buf_alloc(&l2cap_rx_pool, K_MSEC(100));
