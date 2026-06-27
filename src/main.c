@@ -107,6 +107,10 @@ static const struct gpio_dt_spec led = GPIO_DT_SPEC_GET(LED0_NODE, gpios);
 #define HEARTBEAT_INTERVAL_MS 30000 // 30 Seconds
 #define TIMEOUT_THRESHOLD_MS  45000 // 45 Seconds
 
+#ifndef BENCHMARK_CLOSE_AFTER_TLS
+#define BENCHMARK_CLOSE_AFTER_TLS 1
+#endif
+
 static void update_led(bool on)
 {
 #if HAS_STATUS_LED
@@ -119,12 +123,19 @@ static void update_led(bool on)
 }
 
 /* --- BLUETOOTH L2CAP BRIDGE --- */
-NET_BUF_POOL_DEFINE(l2cap_tx_pool, 2, BT_L2CAP_BUF_SIZE(L2CAP_SDU_MTU), 8, NULL);
+/*
+ * ML-KEM-768 and ML-KEM-1024 ClientHello records are larger than one or two
+ * 672-byte LE CoC SDUs.  With only two TX buffers, the first TLS flight can be
+ * truncated/stalled after the second chunk; Mosquitto then waits forever for
+ * the rest of the TLS record and the board only sees WANT_READ until timeout.
+ */
+NET_BUF_POOL_DEFINE(l2cap_tx_pool, 5, BT_L2CAP_BUF_SIZE(L2CAP_SDU_MTU), 8, NULL);
 NET_BUF_POOL_DEFINE(l2cap_rx_pool, 3, BT_L2CAP_BUF_SIZE(L2CAP_SDU_MTU), 8, NULL);
 
 static struct bt_l2cap_le_chan l2cap_chan;
 static volatile bool l2cap_rx_overflow;
 static volatile bool l2cap_peer_disconnected;
+static volatile bool disconnect_requested;
 
 static void bt_connected(struct bt_conn *conn, uint8_t err)
 {
@@ -189,6 +200,7 @@ static void l2cap_connected(struct bt_l2cap_chan *chan) {
 
     l2cap_peer_disconnected = false;
     l2cap_rx_overflow = false;
+    disconnect_requested = false;
 
     printk("[L2CAP] Channel connected. RX MTU=%u TX MTU=%u\n",
            le_chan->rx.mtu, le_chan->tx.mtu);
@@ -238,6 +250,9 @@ static void handle_command(const byte *payload, word32 len)
 			(void)gpio_pin_toggle_dt(&led);
 		}
 #endif
+	} else if (strcmp(msg, "disconnect") == 0) {
+        printk("Disconnect command received. Closing TLS session gracefully.\n");
+        disconnect_requested = true;
 	}
     // else if (strcmp(msg, "ping") == 0) {
 	//	ping_requested = true;
@@ -276,6 +291,10 @@ int l2cap_wolfssl_send(WOLFSSL* ssl, char* buf, int sz, void* ctx) {
     struct bt_l2cap_le_chan *le_chan = CONTAINER_OF(chan, struct bt_l2cap_le_chan, chan);
     int sent = 0;
 
+    if (l2cap_peer_disconnected && !ring_buf_is_empty(&rx_ringbuf)) {
+        return WOLFSSL_CBIO_ERR_WANT_READ;
+    }
+
     if (!chan || !chan->conn) { return WOLFSSL_CBIO_ERR_CONN_CLOSE; }
 
     uint16_t mtu = MIN(le_chan->tx.mtu, L2CAP_SDU_MTU);
@@ -288,6 +307,9 @@ int l2cap_wolfssl_send(WOLFSSL* ssl, char* buf, int sz, void* ctx) {
         int err = 0;
         do {
             /* 1. Abort if connection dropped during retry */
+            if (l2cap_peer_disconnected && !ring_buf_is_empty(&rx_ringbuf)) {
+                return sent > 0 ? sent : WOLFSSL_CBIO_ERR_WANT_READ;
+            }
             if (!chan || !chan->conn) {
                 return sent > 0 ? sent : WOLFSSL_CBIO_ERR_CONN_CLOSE;
             }
@@ -324,20 +346,27 @@ int l2cap_wolfssl_send(WOLFSSL* ssl, char* buf, int sz, void* ctx) {
 /* FIX 5: Safely wait for data without locking up wolfSSL */
 int l2cap_wolfssl_recv(WOLFSSL* ssl, char* buf, int sz, void* ctx) {
     struct bt_l2cap_chan *chan = (struct bt_l2cap_chan *)ctx;
-    
-    if (!chan || !chan->conn || l2cap_peer_disconnected) {
-        return WOLFSSL_CBIO_ERR_CONN_CLOSE;
-    }
 
     if (l2cap_rx_overflow) {
         printk("[WOLFSSL RX] Failing TLS session after L2CAP RX overflow.\n");
         return WOLFSSL_CBIO_ERR_GENERAL;
     }
 
+    /*
+     * Drain data that was already received before treating the transport as
+     * closed.  Mosquitto often sends a final TLS alert/close_notify and then
+     * closes TCP; the bridge forwards that last SDU and L2CAP disconnects right
+     * after it.  If we check chan->conn first, wolfSSL only sees SOCKET_ERROR_E
+     * (-308) and never gets the real TLS close/alert bytes.
+     */
     uint32_t read_bytes = ring_buf_get(&rx_ringbuf, (uint8_t*)buf, sz);
     if (read_bytes > 0) {
         printk("[WOLFSSL RX] delivering %u bytes to wolfSSL\n", read_bytes);
         return read_bytes;
+    }
+
+    if (!chan || !chan->conn || l2cap_peer_disconnected) {
+        return WOLFSSL_CBIO_ERR_CONN_CLOSE;
     }
 
     /* Wait briefly. If nothing arrives, tell wolfSSL we want to read later. */
@@ -347,9 +376,55 @@ int l2cap_wolfssl_recv(WOLFSSL* ssl, char* buf, int sz, void* ctx) {
             printk("[WOLFSSL RX] delivering %u bytes to wolfSSL\n", read_bytes);
             return read_bytes;
         }
+        if (!chan->conn || l2cap_peer_disconnected) {
+            return WOLFSSL_CBIO_ERR_CONN_CLOSE;
+        }
     }
 
     return WOLFSSL_CBIO_ERR_WANT_READ;
+}
+
+static void shutdown_tls_gracefully(WOLFSSL *ssl, struct bt_l2cap_chan *chan)
+{
+    if (!ssl || !chan) {
+        return;
+    }
+
+    for (int attempt = 1; attempt <= 10; attempt++) {
+        int shutdown_ret = wolfSSL_shutdown(ssl);
+
+        if (shutdown_ret == WOLFSSL_SUCCESS) {
+            printk("TLS shutdown complete.\n");
+            return;
+        }
+
+        if (shutdown_ret == WOLFSSL_SHUTDOWN_NOT_DONE) {
+            if (l2cap_peer_disconnected && ring_buf_is_empty(&rx_ringbuf)) {
+                printk("TLS shutdown complete: peer closed after close_notify.\n");
+                return;
+            }
+            printk("TLS shutdown waiting for peer close_notify (%d/10).\n",
+                   attempt);
+            k_sleep(K_MSEC(100));
+            continue;
+        }
+
+        int err = wolfSSL_get_error(ssl, shutdown_ret);
+        if (err == WOLFSSL_ERROR_WANT_READ || err == WOLFSSL_ERROR_WANT_WRITE) {
+            if (l2cap_peer_disconnected && ring_buf_is_empty(&rx_ringbuf)) {
+                printk("TLS shutdown complete: peer closed transport.\n");
+                return;
+            }
+            printk("TLS shutdown waiting for transport (%d/10).\n", attempt);
+            k_sleep(K_MSEC(100));
+            continue;
+        }
+
+        printk("TLS shutdown stopped with wolfSSL error: %d\n", err);
+        return;
+    }
+
+    printk("TLS shutdown close_notify sent; peer did not finish shutdown in time.\n");
 }
 
 void start_secure_mqtt_session(struct bt_l2cap_chan *chan) {
@@ -419,6 +494,7 @@ void start_secure_mqtt_session(struct bt_l2cap_chan *chan) {
     wolfSSL_SetIOWriteCtx(ssl, chan);
 
     int wait_counter = 0;
+    disconnect_requested = false;
     printk("Starting TLS 1.3 Handshake...\n");
     int64_t start_time = k_uptime_get();
     do {
@@ -427,6 +503,12 @@ void start_secure_mqtt_session(struct bt_l2cap_chan *chan) {
             int err = wolfSSL_get_error(ssl, ret);
             printk("wolfSSL error = %d\n", err);
             if (err == WOLFSSL_ERROR_WANT_READ || err == WOLFSSL_ERROR_WANT_WRITE) {
+                if (l2cap_peer_disconnected && ring_buf_is_empty(&rx_ringbuf)) {
+                    printk("TLS Handshake Failed: peer closed connection\n");
+                    wolfSSL_free(ssl);
+                    wolfSSL_CTX_free(ctx);
+                    return;
+                }
                 wait_counter++;
                 if (wait_counter % 20 == 0) {
                     /* Prints once per second if trapped in the waiting loop */
@@ -445,6 +527,15 @@ void start_secure_mqtt_session(struct bt_l2cap_chan *chan) {
     printk(">>> TLS Handshake Successful! <<<\n");
     wolfssl_heap_report("handshake complete");
     printk("\n[BENCHMARK_RESULT] Handshake_Time_MS: %lld\n", (end_time - start_time));
+
+#if BENCHMARK_CLOSE_AFTER_TLS
+    printk("Benchmark complete. Closing TLS session gracefully.\n");
+    shutdown_tls_gracefully(ssl, chan);
+    wolfSSL_free(ssl);
+    wolfSSL_CTX_free(ctx);
+    return;
+#endif
+
     /* Send initial MQTT CONNECT packet */
     /* MQTT CONNECT Packet with Auth Flags */
 /* * Flags: 0xC2 
@@ -467,7 +558,7 @@ void start_secure_mqtt_session(struct bt_l2cap_chan *chan) {
     unsigned char rx_buf[128];
     int64_t last_activity = k_uptime_get();
 
-    while (chan->conn) {
+    while (chan->conn && !disconnect_requested) {
         /* 1. Non-blocking Read */
         int bytes_read = wolfSSL_read(ssl, rx_buf, sizeof(rx_buf));
         
@@ -479,7 +570,7 @@ void start_secure_mqtt_session(struct bt_l2cap_chan *chan) {
                 printk("Broker accepted connection! Subscribing to topic...\n");
                 
                 unsigned char mqtt_subscribe_pkt[] = {
-                    0x82, 0x10,                 // Header: Subscribe (0x82), Length 16
+                    0x82, 0x11,                 // Header: Subscribe (0x82), Length 17
                     0x00, 0x01,                 // Packet Identifier: 1
                     0x00, 0x0C,                 // Topic Length: 12
                     'n', 'r', 'f', '5', '2', '8', '4', '0', '/', 'c', 'm', 'd', // Topic String
@@ -492,11 +583,14 @@ void start_secure_mqtt_session(struct bt_l2cap_chan *chan) {
                 printk("Received command from broker!\n");
                 
                 // Parse the payload out of the packet
-                uint16_t topic_len = (rx_buf[2] << 8) | rx_buf[3];
-                uint16_t payload_offset = 4 + topic_len;
-                uint16_t payload_len = bytes_read - payload_offset;
-                
-                handle_command(&rx_buf[payload_offset], payload_len);
+                if (bytes_read >= 4) {
+                    uint16_t topic_len = (rx_buf[2] << 8) | rx_buf[3];
+                    uint16_t payload_offset = 4 + topic_len;
+                    if (payload_offset <= bytes_read) {
+                        uint16_t payload_len = bytes_read - payload_offset;
+                        handle_command(&rx_buf[payload_offset], payload_len);
+                    }
+                }
             } 
             /* 3. Catch PINGRESP */
             else if (rx_buf[0] == 0xD0) {
@@ -530,7 +624,12 @@ void start_secure_mqtt_session(struct bt_l2cap_chan *chan) {
         k_sleep(K_MSEC(100));
     }
 
+    if (disconnect_requested) {
+        printk("Disconnect command received by application loop.\n");
+    }
+
     printk("Closing Secure Session.\n");
+    shutdown_tls_gracefully(ssl, chan);
     wolfSSL_free(ssl);
     wolfSSL_CTX_free(ctx);
 }
@@ -604,6 +703,7 @@ int main(void) {
         k_sem_reset(&l2cap_connected_sem);
         l2cap_peer_disconnected = false;
         l2cap_rx_overflow = false;
+        disconnect_requested = false;
         
         const struct bt_data *active_ad = l2cap_err ? ad_l2cap_error : ad_l2cap_ok;
         size_t active_ad_len = l2cap_err ? ARRAY_SIZE(ad_l2cap_error) : ARRAY_SIZE(ad_l2cap_ok);
@@ -638,7 +738,7 @@ int main(void) {
         l2cap_chan.chan.conn = NULL;
         
         /* 4. Brief cooldown before firing up the radio again */
-        k_sleep(K_SECONDS(1));
+        k_sleep(K_SECONDS(2));
     }
     
     return 0;

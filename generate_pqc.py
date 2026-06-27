@@ -7,6 +7,7 @@ import serial
 import csv
 import shlex
 import glob
+import datetime
 
 def save_benchmark_result(name, duration_ms):
     filename = "pqc_benchmark_results.csv"
@@ -57,6 +58,7 @@ L2CAP_PSM = os.environ.get("L2CAP_PSM", "0x0080")
 BRIDGE_MTU = int(os.environ.get("BRIDGE_MTU", "672"))
 PI_GATEWAY_IMPL = os.environ.get("PI_GATEWAY_IMPL", "legacy_c")
 PI_DISABLE_WIFI_DURING_BLE = os.environ.get("PI_DISABLE_WIFI_DURING_BLE", "1") not in ("0", "false", "False", "no", "NO")
+PUBLISH_DISCONNECT_AFTER_HANDSHAKE = os.environ.get("PUBLISH_DISCONNECT_AFTER_HANDSHAKE", "0") in ("1", "true", "True", "yes", "YES")
 
 # Docker config
 DOCKER_IMAGE = "pqc-openssl:3.5"
@@ -69,26 +71,26 @@ OUTPUT_DIR = os.path.join(NRF_PROJECT_DIR, "generated_certs")
 
 KEMS = [
     {"name": "MLKEM512", "macro": "WOLFSSL_ML_KEM_512", "group": "MLKEM512"},
-    #{"name": "MLKEM768", "macro": "WOLFSSL_ML_KEM_768", "group": "MLKEM768"},
-    #{"name": "MLKEM1024", "macro": "WOLFSSL_ML_KEM_1024", "group": "MLKEM1024"},
+    {"name": "MLKEM768", "macro": "WOLFSSL_ML_KEM_768", "group": "MLKEM768"},
+    {"name": "MLKEM1024", "macro": "WOLFSSL_ML_KEM_1024", "group": "MLKEM1024"},
 ]
 
 SIGS = [
     # Classical Baseline Signatures
-    #{"name": "ECDSA-P-256", "key_gen": "ec:prime256v1", "ssl_group": "P-256"},
+    {"name": "ECDSA-P-256", "key_gen": "ec:prime256v1", "ssl_group": "P-256"},
     # Post-Quantum Signatures
     {"name": "ML-DSA-44", "key_gen": "ML-DSA-44"},
-    #{"name": "ML-DSA-65", "key_gen": "ML-DSA-65"},
-    #{"name": "ML-DSA-87", "key_gen": "ML-DSA-87"},
+    {"name": "ML-DSA-65", "key_gen": "ML-DSA-65"},
+    {"name": "ML-DSA-87", "key_gen": "ML-DSA-87"},
     # Post-Quantum Signatures (Hash-Based - FIPS 205)
     # TLS has no standardized SLH-DSA CertificateVerify scheme. SLH-DSA signs
     # ECDSA leaf certificates, so both peers verify FIPS-205 chain signatures.
-    #{"name": "SLH-DSA-SHAKE-128s", "key_gen": "SLH-DSA-SHAKE-128s",
-    # "leaf_key_gen": "ec:prime256v1"},
-    #{"name": "SLH-DSA-SHAKE-192s", "key_gen": "SLH-DSA-SHAKE-192s",
-    # "leaf_key_gen": "ec:prime256v1"},
-    #{"name": "SLH-DSA-SHAKE-256s", "key_gen": "SLH-DSA-SHAKE-256s",
-    # "leaf_key_gen": "ec:prime256v1"},
+    {"name": "SLH-DSA-SHAKE-128s", "key_gen": "SLH-DSA-SHAKE-128s",
+     "leaf_key_gen": "ec:prime256v1"},
+    {"name": "SLH-DSA-SHAKE-192s", "key_gen": "SLH-DSA-SHAKE-192s",
+     "leaf_key_gen": "ec:prime256v1"},
+    {"name": "SLH-DSA-SHAKE-256s", "key_gen": "SLH-DSA-SHAKE-256s",
+     "leaf_key_gen": "ec:prime256v1"},
 ]
 
 # Generate the full matrix
@@ -447,9 +449,15 @@ def ensure_raspberry_pi_ready():
         run_pi_cmd(setup_cmd)
 
     run_pi_cmd(
+        "sudo date -u -s "
+        f"{shlex.quote(datetime.datetime.now(datetime.UTC).strftime('%Y-%m-%d %H:%M:%S'))} "
+        ">/dev/null && date -u"
+    )
+
+    run_pi_cmd(
         "sudo sed -i -E "
-        "'s/^#?MinConnectionInterval=.*/MinConnectionInterval=24/; "
-        "s/^#?MaxConnectionInterval=.*/MaxConnectionInterval=40/; "
+        "'s/^#?MinConnectionInterval=.*/MinConnectionInterval=12/; "
+        "s/^#?MaxConnectionInterval=.*/MaxConnectionInterval=12/; "
         "s/^#?ConnectionLatency=.*/ConnectionLatency=0/; "
         "s/^#?ConnectionSupervisionTimeout=.*/ConnectionSupervisionTimeout=400/' "
         "/etc/bluetooth/main.conf && "
@@ -569,10 +577,11 @@ def publish_disconnect():
     if SERVER_BACKEND == "raspberry_pi":
         q_workdir = shlex.quote(PI_WORKDIR)
         run_pi_cmd(
+            f"OPENSSL_CONF={q_workdir}/certs/openssl.cnf "
             f"{shlex.quote(PI_MOSQUITTO_PUB)} -h localhost -p 8883 "
             f"--cafile {q_workdir}/certs/ca.crt "
-            f"--cert {q_workdir}/certs/server.crt "
-            f"--key {q_workdir}/certs/server.key "
+            f"--cert {q_workdir}/certs/client.crt "
+            f"--key {q_workdir}/certs/client.key "
             f"-t {shlex.quote(MQTT_CMD_TOPIC)} -m disconnect",
             ignore_errors=True,
         )
@@ -586,6 +595,23 @@ def publish_disconnect():
         "--key", "/mosquitto/config/server.key",
         "-t", MQTT_CMD_TOPIC, "-m", "disconnect"
     ], ignore_errors=True)
+
+def drain_serial_output(ser, seconds, reason="serial output"):
+    print(f"\n[LOG] Draining {reason} for {seconds}s...")
+    deadline = time.time() + seconds
+    original_timeout = ser.timeout
+    ser.timeout = 0.2
+    try:
+        while time.time() < deadline:
+            line = ser.readline().decode('utf-8', errors='ignore').strip()
+            if line:
+                print(f"[{BOARD}] {line}")
+                if "Session ended. Re-arming for next connection" in line:
+                    break
+    except serial.SerialException:
+        print("[-] Board disconnected while draining serial output.")
+    finally:
+        ser.timeout = original_timeout
 
 def build_and_flash(pqc_macro):
     print("\n--- STEP 4: WEST BUILD & FLASH ---")
@@ -703,11 +729,7 @@ if __name__ == "__main__":
             continue
 
         print("\n[BOOT LOG] Draining queued serial output before launching bridge...")
-        boot_log_deadline = time.time() + 2
-        while time.time() < boot_log_deadline:
-            line = ser.readline().decode('utf-8', errors='ignore').strip()
-            if line:
-                print(f"[{BOARD}] {line}")
+        drain_serial_output(ser, 2, "queued boot output")
 
         # 3. NOW LAUNCH THE GATEWAY TO START THE HANDSHAKE
         if SERVER_BACKEND == "raspberry_pi":
@@ -733,18 +755,28 @@ if __name__ == "__main__":
                 if "Handshake_Time_MS:" in line: 
                     handshake_time = line.split(":")[1].strip()
                     break
+                if "TLS Handshake Failed:" in line:
+                    handshake_time = "TLS_FAILED_" + line.split(":", 1)[1].strip()
+                    break
             except serial.SerialException:
                 print("[-] Board disconnected mid-read! It likely suffered a HardFault.")
                 break
 
         # 5. SAVE AND CLEANUP
         save_benchmark_result(algo['name'], handshake_time)
-        ser.close()
 
-        print(f"\nSending disconnect signal to {MQTT_CMD_TOPIC}...")
-        publish_disconnect()
+        if handshake_time.isdigit():
+            if PUBLISH_DISCONNECT_AFTER_HANDSHAKE:
+                print(f"\nSending graceful disconnect signal to {MQTT_CMD_TOPIC}...")
+                publish_disconnect()
+            else:
+                print("\n[INFO] Board will close TLS itself after the benchmark result.")
+            drain_serial_output(ser, 8, "board shutdown output")
+        else:
+            drain_serial_output(ser, 3, "failure output")
+
+        ser.close()
         
-        time.sleep(5) 
         gateway_proc.terminate()
         try:
             gateway_proc.wait(timeout=5)
