@@ -20,9 +20,11 @@ SLH-DSA signs the server certificate chain. Its TLS `CertificateVerify` leaf
 remains ECDSA because the current TLS stacks do not negotiate SLH-DSA as a TLS
 signature scheme. Both values are recorded explicitly in the CSV.
 
-RSA-PSS-15360 cases are emitted as `known_unsupported`: the pinned wolfSSL
-`USE_FAST_MATH` backend caps TLS RSA keys at 8192 bits. They are recorded
-without silently substituting RSA-PSS-7680.
+RSA-PSS-15360 cases are emitted as `known_unsupported` by default because the
+normal wolfSSL `USE_FAST_MATH` profile caps TLS RSA keys at 8192 bits. They are
+not silently substituted with RSA-PSS-7680. The runner handles them by default
+with a separate RSA-16384 firmware profile that disables `USE_FAST_MATH`, as
+described below.
 
 ## Raspberry Pi
 
@@ -65,7 +67,10 @@ python benchmarking/run_benchmarks.py \
 ```
 
 Two complete sessions are created per case by default. Every warmup or measured
-attempt is a separate block, and all blocks are shuffled by the run seed.
+attempt for normally supported cases is a separate block shuffled by the run
+seed. Cases marked `known_unsupported` are moved to the end of the schedule.
+Their case order is seeded, but every attempt belonging to one such case stays
+contiguous so the large-RSA firmware profile is flashed only once.
 
 Use `--limit N` to execute only the first `N` cases after seeded shuffling:
 
@@ -90,12 +95,22 @@ python -m pip install --user --break-system-packages \
 
 python benchmarking/run_benchmarks.py \
   --cases benchmarking/cases/<cases>.csv \
-  --seed 123 \
-  --serial-device /dev/ttyACM0 \
-  --pi-host thiago@10.12.194.1 \
-  --ssh-key "$HOME/.ssh/id_ed25519_pi_gateway" \
-  --ble-addr F9:79:AE:2A:9A:1E
+  --seed 123
 ```
+
+Hardware connection defaults are read from `benchmarking/config.json`:
+
+```json
+{
+  "serial-device": "/dev/ttyACM0",
+  "pi-host": "thiago@10.12.194.1",
+  "ssh-key": "~/.ssh/id_ed25519_pi_gateway",
+  "ble-addr": "F9:79:AE:2A:9A:1E"
+}
+```
+
+Use `--config path/to/config.json` to select another configuration. The four
+corresponding command-line options remain available and override JSON values.
 
 The runner generates every certificate first, builds and flashes one universal
 firmware image, then executes the saved schedule. Use `--skip-build
@@ -122,6 +137,65 @@ routes P-256/P-384/P-521 through wolfSSL's Cortex-M SP-ECC backend. Without
 that split, every ECC operation inherits the oversized TFM representation and
 P-256 handshakes become tens of seconds slower.
 
+### RSA-15360 reflash profile
+
+RSA-PSS-15360 cases automatically use the separate large-RSA firmware profile.
+This is equivalent to passing `--reflash-known-unsupported-rsa` and is enabled
+by default:
+
+```bash
+python benchmarking/run_benchmarks.py \
+  --cases benchmarking/cases/<cases>.csv \
+  --seed 123
+```
+
+The runner creates independent CA bundles and firmware images for:
+
+- `fast-math`: the normal image using `USE_FAST_MATH`;
+- `integer-heap-16384`: disables fast math, enables
+  `USE_INTEGER_HEAP_MATH`, and raises `RSA_MAX_SIZE`,
+  `WC_MAX_RSA_BITS`, and the pinned wolfSSL ASN/TLS buffers to 16384 bits.
+
+The runner executes the normal shuffled schedule first. It then flashes the
+large-RSA image once and runs every RSA-PSS-15360 case at the end, with all
+attempts of each case contiguous. The profile is recorded in `attempts.csv`,
+`summary.csv`, and the serial readiness marker.
+
+This fallback cannot be combined with `--skip-build` or `--skip-flash` when
+large-RSA cases are selected. Pass `--no-reflash-known-unsupported-rsa` to
+retain the old behavior of recording those cases as unsupported without
+executing them.
+
+### Default pqm4 ML-KEM backend
+
+The nRF52840 uses pqm4's Cortex-M4F ML-KEM implementation by default, including
+the ML-KEM component of hybrid groups. Use `--mlkem-backend wolfssl` only when
+an explicit wolfSSL baseline is required:
+
+```bash
+python benchmarking/run_benchmarks.py \
+  --cases benchmarking/cases/simple_cases.csv \
+  --seed 123 \
+  --limit 1 \
+  --mlkem-backend wolfssl \
+  --serial-device /dev/ttyACM0 \
+  --pi-host thiago@10.12.194.1 \
+  --ssh-key "$HOME/.ssh/id_ed25519_pi_gateway" \
+  --ble-addr F9:79:AE:2A:9A:1E
+```
+
+The runner clones a pinned pqm4 revision into `benchmarking/work/pqm4`.
+wolfSSL still owns TLS 1.3, X.509, signatures and the transcript; its
+`CryptoCb` interface delegates ML-KEM-512/768/1024 key generation,
+encapsulation and decapsulation to pqm4. The selected backend is saved in
+`mlkem_backend.txt`, `attempts.csv`, `summary.csv`, and the serial
+`BENCH_READY` marker. pqm4 replaces only ML-KEM operations; certificate
+signatures and verification remain handled by wolfSSL.
+
+The `m4fstack` implementation is intentionally used instead of `m4fspeed`.
+Both use Cortex-M4F assembly, while `m4fstack` leaves more stack headroom for
+the TLS call chain on the 256 KiB nRF52840.
+
 ## Measurements
 
 `raw_handshake_ms` covers only `wolfSSL_connect()`. `tls_setup_ms` includes
@@ -129,6 +203,48 @@ context, CA, client certificate, key, group, and `WOLFSSL` object setup.
 `mqtt_connect_ms` ends at MQTT CONNACK. `full_connect_ms` starts at TLS setup,
 while `end_to_end_ms` starts when the firmware L2CAP channel becomes ready.
 Gateway-side BLE and TCP setup durations are recorded separately.
+
+The firmware also records the following per-attempt values:
+
+- `client_cpu_cycles` is the Zephyr runtime-statistics delta for the main
+  thread during `wolfSSL_connect()`. `client_cpu_ms` is converted by the
+  firmware with Zephyr's kernel time API rather than calculated by Python.
+  Runs produced before this change used the DWT handshake-span counter and are
+  therefore not directly comparable with the new active-thread CPU values.
+- `client_heap_peak_bytes` is the wolfSSL heap high-water mark. Its maximum is
+  reset immediately before each handshake, making the value local to the
+  attempt instead of cumulative since boot.
+- `client_cpu_usage_percent` is the main benchmark thread's share of the
+  processor during `wolfSSL_connect()`. `system_cpu_usage_percent` is the
+  non-idle share across all Zephyr threads and interrupts over the same
+  runtime-statistics window.
+- `firmware_flash_used_bytes` and `firmware_static_ram_used_bytes` come from
+  the Zephyr linker symbols `_flash_used` and `_image_ram_size`; their matching
+  capacity columns come from the board configuration. Static RAM includes
+  reserved stacks, buffers, BSS, and the wolfSSL heap arena, while the heap
+  current/peak columns describe dynamic occupancy inside that arena.
+- `thread_stack_used_bytes` is the aggregate stack high-water usage reported
+  by Thread Analyzer, `thread_stack_capacity_bytes` is the monitored aggregate
+  capacity, and `thread_stack_peak_percent` is the fullest individual thread.
+- `communication_overhead_ms` is the cumulative wall time spent inside the
+  wolfSSL L2CAP send and receive callbacks, from TLS handshake start through
+  MQTT CONNACK. It and the cryptographic operation durations use Zephyr
+  monotonic uptime ticks rather than CPU-cycle conversion.
+- `kem_keygen_ms`, `kem_encapsulation_ms`, and `kem_decapsulation_ms` measure
+  the ML-KEM primitive calls made on the client. In a normal TLS client
+  handshake, key generation and decapsulation occur on the board while
+  encapsulation occurs on the server, so client encapsulation can be zero.
+- `certificate_signature_verify_ms` is the cumulative time spent by wolfSSL
+  in `ConfirmSignature()` while validating certificate-chain signatures.
+- `l2cap_tx_packets`, `l2cap_tx_bytes`, `l2cap_rx_packets`, and
+  `l2cap_rx_bytes` cover TLS plus MQTT CONNECT/CONNACK. Packet counts are
+  Zephyr L2CAP SDUs, not Bluetooth Link Layer packets or radio transmissions.
+- `l2cap_tx_retries`, `l2cap_tx_wait_ms`, and `l2cap_rx_overflows` expose
+  transport pressure caused by exhausted TX buffers, radio backpressure, and
+  insufficient RX ring-buffer capacity.
+
+`summary.csv` contains the mean of these fields for successful measured
+attempts. The raw values remain available in each case's `attempts.csv`.
 
 Each run writes immutable artifacts below `results/<timestamp>_<seed>/`,
 including the input CSV, run and session manifests, per-case attempts and logs,

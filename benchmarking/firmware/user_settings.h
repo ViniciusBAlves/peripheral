@@ -45,7 +45,13 @@
 #define WOLFSSL_SHA512
 #define HAVE_HKDF
 #define WC_RSA_PSS
+#ifdef BENCH_LARGE_RSA
+#define USE_INTEGER_HEAP_MATH
+#define RSA_MAX_SIZE 16384
+#define WC_MAX_RSA_BITS 16384
+#else
 #define USE_FAST_MATH
+#endif
 #ifndef WOLFSSL_DISABLE_TFM_TIMING_RESISTANT
 #define TFM_TIMING_RESISTANT
 #endif
@@ -63,6 +69,13 @@
 #define WOLFSSL_SHA3
 #define WOLFSSL_SHAKE128
 #define WOLFSSL_SHAKE256
+
+#ifdef BENCH_USE_PQM4_MLKEM
+#define WOLF_CRYPTO_CB
+#define WOLF_CRYPTO_CB_FIND
+#define WOLF_CRYPTO_CB_ONLY_PQC
+#define MAX_CRYPTO_DEVID_CALLBACKS 16
+#endif
 
 /* ========================================================
  * 6. MISC FIXES

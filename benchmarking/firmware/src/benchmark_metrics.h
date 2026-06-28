@@ -1,0 +1,42 @@
+#pragma once
+
+#include <stdint.h>
+
+enum benchmark_crypto_operation {
+    BENCH_CRYPTO_KEM_KEYGEN,
+    BENCH_CRYPTO_KEM_ENCAPSULATE,
+    BENCH_CRYPTO_KEM_DECAPSULATE,
+    BENCH_CRYPTO_CERT_VERIFY,
+};
+
+typedef int64_t benchmark_timepoint_t;
+
+struct benchmark_metrics {
+    uint64_t communication_us;
+    uint64_t kem_keygen_us;
+    uint64_t kem_encapsulation_us;
+    uint64_t kem_decapsulation_us;
+    uint64_t certificate_verify_us;
+    uint32_t l2cap_tx_packets;
+    uint32_t l2cap_tx_bytes;
+    uint32_t l2cap_rx_packets;
+    uint32_t l2cap_rx_bytes;
+    uint32_t l2cap_tx_retries;
+    uint64_t l2cap_tx_wait_us;
+    uint32_t l2cap_rx_overflows;
+    uint32_t l2cap_rx_ring_peak_bytes;
+};
+
+void benchmark_metrics_reset(void);
+void benchmark_metrics_stop(void);
+benchmark_timepoint_t benchmark_metric_start(void);
+void benchmark_metric_stop(enum benchmark_crypto_operation operation,
+                           benchmark_timepoint_t start);
+void benchmark_communication_stop(benchmark_timepoint_t start);
+void benchmark_l2cap_tx(uint32_t bytes);
+void benchmark_l2cap_rx(uint32_t bytes);
+void benchmark_l2cap_tx_retry(void);
+void benchmark_l2cap_tx_wait_stop(benchmark_timepoint_t start);
+void benchmark_l2cap_rx_overflow(void);
+void benchmark_l2cap_rx_ring_usage(uint32_t bytes);
+const struct benchmark_metrics *benchmark_metrics_get(void);
