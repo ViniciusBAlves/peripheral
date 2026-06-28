@@ -4,10 +4,14 @@
 #include <zephyr/sys/ring_buffer.h>
 #include <zephyr/settings/settings.h>
 #include <zephyr/bluetooth/conn.h>
+#include <zephyr/debug/thread_analyzer.h>
 #include <time.h>
 #include <wolfssl/ssl.h>
 #include <wolfssl/wolfcrypt/memory.h>
 #include <zephyr/drivers/gpio.h>
+#if defined(CONFIG_CPU_CORTEX_M_HAS_DWT)
+#include <cmsis_core.h>
+#endif
 #include "client_cert.h"
 #include "client_key.h"
 #include "ca_cert.h"
@@ -29,6 +33,10 @@
 
 K_HEAP_DEFINE(wolfssl_heap, WOLFSSL_HEAP_SIZE);
 
+static volatile bool suppress_l2cap_rx_log;
+static volatile bool tls_handshake_active;
+static volatile int64_t tls_handshake_start_ms;
+
 static void wolfssl_heap_report(const char *where)
 {
     struct sys_memory_stats stats;
@@ -39,6 +47,73 @@ static void wolfssl_heap_report(const char *where)
                (unsigned int)stats.max_allocated_bytes,
                (unsigned int)stats.free_bytes, WOLFSSL_HEAP_SIZE);
     }
+}
+
+static void tls_handshake_progress(struct k_timer *timer)
+{
+    ARG_UNUSED(timer);
+
+    if (!tls_handshake_active) {
+        return;
+    }
+
+    int64_t elapsed_ms = k_uptime_get() - tls_handshake_start_ms;
+    printk("[TLS] Handshake still running after %lld ms; RSA/PQC crypto is busy.\n",
+           elapsed_ms);
+}
+
+K_TIMER_DEFINE(tls_progress_timer, tls_handshake_progress, NULL);
+
+static uint32_t benchmark_cpu_cycles_per_sec(void)
+{
+#if defined(CONFIG_CPU_CORTEX_M_HAS_DWT)
+    return SystemCoreClock;
+#else
+    return sys_clock_hw_cycles_per_sec();
+#endif
+}
+
+static uint32_t benchmark_cpu_cycle_start(void)
+{
+#if defined(CONFIG_CPU_CORTEX_M_HAS_DWT)
+    CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
+    DWT->CYCCNT = 0;
+    DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
+    return DWT->CYCCNT;
+#else
+    return k_cycle_get_32();
+#endif
+}
+
+static uint32_t benchmark_cpu_cycle_stop(uint32_t start)
+{
+#if defined(CONFIG_CPU_CORTEX_M_HAS_DWT)
+    uint32_t end = DWT->CYCCNT;
+    DWT->CTRL &= ~DWT_CTRL_CYCCNTENA_Msk;
+    return end - start;
+#else
+    return k_cycle_get_32() - start;
+#endif
+}
+
+static void benchmark_runtime_report(const char *where)
+{
+    printk("[BENCHMARK_RESULT] Runtime_Report: %s\n", where);
+    printk("[BENCHMARK_RESULT] Client_RAM_Total_Bytes: %u\n",
+           (unsigned int)(CONFIG_SRAM_SIZE * 1024U));
+    printk("[BENCHMARK_RESULT] Client_ROM_Total_Bytes: %u\n",
+           (unsigned int)(CONFIG_FLASH_SIZE * 1024U));
+
+    /*
+     * Zephyr's Thread Analyzer reports per-thread stack usage and CPU
+     * utilization.  The begin/end markers make the host-side CSV parser treat
+     * the following lines as one clean benchmark snapshot.
+     */
+    printk("[BENCHMARK_RESULT] Thread_Analyzer_Begin\n");
+    suppress_l2cap_rx_log = true;
+    thread_analyzer_print(0);
+    suppress_l2cap_rx_log = false;
+    printk("[BENCHMARK_RESULT] Thread_Analyzer_End\n");
 }
 
 static void *wolfssl_malloc(size_t size)
@@ -187,7 +262,7 @@ static int l2cap_recv(struct bt_l2cap_chan *chan, struct net_buf *buf) {
         l2cap_rx_overflow = true;
         printk("[L2CAP RX] RX ring buffer overflowed: kept %u/%u bytes\n",
                written, buf->len);
-    } else {
+    } else if (!suppress_l2cap_rx_log) {
         printk("[L2CAP RX] queued %u bytes\n", buf->len);
     }
     k_sem_give(&rx_sem);
@@ -468,6 +543,9 @@ void start_secure_mqtt_session(struct bt_l2cap_chan *chan) {
                                                       WOLFSSL_FILETYPE_ASN1); 
     if (cert_ret != WOLFSSL_SUCCESS) {
         printk("Failed to load Client Certificate! Error: %d\n", cert_ret);
+        wolfssl_heap_report("client certificate load failed");
+        wolfSSL_CTX_free(ctx);
+        return;
     }
 
     /* 2. Load the binary DER Private Key */
@@ -477,6 +555,9 @@ void start_secure_mqtt_session(struct bt_l2cap_chan *chan) {
                                                     WOLFSSL_FILETYPE_ASN1); 
     if (key_ret != WOLFSSL_SUCCESS) {
         printk("Failed to load Client Private Key! Error: %d\n", key_ret);
+        wolfssl_heap_report("client private key load failed");
+        wolfSSL_CTX_free(ctx);
+        return;
     }
     wolfssl_heap_report("certificate and key loaded");
 
@@ -497,6 +578,11 @@ void start_secure_mqtt_session(struct bt_l2cap_chan *chan) {
     disconnect_requested = false;
     printk("Starting TLS 1.3 Handshake...\n");
     int64_t start_time = k_uptime_get();
+    tls_handshake_start_ms = start_time;
+    tls_handshake_active = true;
+    k_timer_start(&tls_progress_timer, K_SECONDS(10), K_SECONDS(10));
+    uint32_t cpu_cycle_hz = benchmark_cpu_cycles_per_sec();
+    uint32_t cpu_cycle_start = benchmark_cpu_cycle_start();
     do {
         ret = wolfSSL_connect(ssl);
         if (ret != WOLFSSL_SUCCESS) {
@@ -504,7 +590,11 @@ void start_secure_mqtt_session(struct bt_l2cap_chan *chan) {
             printk("wolfSSL error = %d\n", err);
             if (err == WOLFSSL_ERROR_WANT_READ || err == WOLFSSL_ERROR_WANT_WRITE) {
                 if (l2cap_peer_disconnected && ring_buf_is_empty(&rx_ringbuf)) {
+                    (void)benchmark_cpu_cycle_stop(cpu_cycle_start);
+                    tls_handshake_active = false;
+                    k_timer_stop(&tls_progress_timer);
                     printk("TLS Handshake Failed: peer closed connection\n");
+                    benchmark_runtime_report("handshake failed");
                     wolfSSL_free(ssl);
                     wolfSSL_CTX_free(ctx);
                     return;
@@ -517,16 +607,26 @@ void start_secure_mqtt_session(struct bt_l2cap_chan *chan) {
                 k_sleep(K_MSEC(50));
                 continue; 
             }
+            (void)benchmark_cpu_cycle_stop(cpu_cycle_start);
+            tls_handshake_active = false;
+            k_timer_stop(&tls_progress_timer);
             printk("TLS Handshake Failed: %d\n", err);
+            benchmark_runtime_report("handshake failed");
             wolfSSL_free(ssl);
             wolfSSL_CTX_free(ctx);
             return;
         }
     } while (ret != WOLFSSL_SUCCESS);
+    uint32_t client_cpu_cycles = benchmark_cpu_cycle_stop(cpu_cycle_start);
+    tls_handshake_active = false;
+    k_timer_stop(&tls_progress_timer);
     int64_t end_time = k_uptime_get();
     printk(">>> TLS Handshake Successful! <<<\n");
     wolfssl_heap_report("handshake complete");
     printk("\n[BENCHMARK_RESULT] Handshake_Time_MS: %lld\n", (end_time - start_time));
+    printk("[BENCHMARK_RESULT] Client_CPU_Cycles: %u Cycle_Hz: %u\n",
+           client_cpu_cycles, cpu_cycle_hz);
+    benchmark_runtime_report("handshake complete");
 
 #if BENCHMARK_CLOSE_AFTER_TLS
     printk("Benchmark complete. Closing TLS session gracefully.\n");

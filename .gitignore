@@ -4,3 +4,6 @@
 
 # build
 /build*/
+/third_party/.cache/
+/raspberry_pi/offline_debs/
+__pycache__/

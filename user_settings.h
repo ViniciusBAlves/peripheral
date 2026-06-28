@@ -40,7 +40,9 @@
 #define HAVE_HKDF
 #define WC_RSA_PSS
 #define USE_FAST_MATH
+#ifndef WOLFSSL_DISABLE_TFM_TIMING_RESISTANT
 #define TFM_TIMING_RESISTANT
+#endif
 #define HAVE_FFDHE_2048
 
 /* ========================================================
