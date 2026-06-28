@@ -1,0 +1,7 @@
+work/
+results/
+!results/.gitkeep
+__pycache__/
+*.py[cod]
+firmware/third_party/
+cases/

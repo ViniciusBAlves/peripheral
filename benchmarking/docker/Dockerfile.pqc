@@ -1,0 +1,61 @@
+FROM debian:trixie-slim
+
+ARG LIBOQS_VERSION=0.15.0
+ARG OQS_PROVIDER_VERSION=0.11.0
+
+RUN apt-get update \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        build-essential \
+        ca-certificates \
+        cmake \
+        git \
+        libssl-dev \
+        ninja-build \
+        openssl \
+    && git clone --depth 1 --branch "${LIBOQS_VERSION}" \
+        https://github.com/open-quantum-safe/liboqs.git /tmp/liboqs \
+    && cmake -S /tmp/liboqs -B /tmp/liboqs/build -GNinja \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_INSTALL_PREFIX=/usr/local \
+        -DBUILD_SHARED_LIBS=ON \
+        -DOQS_BUILD_ONLY_LIB=ON \
+        -DOQS_ALGS_ENABLED=STD \
+    && cmake --build /tmp/liboqs/build \
+    && cmake --install /tmp/liboqs/build \
+    && git clone --depth 1 --branch "${OQS_PROVIDER_VERSION}" \
+        https://github.com/open-quantum-safe/oqs-provider.git /tmp/oqs-provider \
+    && cmake -S /tmp/oqs-provider -B /tmp/oqs-provider/build -GNinja \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_INSTALL_PREFIX=/usr/local \
+        -Dliboqs_DIR=/usr/local/lib/cmake/liboqs \
+    && cmake --build /tmp/oqs-provider/build \
+    && cmake --install /tmp/oqs-provider/build \
+    && ldconfig \
+    && rm -rf /tmp/liboqs /tmp/oqs-provider /var/lib/apt/lists/*
+
+RUN module="$(find /usr/lib /usr/local -name oqsprovider.so -print -quit)" \
+    && test -n "${module}" \
+    && mkdir -p /usr/local/lib/ossl-modules \
+    && cp "${module}" /usr/local/lib/ossl-modules/oqsprovider.so \
+    && printf '%s\n' \
+        'openssl_conf = openssl_init' \
+        '[openssl_init]' \
+        'providers = provider_sect' \
+        '[provider_sect]' \
+        'default = default_sect' \
+        'oqsprovider = oqsprovider_sect' \
+        '[default_sect]' \
+        'activate = 1' \
+        '[oqsprovider_sect]' \
+        'activate = 1' \
+        'module = /usr/local/lib/ossl-modules/oqsprovider.so' \
+        > /etc/ssl/openssl-oqs.cnf
+
+ENV OPENSSL_CONF=/etc/ssl/openssl-oqs.cnf
+ENV OPENSSL_MODULES=/usr/local/lib/ossl-modules
+
+RUN openssl list -providers | grep -q oqsprovider \
+    && openssl list -kem-algorithms | grep -Eq 'MLKEM512|ML-KEM-512' \
+    && openssl list -signature-algorithms | grep -q 'SLH-DSA-SHAKE-256s'
+
+CMD ["sleep", "infinity"]
