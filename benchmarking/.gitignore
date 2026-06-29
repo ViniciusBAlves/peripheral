@@ -4,5 +4,4 @@ results/
 __pycache__/
 *.py[cod]
 firmware/third_party/
-cases/
 config.json

@@ -1,0 +1,3 @@
+case_id,enabled,kex_group,kex_family,kex_nist_level,kex_public_key_bytes,kex_ciphertext_bytes,kex_shared_secret_bytes,cert_sig_alg,sig_family,sig_nist_level,sig_public_key_bytes,sig_private_key_bytes,sig_signature_bytes,certificate_verify_alg,iterations,warmup_iterations,expected_support,notes
+secp384r1mlkem1024__ml_dsa_87,1,SecP384r1MLKEM1024,pqc,5,1665,1665,80,ML-DSA-87,pqc,5,2592,4896,4627,ML-DSA-87,1,1,required,
+ecdhe_p_521__rsa_pss_15360,1,ECDHE-P-521,classic,5,133,133,66,RSA-PSS-15360,classic,5,1920,1920,1920,RSA-PSS-15360,1,1,known_unsupported,wolfSSL USE_FAST_MATH in this pinned revision caps TLS RSA at 8192 bits

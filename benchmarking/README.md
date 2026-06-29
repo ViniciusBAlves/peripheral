@@ -103,9 +103,9 @@ Hardware connection defaults are read from `benchmarking/config.json`:
 ```json
 {
   "serial-device": "/dev/ttyACM0",
-  "pi-host": "thiago@10.12.194.1",
-  "ssh-key": "~/.ssh/id_ed25519_pi_gateway",
-  "ble-addr": "F9:79:AE:2A:9A:1E"
+  "pi-host": "user@ip",
+  "ssh-key": "~/.ssh/[INSERT_SSH_KEY]",
+  "ble-addr": "00:00:00:00:00:00"
 }
 ```
 
