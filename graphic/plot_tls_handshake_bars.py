@@ -12,6 +12,7 @@ from pathlib import Path
 
 try:
     import matplotlib.pyplot as plt
+    from matplotlib.colors import LinearSegmentedColormap
     import numpy as np
 except ModuleNotFoundError as exc:
     raise SystemExit(
@@ -29,7 +30,11 @@ PURE_PQC_KEM_PREFIXES = ("MLKEM",)
 HYBRID_KEM_PREFIXES = ("SecP", "X25519MLKEM")
 PQC_SIG_PREFIXES = ("ML-DSA", "SLH-DSA")
 SECURITY_LEVELS = (1, 3, 5)
-HANDSHAKE_HEATMAP_MAX_MS = 8000
+HANDSHAKE_HEATMAP_MAX_MS = 6000
+HEATMAP_CMAP = LinearSegmentedColormap.from_list(
+    "benchmark_green_to_red",
+    ("#15803d", "#facc15", "#b91c1c"),
+)
 T_CRITICAL_95 = (
     0.0,
     12.706, 4.303, 3.182, 2.776, 2.571, 2.447, 2.365, 2.306, 2.262,
@@ -82,8 +87,29 @@ def case_category(row: dict[str, str]) -> str:
     return "mixed"
 
 
-def algorithm_sort_key(name: str, is_pqc: bool) -> tuple[int, str]:
-    return (1 if is_pqc else 0, name.lower())
+def heatmap_axes_by_descending_mean(
+    values_by_pair: dict[tuple[str, str], list[float]],
+) -> tuple[list[str], list[str]]:
+    values_by_kem: dict[str, list[float]] = defaultdict(list)
+    values_by_signature: dict[str, list[float]] = defaultdict(list)
+    for (kem, signature), values in values_by_pair.items():
+        values_by_kem[kem].extend(values)
+        values_by_signature[signature].extend(values)
+
+    # imshow places row zero at the top. Rows therefore descend, while columns
+    # ascend from left to right so the largest KEM mean is at the right edge.
+    kems = sorted(
+        values_by_kem,
+        key=lambda kem: (statistics.mean(values_by_kem[kem]), kem.lower()),
+    )
+    signatures = sorted(
+        values_by_signature,
+        key=lambda signature: (
+            -statistics.mean(values_by_signature[signature]),
+            signature.lower(),
+        ),
+    )
+    return kems, signatures
 
 
 def float_or_none(value: str | None) -> float | None:
@@ -312,7 +338,6 @@ def plot_heatmap(rows: list[dict[str, str]], output: Path, run_id: str) -> None:
     output.parent.mkdir(parents=True, exist_ok=True)
     values_by_pair: dict[tuple[str, str], list[float]] = defaultdict(list)
     ci_by_pair: dict[tuple[str, str], list[float]] = defaultdict(list)
-    values_by_signature: dict[str, list[float]] = defaultdict(list)
     for row in rows:
         kex = row.get("kex_group", "")
         sig = row.get("cert_sig_alg", "")
@@ -322,23 +347,11 @@ def plot_heatmap(rows: list[dict[str, str]], output: Path, run_id: str) -> None:
             ci = ci95_half_width(row)
             if ci is not None:
                 ci_by_pair[(kex, sig)].append(ci)
-            values_by_signature[sig].append(value)
 
     if not values_by_pair:
         raise SystemExit("No KEM/signature handshake values found for heatmap")
 
-    kems = sorted(
-        {kex for kex, _ in values_by_pair},
-        key=lambda kex: algorithm_sort_key(kex, is_pqc_or_hybrid_kem(kex)),
-    )
-    sigs = sorted(
-        {sig for _, sig in values_by_pair},
-        key=lambda sig: (
-            1 if is_pqc_signature(sig) else 0,
-            statistics.mean(values_by_signature[sig]),
-            sig.lower(),
-        ),
-    )
+    kems, sigs = heatmap_axes_by_descending_mean(values_by_pair)
     matrix = np.full((len(sigs), len(kems)), np.nan)
     ci_matrix = np.full((len(sigs), len(kems)), np.nan)
     for row_idx, sig in enumerate(sigs):
@@ -351,7 +364,7 @@ def plot_heatmap(rows: list[dict[str, str]], output: Path, run_id: str) -> None:
                     ci_matrix[row_idx, col_idx] = statistics.mean(pair_ci)
 
     masked = np.ma.masked_invalid(matrix)
-    cmap = plt.cm.summer.copy()
+    cmap = HEATMAP_CMAP.copy()
     cmap.set_bad("#f1f1f1")
     fig, ax = plt.subplots(
         figsize=(max(10, len(kems) * 0.9), max(7, len(sigs) * 0.55)),
@@ -384,7 +397,7 @@ def plot_heatmap(rows: list[dict[str, str]], output: Path, run_id: str) -> None:
                 )
                 ax.text(
                     col_idx, row_idx, annotation,
-                    ha="center", va="center", fontsize=9,
+                    ha="center", va="center", fontsize=12,
                     color="white" if value <= median else "black",
                 )
     colorbar = fig.colorbar(image, ax=ax, extend="max")
@@ -407,31 +420,18 @@ def plot_percent_heatmap(
 ) -> int:
     output.parent.mkdir(parents=True, exist_ok=True)
     values_by_pair: dict[tuple[str, str], list[float]] = defaultdict(list)
-    values_by_signature: dict[str, list[float]] = defaultdict(list)
     for row in rows:
         kex = row.get("kex_group", "")
         sig = row.get("cert_sig_alg", "")
         value = float_or_none(row.get(metric))
         if kex and sig and value is not None:
             values_by_pair[(kex, sig)].append(value)
-            values_by_signature[sig].append(value)
 
     if not values_by_pair:
         print(f"warning: no values found for {metric}")
         return 0
 
-    kems = sorted(
-        {kex for kex, _ in values_by_pair},
-        key=lambda kex: algorithm_sort_key(kex, is_pqc_or_hybrid_kem(kex)),
-    )
-    sigs = sorted(
-        {sig for _, sig in values_by_pair},
-        key=lambda sig: (
-            1 if is_pqc_signature(sig) else 0,
-            statistics.mean(values_by_signature[sig]),
-            sig.lower(),
-        ),
-    )
+    kems, sigs = heatmap_axes_by_descending_mean(values_by_pair)
     matrix = np.full((len(sigs), len(kems)), np.nan)
     for row_idx, sig in enumerate(sigs):
         for col_idx, kex in enumerate(kems):
@@ -440,7 +440,7 @@ def plot_percent_heatmap(
                 matrix[row_idx, col_idx] = statistics.mean(pair_values)
 
     masked = np.ma.masked_invalid(matrix)
-    cmap = plt.cm.summer.copy()
+    cmap = HEATMAP_CMAP.copy()
     cmap.set_bad("#f1f1f1")
     fig, ax = plt.subplots(
         figsize=(max(10, len(kems) * 0.9), max(7, len(sigs) * 0.55)),
@@ -461,7 +461,7 @@ def plot_percent_heatmap(
                 ax.text(
                     col_idx, row_idx,
                     f"{value:.{value_decimals}f}{value_suffix}",
-                    ha="center", va="center", fontsize=7,
+                    ha="center", va="center", fontsize=12,
                     color="white" if image.norm(value) < 0.6 else "black",
                 )
     colorbar = fig.colorbar(image, ax=ax)
