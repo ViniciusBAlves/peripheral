@@ -26,6 +26,40 @@ not silently substituted with RSA-PSS-7680. The runner handles them by default
 with a separate RSA-16384 firmware profile that disables `USE_FAST_MATH`, as
 described below.
 
+## Connection Configuration
+
+Before running a hardware benchmark, configure the four connection values in
+`benchmarking/config.json`. The repository currently uses:
+
+```json
+{
+  "serial-device": "/dev/ttyACM0",
+  "pi-host": "user@ip",
+  "ssh-key": "~/.ssh/[INSERT_SSH_KEY]",
+  "ble-addr": "00:00:00:00:00:00"
+}
+```
+
+- `serial-device`: nRF52840DK serial port used for `BENCH_*` telemetry.
+- `pi-host`: Raspberry Pi SSH destination in `user@host` form.
+- `ssh-key`: private SSH key; `~` and environment variables are expanded.
+- `ble-addr`: BLE address advertised by the nRF52840DK.
+
+`run_benchmarks.py` loads this file automatically. A different file can be
+selected with `--config`:
+
+```bash
+python benchmarking/run_benchmarks.py \
+  --config benchmarking/config-lab.json \
+  --cases benchmarking/cases/<cases>.csv \
+  --seed 123
+```
+
+The corresponding CLI options (`--serial-device`, `--pi-host`, `--ssh-key`,
+and `--ble-addr`) remain available as one-run overrides and take precedence
+over JSON values. The runner validates that all four JSON fields exist and
+rejects unknown fields, which helps catch misspelled configuration names.
+
 ## Raspberry Pi
 
 Configure SSH key authentication first. Then install the gateway dependencies:
@@ -33,9 +67,12 @@ Configure SSH key authentication first. Then install the gateway dependencies:
 ```bash
 ssh thiago@10.12.194.1 'bash -s' < benchmarking/gateway/setup_pi_gateway.sh
 PI_HOST=thiago@10.12.194.1 \
-SSH_KEY="$HOME/.ssh/id_ed25519_pi" \
+SSH_KEY="$HOME/.ssh/id_ed25519_pi_gateway" \
 benchmarking/gateway/deploy_pi_gateway.sh
 ```
+
+These standalone gateway shell scripts use `PI_HOST` and `SSH_KEY`; the Python
+benchmark runner uses the matching values from `config.json`.
 
 The benchmark user must be able to start `ble_mqtt_bridge` with non-interactive
 sudo. Add a narrow sudoers rule for the deployed binary if needed.
@@ -98,19 +135,8 @@ python benchmarking/run_benchmarks.py \
   --seed 123
 ```
 
-Hardware connection defaults are read from `benchmarking/config.json`:
-
-```json
-{
-  "serial-device": "/dev/ttyACM0",
-  "pi-host": "user@ip",
-  "ssh-key": "~/.ssh/[INSERT_SSH_KEY]",
-  "ble-addr": "00:00:00:00:00:00"
-}
-```
-
-Use `--config path/to/config.json` to select another configuration. The four
-corresponding command-line options remain available and override JSON values.
+The command automatically reads the serial device, Pi SSH destination, SSH
+key, and board BLE address from `benchmarking/config.json`.
 
 The runner generates every certificate first, builds and flashes one universal
 firmware image, then executes the saved schedule. Use `--skip-build
@@ -177,11 +203,7 @@ python benchmarking/run_benchmarks.py \
   --cases benchmarking/cases/simple_cases.csv \
   --seed 123 \
   --limit 1 \
-  --mlkem-backend wolfssl \
-  --serial-device /dev/ttyACM0 \
-  --pi-host thiago@10.12.194.1 \
-  --ssh-key "$HOME/.ssh/id_ed25519_pi_gateway" \
-  --ble-addr F9:79:AE:2A:9A:1E
+  --mlkem-backend wolfssl
 ```
 
 The runner clones a pinned pqm4 revision into `benchmarking/work/pqm4`.

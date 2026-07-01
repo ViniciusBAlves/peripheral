@@ -29,6 +29,7 @@ PURE_PQC_KEM_PREFIXES = ("MLKEM",)
 HYBRID_KEM_PREFIXES = ("SecP", "X25519MLKEM")
 PQC_SIG_PREFIXES = ("ML-DSA", "SLH-DSA")
 SECURITY_LEVELS = (1, 3, 5)
+HANDSHAKE_HEATMAP_MAX_MS = 8000
 T_CRITICAL_95 = (
     0.0,
     12.706, 4.303, 3.182, 2.776, 2.571, 2.447, 2.365, 2.306, 2.262,
@@ -356,7 +357,13 @@ def plot_heatmap(rows: list[dict[str, str]], output: Path, run_id: str) -> None:
         figsize=(max(10, len(kems) * 0.9), max(7, len(sigs) * 0.55)),
         constrained_layout=True,
     )
-    image = ax.imshow(masked, cmap=cmap, aspect="auto")
+    image = ax.imshow(
+        masked,
+        cmap=cmap,
+        aspect="auto",
+        vmin=0,
+        vmax=HANDSHAKE_HEATMAP_MAX_MS,
+    )
     ax.set_title(f"TLS handshake mean w/ 95% confidence - {run_id}")
     ax.set_xlabel("KEM / TLS key exchange group")
     ax.set_ylabel("Certificate signature algorithm")
@@ -380,7 +387,7 @@ def plot_heatmap(rows: list[dict[str, str]], output: Path, run_id: str) -> None:
                     ha="center", va="center", fontsize=9,
                     color="white" if value <= median else "black",
                 )
-    colorbar = fig.colorbar(image, ax=ax)
+    colorbar = fig.colorbar(image, ax=ax, extend="max")
     colorbar.set_label("TLS handshake mean (ms); cells show mean ± 95% CI")
     fig.savefig(output, dpi=180)
     plt.close(fig)
