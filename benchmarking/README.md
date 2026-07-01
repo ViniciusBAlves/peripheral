@@ -256,14 +256,41 @@ The firmware also records the following per-attempt values:
   the ML-KEM primitive calls made on the client. In a normal TLS client
   handshake, key generation and decapsulation occur on the board while
   encapsulation occurs on the server, so client encapsulation can be zero.
-- `certificate_signature_verify_ms` is the cumulative time spent by wolfSSL
-  in `ConfirmSignature()` while validating certificate-chain signatures.
+- `classical_kex_keygen_ms` and `classical_kex_shared_secret_ms` measure the
+  ECDHE/X25519 component. `kem_client_total_ms` includes only the primitives
+  belonging to the selected group: ML-KEM for pure ML-KEM, classic operations
+  for ECDHE, and both for hybrid groups. Speculative classic key generation by
+  wolfSSL remains visible in the raw classic field but is excluded from a pure
+  ML-KEM total.
+- `x509_chain_signature_verify_ms` measures wolfSSL `ConfirmSignature()` calls
+  while validating the server certificate chain. The legacy
+  `certificate_signature_verify_ms` column contains the same value.
+- `tls_certificate_verify_signature_verify_ms` measures processing and
+  cryptographic verification of the server TLS 1.3 `CertificateVerify`.
+- `mtls_signature_generate_ms` measures the signature primitive used by the
+  nRF52840 to produce its client-authentication `CertificateVerify`.
+  `client_signature_total_ms` is the sum of X.509 verification, server
+  `CertificateVerify` verification, and client mTLS signing.
+- `server_kem_encapsulation_ms` and `server_certificate_verify_sign_ms` are
+  measured inside the Raspberry Pi OpenSSL EVP calls. The runner preloads
+  `server_crypto_metrics.so` into Mosquitto, so these values exclude BLE/TCP
+  transport and are read from `[BENCH_SERVER]` records in `broker.log`.
 - `l2cap_tx_packets`, `l2cap_tx_bytes`, `l2cap_rx_packets`, and
   `l2cap_rx_bytes` cover TLS plus MQTT CONNECT/CONNACK. Packet counts are
   Zephyr L2CAP SDUs, not Bluetooth Link Layer packets or radio transmissions.
 - `l2cap_tx_retries`, `l2cap_tx_wait_ms`, and `l2cap_rx_overflows` expose
   transport pressure caused by exhausted TX buffers, radio backpressure, and
   insufficient RX ring-buffer capacity.
+- `client_icache_hits` and `client_icache_misses` come directly from the
+  nRF52840 NVMC instruction-cache profiling registers over the
+  `wolfSSL_connect()` interval. The runner derives requests and hit/miss
+  percentages from those hardware counters.
+- `client_memory_access_counters_supported` is `0` on the nRF52840. Its
+  Cortex-M4 has no PMU event counters for globally retired data-memory reads
+  and writes. The DWT `LSUCNT` register counts extra load/store-unit cycles,
+  saturates at eight bits, and is therefore deliberately not mislabeled as
+  read/write operations. Use the exact L2CAP byte counters above when the
+  quantity of interest is communication data moved during the attempt.
 
 `summary.csv` contains the mean of these fields for successful measured
 attempts. The raw values remain available in each case's `attempts.csv`.

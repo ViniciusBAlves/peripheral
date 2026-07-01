@@ -690,6 +690,7 @@ void start_secure_mqtt_session(struct bt_l2cap_chan *chan)
 
     (void)sys_heap_runtime_stats_reset_max(&wolfssl_heap.heap);
     benchmark_metrics_reset();
+    benchmark_hardware_counters_start();
     int64_t handshake_start_ms = setup_done_ms;
     tls_handshake_start_ms = handshake_start_ms;
     tls_handshake_active = true;
@@ -711,6 +712,7 @@ void start_secure_mqtt_session(struct bt_l2cap_chan *chan)
                 &cpu_start, &cpu_end, &client_cpu_cycles,
                 &client_cpu_usage_bp, &system_cpu_usage_bp);
             client_cpu_us = k_cyc_to_us_floor64(client_cpu_cycles);
+            benchmark_hardware_counters_stop();
             tls_handshake_active = false;
             BENCH_OUT(
                 "[BENCH_RESULT] status=fail stage=tls_handshake error=%d "
@@ -728,6 +730,7 @@ void start_secure_mqtt_session(struct bt_l2cap_chan *chan)
         &cpu_start, &cpu_end, &client_cpu_cycles,
         &client_cpu_usage_bp, &system_cpu_usage_bp);
     client_cpu_us = k_cyc_to_us_floor64(client_cpu_cycles);
+    benchmark_hardware_counters_stop();
     tls_handshake_active = false;
     handshake_done_ms = k_uptime_get();
 
@@ -773,11 +776,17 @@ void start_secure_mqtt_session(struct bt_l2cap_chan *chan)
                 "communication_overhead_us=%llu kem_keygen_us=%llu "
                 "kem_encapsulation_us=%llu kem_decapsulation_us=%llu "
                 "certificate_signature_verify_us=%llu "
+                "classical_kex_keygen_us=%llu "
+                "classical_kex_shared_secret_us=%llu "
+                "tls_certificate_verify_us=%llu "
+                "mtls_signature_generate_us=%llu "
                 "l2cap_tx_packets=%u l2cap_tx_bytes=%u "
                 "l2cap_rx_packets=%u l2cap_rx_bytes=%u "
                 "l2cap_tx_retries=%u l2cap_tx_wait_us=%llu "
                 "l2cap_rx_overflows=%u l2cap_rx_ring_peak_bytes=%u "
-                "l2cap_rx_ring_capacity_bytes=%u\n",
+                "l2cap_rx_ring_capacity_bytes=%u "
+                "client_icache_hits=%u client_icache_misses=%u "
+                "client_memory_access_counters_supported=0\n",
                 setup_done_ms - setup_start_ms,
                 handshake_done_ms - handshake_start_ms,
                 mqtt_done_ms - mqtt_start_ms,
@@ -799,11 +808,17 @@ void start_secure_mqtt_session(struct bt_l2cap_chan *chan)
                 metrics->kem_encapsulation_us,
                 metrics->kem_decapsulation_us,
                 metrics->certificate_verify_us,
+                metrics->classical_kex_keygen_us,
+                metrics->classical_kex_shared_secret_us,
+                metrics->tls_certificate_verify_us,
+                metrics->mtls_signature_generate_us,
                 metrics->l2cap_tx_packets, metrics->l2cap_tx_bytes,
                 metrics->l2cap_rx_packets, metrics->l2cap_rx_bytes,
                 metrics->l2cap_tx_retries, metrics->l2cap_tx_wait_us,
                 metrics->l2cap_rx_overflows,
-                metrics->l2cap_rx_ring_peak_bytes, TLS_RX_RINGBUF_SIZE);
+                metrics->l2cap_rx_ring_peak_bytes, TLS_RX_RINGBUF_SIZE,
+                metrics->instruction_cache_hits,
+                metrics->instruction_cache_misses);
             goto cleanup;
         }
         if (bytes_read < 0) {

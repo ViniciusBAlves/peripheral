@@ -49,11 +49,19 @@ ATTEMPT_FIELDS = [
     "ble_l2cap_connect_ms", "gateway_tcp_connect_ms", "tls_setup_ms",
     "raw_handshake_ms", "mqtt_connect_ms", "full_connect_ms", "end_to_end_ms",
     "communication_overhead_ms", "kem_keygen_ms", "kem_encapsulation_ms",
-    "kem_decapsulation_ms", "certificate_signature_verify_ms",
+    "kem_decapsulation_ms", "classical_kex_keygen_ms",
+    "classical_kex_shared_secret_ms", "kem_client_total_ms",
+    "certificate_signature_verify_ms", "x509_chain_signature_verify_ms",
+    "tls_certificate_verify_signature_verify_ms",
+    "mtls_signature_generate_ms", "client_signature_total_ms",
+    "server_kem_encapsulation_ms", "server_certificate_verify_sign_ms",
     "l2cap_tx_packets", "l2cap_tx_bytes", "l2cap_rx_packets", "l2cap_rx_bytes",
     "l2cap_tx_retries", "l2cap_tx_wait_ms", "l2cap_rx_overflows",
     "client_cpu_cycles", "client_cycle_hz", "client_cpu_ms",
     "client_cpu_usage_percent", "system_cpu_usage_percent",
+    "client_icache_hits", "client_icache_misses", "client_icache_requests",
+    "client_icache_hit_percent", "client_icache_miss_percent",
+    "client_memory_access_counters_supported",
     "client_heap_current_bytes", "client_heap_peak_bytes",
     "client_heap_free_bytes", "client_heap_capacity_bytes",
     "client_heap_peak_usage_percent",
@@ -80,11 +88,22 @@ SUMMARY_FIELDS = [
     "handshake_throughput_hps", "mean_mqtt_connect_ms", "mean_full_connect_ms",
     "mean_end_to_end_ms", "connections_per_second", "mean_client_cpu_ms",
     "mean_client_cpu_usage_percent", "mean_system_cpu_usage_percent",
+    "mean_client_icache_hits", "mean_client_icache_misses",
+    "mean_client_icache_requests", "mean_client_icache_hit_percent",
+    "mean_client_icache_miss_percent",
+    "client_memory_access_counters_supported",
     "max_client_heap_peak_bytes", "min_client_heap_free_bytes",
     "client_heap_capacity_bytes", "max_client_heap_peak_usage_percent",
     "mean_communication_overhead_ms",
     "mean_kem_keygen_ms", "mean_kem_encapsulation_ms",
-    "mean_kem_decapsulation_ms", "mean_certificate_signature_verify_ms",
+    "mean_kem_decapsulation_ms", "mean_classical_kex_keygen_ms",
+    "mean_classical_kex_shared_secret_ms", "mean_kem_client_total_ms",
+    "mean_certificate_signature_verify_ms",
+    "mean_x509_chain_signature_verify_ms",
+    "mean_tls_certificate_verify_signature_verify_ms",
+    "mean_mtls_signature_generate_ms", "mean_client_signature_total_ms",
+    "mean_server_kem_encapsulation_ms",
+    "mean_server_certificate_verify_sign_ms",
     "mean_l2cap_tx_packets", "mean_l2cap_tx_bytes",
     "mean_l2cap_rx_packets", "mean_l2cap_rx_bytes",
     "mean_l2cap_tx_retries", "mean_l2cap_tx_wait_ms",
@@ -158,9 +177,42 @@ def parse_gateway_metrics(path: Path) -> dict[str, str]:
     return values
 
 
+def parse_server_metrics(path: Path) -> dict[str, str]:
+    values: dict[str, str] = {}
+    if not path.exists():
+        return values
+    for line in path.read_text(errors="replace").splitlines():
+        parsed = parse_bench_line(line)
+        if parsed and parsed[0] == "SERVER":
+            values.update(parsed[1])
+    return values
+
+
 def microseconds_as_milliseconds(values: dict[str, str], key: str) -> str:
     value = number(values, key)
     return f"{value / 1000.0:.3f}" if value is not None else ""
+
+
+def summed_microseconds_as_milliseconds(
+    values: dict[str, str], keys: tuple[str, ...]
+) -> str:
+    parts = [number(values, key) for key in keys]
+    present = [value for value in parts if value is not None]
+    return f"{sum(present) / 1000.0:.3f}" if present else ""
+
+
+def client_kex_metric_keys(case: dict[str, str]) -> tuple[str, ...]:
+    mlkem = ("kem_keygen_us", "kem_encapsulation_us", "kem_decapsulation_us")
+    classical = (
+        "classical_kex_keygen_us",
+        "classical_kex_shared_secret_us",
+    )
+    group = case["kex_group"]
+    if group.startswith("MLKEM"):
+        return mlkem
+    if "MLKEM" in group:
+        return (*mlkem, *classical)
+    return classical
 
 def usage_percent(values: dict[str, str], used_key: str, capacity_key: str) -> str:
     used = number(values, used_key)
@@ -298,10 +350,17 @@ def run_job(
             time.sleep(args.reconnect_delay_sec)
 
     gateway_values = parse_gateway_metrics(gateway_log)
+    server_values = parse_server_metrics(broker_log)
     cpu_us = number(final, "client_cpu_us")
     client_cpu_usage_bp = number(final, "client_cpu_usage_bp")
     system_cpu_usage_bp = number(final, "system_cpu_usage_bp")
     stack_peak_bp = number(final, "thread_stack_peak_percent_bp")
+    icache_hits = number(final, "client_icache_hits")
+    icache_misses = number(final, "client_icache_misses")
+    icache_requests = (
+        icache_hits + icache_misses
+        if icache_hits is not None and icache_misses is not None else None
+    )
     status = final.get("status", "fail").lower()
     return {
         "attempt_index": attempt_index,
@@ -329,8 +388,39 @@ def run_job(
         "kem_decapsulation_ms": microseconds_as_milliseconds(
             final, "kem_decapsulation_us"
         ),
+        "classical_kex_keygen_ms": microseconds_as_milliseconds(
+            final, "classical_kex_keygen_us"
+        ),
+        "classical_kex_shared_secret_ms": microseconds_as_milliseconds(
+            final, "classical_kex_shared_secret_us"
+        ),
+        "kem_client_total_ms": summed_microseconds_as_milliseconds(
+            final, client_kex_metric_keys(case),
+        ),
         "certificate_signature_verify_ms": microseconds_as_milliseconds(
             final, "certificate_signature_verify_us"
+        ),
+        "x509_chain_signature_verify_ms": microseconds_as_milliseconds(
+            final, "certificate_signature_verify_us"
+        ),
+        "tls_certificate_verify_signature_verify_ms":
+            microseconds_as_milliseconds(final, "tls_certificate_verify_us"),
+        "mtls_signature_generate_ms": microseconds_as_milliseconds(
+            final, "mtls_signature_generate_us"
+        ),
+        "client_signature_total_ms": summed_microseconds_as_milliseconds(
+            final,
+            (
+                "certificate_signature_verify_us",
+                "tls_certificate_verify_us",
+                "mtls_signature_generate_us",
+            ),
+        ),
+        "server_kem_encapsulation_ms": microseconds_as_milliseconds(
+            server_values, "server_kem_encapsulation_us"
+        ),
+        "server_certificate_verify_sign_ms": microseconds_as_milliseconds(
+            server_values, "server_certificate_verify_sign_us"
         ),
         "l2cap_tx_packets": final.get("l2cap_tx_packets", ""),
         "l2cap_tx_bytes": final.get("l2cap_tx_bytes", ""),
@@ -351,6 +441,22 @@ def run_job(
         "system_cpu_usage_percent": (
             f"{system_cpu_usage_bp / 100.0:.2f}"
             if system_cpu_usage_bp is not None else ""
+        ),
+        "client_icache_hits": final.get("client_icache_hits", ""),
+        "client_icache_misses": final.get("client_icache_misses", ""),
+        "client_icache_requests": (
+            f"{icache_requests:.0f}" if icache_requests is not None else ""
+        ),
+        "client_icache_hit_percent": (
+            f"{100.0 * icache_hits / icache_requests:.4f}"
+            if icache_requests else ""
+        ),
+        "client_icache_miss_percent": (
+            f"{100.0 * icache_misses / icache_requests:.4f}"
+            if icache_requests else ""
+        ),
+        "client_memory_access_counters_supported": final.get(
+            "client_memory_access_counters_supported", "0"
         ),
         "client_heap_current_bytes": final.get("client_heap_current_bytes", ""),
         "client_heap_peak_bytes": final.get("client_heap_peak_bytes", ""),
@@ -411,11 +517,27 @@ def summarize(case: dict[str, str], attempts: list[dict[str, object]]) -> dict[s
 
     client_cpu_usage = successful_numbers("client_cpu_usage_percent")
     system_cpu_usage = successful_numbers("system_cpu_usage_percent")
+    icache_hits = successful_numbers("client_icache_hits")
+    icache_misses = successful_numbers("client_icache_misses")
+    icache_requests = successful_numbers("client_icache_requests")
+    icache_hit_percent = successful_numbers("client_icache_hit_percent")
+    icache_miss_percent = successful_numbers("client_icache_miss_percent")
     communication = successful_numbers("communication_overhead_ms")
     keygen = successful_numbers("kem_keygen_ms")
     encapsulation = successful_numbers("kem_encapsulation_ms")
     decapsulation = successful_numbers("kem_decapsulation_ms")
+    classical_keygen = successful_numbers("classical_kex_keygen_ms")
+    classical_shared = successful_numbers("classical_kex_shared_secret_ms")
+    kem_total = successful_numbers("kem_client_total_ms")
     cert_verify = successful_numbers("certificate_signature_verify_ms")
+    x509_verify = successful_numbers("x509_chain_signature_verify_ms")
+    tls_cert_verify = successful_numbers(
+        "tls_certificate_verify_signature_verify_ms"
+    )
+    mtls_sign = successful_numbers("mtls_signature_generate_ms")
+    signature_total = successful_numbers("client_signature_total_ms")
+    server_encapsulation = successful_numbers("server_kem_encapsulation_ms")
+    server_sign = successful_numbers("server_certificate_verify_sign_ms")
     tx_packets = successful_numbers("l2cap_tx_packets")
     tx_bytes = successful_numbers("l2cap_tx_bytes")
     rx_packets = successful_numbers("l2cap_rx_packets")
@@ -473,6 +595,28 @@ def summarize(case: dict[str, str], attempts: list[dict[str, object]]) -> dict[s
             f"{sum(system_cpu_usage) / len(system_cpu_usage):.3f}"
             if system_cpu_usage else ""
         ),
+        "mean_client_icache_hits": (
+            f"{sum(icache_hits) / len(icache_hits):.3f}" if icache_hits else ""
+        ),
+        "mean_client_icache_misses": (
+            f"{sum(icache_misses) / len(icache_misses):.3f}"
+            if icache_misses else ""
+        ),
+        "mean_client_icache_requests": (
+            f"{sum(icache_requests) / len(icache_requests):.3f}"
+            if icache_requests else ""
+        ),
+        "mean_client_icache_hit_percent": (
+            f"{sum(icache_hit_percent) / len(icache_hit_percent):.4f}"
+            if icache_hit_percent else ""
+        ),
+        "mean_client_icache_miss_percent": (
+            f"{sum(icache_miss_percent) / len(icache_miss_percent):.4f}"
+            if icache_miss_percent else ""
+        ),
+        "client_memory_access_counters_supported": first_successful(
+            "client_memory_access_counters_supported"
+        ),
         "max_client_heap_peak_bytes": max(heap) if heap else "",
         "min_client_heap_free_bytes": (
             f"{min(heap_free):.0f}" if heap_free else ""
@@ -495,8 +639,41 @@ def summarize(case: dict[str, str], attempts: list[dict[str, object]]) -> dict[s
             f"{sum(decapsulation) / len(decapsulation):.3f}"
             if decapsulation else ""
         ),
+        "mean_classical_kex_keygen_ms": (
+            f"{sum(classical_keygen) / len(classical_keygen):.3f}"
+            if classical_keygen else ""
+        ),
+        "mean_classical_kex_shared_secret_ms": (
+            f"{sum(classical_shared) / len(classical_shared):.3f}"
+            if classical_shared else ""
+        ),
+        "mean_kem_client_total_ms": (
+            f"{sum(kem_total) / len(kem_total):.3f}" if kem_total else ""
+        ),
         "mean_certificate_signature_verify_ms": (
             f"{sum(cert_verify) / len(cert_verify):.3f}" if cert_verify else ""
+        ),
+        "mean_x509_chain_signature_verify_ms": (
+            f"{sum(x509_verify) / len(x509_verify):.3f}" if x509_verify else ""
+        ),
+        "mean_tls_certificate_verify_signature_verify_ms": (
+            f"{sum(tls_cert_verify) / len(tls_cert_verify):.3f}"
+            if tls_cert_verify else ""
+        ),
+        "mean_mtls_signature_generate_ms": (
+            f"{sum(mtls_sign) / len(mtls_sign):.3f}" if mtls_sign else ""
+        ),
+        "mean_client_signature_total_ms": (
+            f"{sum(signature_total) / len(signature_total):.3f}"
+            if signature_total else ""
+        ),
+        "mean_server_kem_encapsulation_ms": (
+            f"{sum(server_encapsulation) / len(server_encapsulation):.3f}"
+            if server_encapsulation else ""
+        ),
+        "mean_server_certificate_verify_sign_ms": (
+            f"{sum(server_sign) / len(server_sign):.3f}"
+            if server_sign else ""
         ),
         "mean_l2cap_tx_packets": (
             f"{sum(tx_packets) / len(tx_packets):.3f}" if tx_packets else ""

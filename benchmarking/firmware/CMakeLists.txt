@@ -91,6 +91,59 @@ string(REPLACE
 )
 file(WRITE "${WOLFSSL_MLKEM_C}" "${WOLFSSL_MLKEM_TEXT}")
 
+# Instrument the classic half of ECDHE/hybrid key exchange and the client's
+# mTLS CertificateVerify signature in wolfSSL's TLS wrappers.
+set(WOLFSSL_INTERNAL_C "${WOLFSSL_ROOT_DIR}/src/internal.c")
+file(READ "${WOLFSSL_INTERNAL_C}" WOLFSSL_INTERNAL_TEXT)
+string(REPLACE
+    "#include <wolfssl/wolfcrypt/libwolfssl_sources.h>"
+    "#include <wolfssl/wolfcrypt/libwolfssl_sources.h>\n#include \"benchmark_metrics.h\""
+    WOLFSSL_INTERNAL_TEXT "${WOLFSSL_INTERNAL_TEXT}"
+)
+foreach(PAIR IN ITEMS
+    "EccSharedSecret|BENCH_CRYPTO_CLASSICAL_KEX_SHARED_SECRET"
+    "EccMakeKey|BENCH_CRYPTO_CLASSICAL_KEX_KEYGEN"
+    "X25519SharedSecret|BENCH_CRYPTO_CLASSICAL_KEX_SHARED_SECRET"
+    "X25519MakeKey|BENCH_CRYPTO_CLASSICAL_KEX_KEYGEN"
+    "EccSign|BENCH_CRYPTO_MTLS_SIGN"
+)
+    string(REPLACE "|" ";" PAIR_PARTS "${PAIR}")
+    list(GET PAIR_PARTS 0 FUNCTION_NAME)
+    list(GET PAIR_PARTS 1 METRIC_NAME)
+    string(REPLACE
+        "    WOLFSSL_ENTER(\"${FUNCTION_NAME}\");"
+        "    benchmark_timepoint_t benchmark_${FUNCTION_NAME}_start = benchmark_metric_start();\n    WOLFSSL_ENTER(\"${FUNCTION_NAME}\");"
+        WOLFSSL_INTERNAL_TEXT "${WOLFSSL_INTERNAL_TEXT}"
+    )
+    string(REPLACE
+        "    WOLFSSL_LEAVE(\"${FUNCTION_NAME}\", ret);"
+        "    benchmark_metric_stop(${METRIC_NAME}, benchmark_${FUNCTION_NAME}_start);\n    WOLFSSL_LEAVE(\"${FUNCTION_NAME}\", ret);"
+        WOLFSSL_INTERNAL_TEXT "${WOLFSSL_INTERNAL_TEXT}"
+    )
+endforeach()
+file(WRITE "${WOLFSSL_INTERNAL_C}" "${WOLFSSL_INTERNAL_TEXT}")
+
+# Measure processing of the server's TLS 1.3 CertificateVerify separately
+# from X.509 chain signature verification.
+set(WOLFSSL_TLS13_C "${WOLFSSL_ROOT_DIR}/src/tls13.c")
+file(READ "${WOLFSSL_TLS13_C}" WOLFSSL_TLS13_TEXT)
+string(REPLACE
+    "#include <wolfssl/wolfcrypt/libwolfssl_sources.h>"
+    "#include <wolfssl/wolfcrypt/libwolfssl_sources.h>\n#include \"benchmark_metrics.h\""
+    WOLFSSL_TLS13_TEXT "${WOLFSSL_TLS13_TEXT}"
+)
+string(REPLACE
+    "static int DoTls13CertificateVerify(WOLFSSL* ssl, byte* input,\n                                    word32* inOutIdx, word32 totalSz)\n{\n    int         ret = 0;"
+    "static int DoTls13CertificateVerify(WOLFSSL* ssl, byte* input,\n                                    word32* inOutIdx, word32 totalSz)\n{\n    benchmark_timepoint_t benchmark_tls_cert_verify_start = benchmark_metric_start();\n    int         ret = 0;"
+    WOLFSSL_TLS13_TEXT "${WOLFSSL_TLS13_TEXT}"
+)
+string(REPLACE
+    "exit_dcv:\n\n    WOLFSSL_LEAVE(\"DoTls13CertificateVerify\", ret);"
+    "exit_dcv:\n\n    benchmark_metric_stop(BENCH_CRYPTO_TLS_CERT_VERIFY, benchmark_tls_cert_verify_start);\n    WOLFSSL_LEAVE(\"DoTls13CertificateVerify\", ret);"
+    WOLFSSL_TLS13_TEXT "${WOLFSSL_TLS13_TEXT}"
+)
+file(WRITE "${WOLFSSL_TLS13_C}" "${WOLFSSL_TLS13_TEXT}")
+
 # This pinned wolfSSL revision sizes two classic RSA ASN/TLS buffers for
 # RSA-4096 when fast math is disabled. Patch only the disposable FetchContent
 # copy used by the large-RSA image; the normal image and NCS stay untouched.

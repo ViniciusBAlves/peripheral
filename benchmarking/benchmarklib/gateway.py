@@ -56,10 +56,18 @@ class PiGateway:
     def prepare(self, bridge_source: Path, log: Path) -> None:
         self.command(f"mkdir -p {shlex.quote(self.workdir)}/{{bin,cases,logs}}", log)
         self.deploy_file(bridge_source, f"{self.workdir}/bin/ble_mqtt_bridge.c", log)
+        self.deploy_file(
+            bridge_source.parent / "server_crypto_metrics.c",
+            f"{self.workdir}/bin/server_crypto_metrics.c",
+            log,
+        )
         self.command(
             f"cd {shlex.quote(self.workdir)} && "
             "gcc -O2 -Wall -Wextra -o bin/ble_mqtt_bridge "
-            "bin/ble_mqtt_bridge.c $(pkg-config --cflags --libs bluez)",
+            "bin/ble_mqtt_bridge.c $(pkg-config --cflags --libs bluez) && "
+            "gcc -O2 -Wall -Wextra -shared -fPIC "
+            "-o bin/server_crypto_metrics.so bin/server_crypto_metrics.c "
+            "-ldl -lcrypto",
             log,
         )
         # Capabilities let the bridge open Bluetooth sockets without leaving a
@@ -156,6 +164,7 @@ class PiGateway:
         script = (
             f": > {broker_log}; : > {gateway_log}; "
             f"setsid env OPENSSL_CONF={remote_case_dir}/openssl.cnf "
+            f"LD_PRELOAD={self.workdir}/bin/server_crypto_metrics.so "
             f"/usr/sbin/mosquitto -c {remote_case_dir}/mosquitto.conf -v "
             f"> {broker_log} 2>&1 < /dev/null & echo $! > {self.workdir}/broker.pid; "
             "sleep 1; "

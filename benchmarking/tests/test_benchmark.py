@@ -13,6 +13,7 @@ from benchmarklib.scheduler import build_jobs
 from generate_cases import build_cases
 from run_benchmarks import (
     ATTEMPT_FIELDS,
+    client_kex_metric_keys,
     load_config,
     parse_args,
     resolve_pi_workdir,
@@ -91,6 +92,18 @@ class BenchmarkTests(unittest.TestCase):
                         "mqtt_connect_ms": "3"}),
         )
 
+    def test_client_kex_total_uses_only_selected_group_components(self) -> None:
+        mlkem = {"kex_group": "MLKEM512"}
+        hybrid = {"kex_group": "X25519MLKEM768"}
+        classical = {"kex_group": "ECDHE-P-256"}
+        self.assertNotIn(
+            "classical_kex_keygen_us", client_kex_metric_keys(mlkem)
+        )
+        self.assertIn(
+            "classical_kex_keygen_us", client_kex_metric_keys(hybrid)
+        )
+        self.assertNotIn("kem_keygen_us", client_kex_metric_keys(classical))
+
     def test_hardware_metrics_are_aggregated(self) -> None:
         case = build_cases(1, 0, True)[0]
         attempt = {field: "" for field in ATTEMPT_FIELDS}
@@ -101,6 +114,12 @@ class BenchmarkTests(unittest.TestCase):
             "client_cpu_ms": "40",
             "client_cpu_usage_percent": "40.00",
             "system_cpu_usage_percent": "55.00",
+            "client_icache_hits": "900",
+            "client_icache_misses": "100",
+            "client_icache_requests": "1000",
+            "client_icache_hit_percent": "90.0000",
+            "client_icache_miss_percent": "10.0000",
+            "client_memory_access_counters_supported": "0",
             "client_heap_peak_bytes": "4096",
             "firmware_flash_used_bytes": "600000",
             "firmware_flash_capacity_bytes": "1048576",
@@ -116,6 +135,11 @@ class BenchmarkTests(unittest.TestCase):
         summary = summarize(case, [attempt])
         self.assertEqual(summary["mean_client_cpu_usage_percent"], "40.000")
         self.assertEqual(summary["mean_system_cpu_usage_percent"], "55.000")
+        self.assertEqual(summary["mean_client_icache_hits"], "900.000")
+        self.assertEqual(summary["mean_client_icache_hit_percent"], "90.0000")
+        self.assertEqual(
+            summary["client_memory_access_counters_supported"], "0"
+        )
         self.assertEqual(summary["firmware_flash_used_bytes"], "600000")
         self.assertEqual(summary["max_thread_stack_peak_percent"], "72.50")
 
