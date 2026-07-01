@@ -16,6 +16,7 @@ from run_benchmarks import (
     load_config,
     parse_args,
     resolve_pi_workdir,
+    resolve_serial_device,
     summarize,
     timeout_for_case,
 )
@@ -68,7 +69,10 @@ class BenchmarkTests(unittest.TestCase):
     def test_config_supplies_hardware_defaults_and_cli_overrides(self) -> None:
         config = load_config(ROOT / "config.json")
         args = parse_args(["--cases", "cases.csv"])
-        self.assertEqual(args.serial_device, config["serial-device"])
+        self.assertEqual(
+            args.serial_device,
+            resolve_serial_device(config["serial-device"]),
+        )
         self.assertEqual(args.pi_host, config["pi-host"])
         self.assertEqual(args.ble_addr, config["ble-addr"])
         self.assertEqual(args.mlkem_backend, "pqm4-m4fstack")

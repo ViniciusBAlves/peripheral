@@ -15,7 +15,8 @@ class PiGateway:
 
     def ssh_base(self) -> list[str]:
         command = [
-            "ssh", "-o", "BatchMode=yes", "-o", "ControlMaster=auto",
+            "ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
+            "-o", "ControlMaster=auto",
             "-o", "ControlPersist=10m", "-o", f"ControlPath={self.control_path}",
         ]
         if self.ssh_key:
@@ -35,7 +36,13 @@ class PiGateway:
             stream.write(f"$ {' '.join(command)}\n")
             proc = subprocess.run(command, text=True, stdout=stream, stderr=subprocess.STDOUT)
         if proc.returncode:
-            raise subprocess.CalledProcessError(proc.returncode, command)
+            detail = log.read_text(errors="replace").strip()
+            if len(detail) > 2000:
+                detail = detail[-2000:]
+            raise RuntimeError(
+                "local command failed with exit "
+                f"{proc.returncode}: {' '.join(command)}\n{detail}"
+            )
 
     def command(self, script: str, log: Path, *, check: bool = True) -> subprocess.CompletedProcess[str]:
         command = [*self.ssh_base(), self.host, f"bash -lc {shlex.quote(script)}"]

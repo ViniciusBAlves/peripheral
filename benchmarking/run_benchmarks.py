@@ -38,6 +38,7 @@ ROOT = Path(__file__).resolve().parent
 RESULTS = ROOT / "results"
 WORK = ROOT / "work"
 DEFAULT_CONFIG = ROOT / "config.json"
+DEFAULT_NCS_VERSION = "v3.3.0"
 
 ATTEMPT_FIELDS = [
     "attempt_index", "schedule_index", "session", "attempt_in_session", "warmup",
@@ -577,6 +578,35 @@ def load_config(path: Path) -> dict[str, str]:
     return values
 
 
+def default_nrfutil() -> str:
+    discovered = shutil.which("nrfutil")
+    if discovered:
+        return discovered
+    for candidate in (
+        "/opt/nordic/ncs/toolchains/0c0f19d91c/nrfutil/bin/nrfutil",
+        "/opt/nordic/ncs/toolchains/0c0f19d91c/nrfutil/home/bin/nrfutil",
+    ):
+        if Path(candidate).exists():
+            return candidate
+    return "nrfutil"
+
+
+def default_ncs_chdir(ncs_version: str = DEFAULT_NCS_VERSION) -> str:
+    candidate = Path("/opt/nordic/ncs") / ncs_version / "nrf"
+    if candidate.exists():
+        return str(candidate)
+    return f"/home/thiago/Documents/ncs/{ncs_version}/nrf"
+
+
+def resolve_serial_device(configured: str) -> str:
+    if Path(configured).exists() or configured != "/dev/ttyACM0":
+        return configured
+    candidates = sorted(Path("/dev").glob("tty.usbmodem*"))
+    if candidates:
+        return str(candidates[0])
+    return configured
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     config_parser = argparse.ArgumentParser(add_help=False)
     config_parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
@@ -629,9 +659,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--ble-addr-type", choices=("public", "random"), default="random")
     parser.add_argument("--psm", default="0x0080")
     parser.add_argument("--mtu", type=int, default=672)
-    parser.add_argument("--nrfutil", default="/home/thiago/.local/bin/nrfutil")
-    parser.add_argument("--ncs-version", default="v3.3.0")
-    parser.add_argument("--ncs-chdir", default="/home/thiago/Documents/ncs/v3.3.0/nrf")
+    parser.add_argument("--nrfutil", default=default_nrfutil())
+    parser.add_argument("--ncs-version", default=DEFAULT_NCS_VERSION)
+    parser.add_argument("--ncs-chdir", default=default_ncs_chdir())
     parser.add_argument("--board", default="nrf52840dk/nrf52840")
     parser.add_argument(
         "--mlkem-backend",
@@ -650,6 +680,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     args = parser.parse_args(argv)
     args.ssh_key = os.path.expandvars(os.path.expanduser(args.ssh_key))
+    args.serial_device = resolve_serial_device(args.serial_device)
     return args
 
 
