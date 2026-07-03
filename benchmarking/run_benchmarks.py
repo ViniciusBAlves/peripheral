@@ -31,6 +31,11 @@ from benchmarklib.firmware import flash as flash_firmware
 from benchmarklib.gateway import PiGateway
 from benchmarklib.metrics import aggregate, number, parse_bench_line
 from benchmarklib.scheduler import SessionJob, build_jobs
+from benchmarklib.server_backends import (
+    SERVER_BACKEND_CHOICES,
+    server_backend_for_case,
+    unsupported_backend_reason,
+)
 from generate_cases import FIELDS as INPUT_FIELDS
 
 
@@ -38,6 +43,7 @@ ROOT = Path(__file__).resolve().parent
 RESULTS = ROOT / "results"
 WORK = ROOT / "work"
 DEFAULT_CONFIG = ROOT / "config.json"
+DEFAULT_NCS_VERSION = "v3.3.0"
 
 ATTEMPT_FIELDS = [
     "attempt_index", "schedule_index", "session", "attempt_in_session", "warmup",
@@ -273,6 +279,10 @@ def timeout_for_case(case: dict[str, str], override: float | None) -> float:
         timeout = 120.0
     elif signature == "RSA-PSS-3072":
         timeout = 45.0
+    elif signature == "LMS-HSS-L2-H10-W4":
+        timeout = 180.0
+    elif signature == "XMSS-SHA2_20_256":
+        timeout = 210.0
     elif signature.startswith("ML-DSA"):
         timeout = 45.0
     else:
@@ -287,11 +297,34 @@ def timeout_for_case(case: dict[str, str], override: float | None) -> float:
     return timeout
 
 
+def classify_gateway_start_failure(
+    gateway_log: Path,
+    final: dict[str, str],
+) -> dict[str, str]:
+    if final.get("stage") != "gateway_start":
+        return final
+    try:
+        text = gateway_log.read_text(errors="replace")
+    except OSError:
+        return final
+    if "Device named" in text and "was not found" in text:
+        final["stage"] = "ble_discovery"
+    elif "L2CAP Channel failed to open" in text:
+        if final.get("error") == "CalledProcessError":
+            final["stage"] = "ble_l2cap_ready_timeout"
+        else:
+            final["stage"] = "ble_l2cap_connect"
+    elif "TCP connect failed" in text:
+        final["stage"] = "gateway_tcp_connect"
+    return final
+
+
 def run_job(
     job: SessionJob,
     case: dict[str, str],
     case_dir: Path,
     remote_case: str,
+    server_backend: str,
     gateway: PiGateway,
     serial_port,
     args: argparse.Namespace,
@@ -316,8 +349,11 @@ def run_job(
                 psm=args.psm,
                 mtu=args.mtu,
                 adapter=args.pi_adapter,
+                disable_wifi=args.disable_pi_wifi,
                 ready_timeout=args.gateway_ready_timeout_sec,
                 log=case_dir / "gateway-control.log",
+                server_backend=server_backend,
+                wolfssl_group=KEMS_BY_NAME[case["kex_group"]].wolfssl_group,
             )
             final = wait_for_result(serial_port, board_log, attempt_timeout)
         except Exception as error:
@@ -334,6 +370,7 @@ def run_job(
                 case["case_id"], broker_log, gateway_log,
                 case_dir / "gateway-control.log",
             )
+            final = classify_gateway_start_failure(gateway_log, final)
             try:
                 wait_for_board_ready(
                     serial_port, board_log, args.board_rearm_timeout_sec
@@ -754,6 +791,42 @@ def load_config(path: Path) -> dict[str, str]:
     return values
 
 
+def default_nrfutil() -> str:
+    discovered = shutil.which("nrfutil")
+    if discovered:
+        return discovered
+    for candidate in (
+        "/opt/nordic/ncs/toolchains/0c0f19d91c/nrfutil/bin/nrfutil",
+        "/opt/nordic/ncs/toolchains/0c0f19d91c/nrfutil/home/bin/nrfutil",
+    ):
+        if Path(candidate).exists():
+            return candidate
+    return "nrfutil"
+
+
+def default_ncs_chdir(ncs_version: str = DEFAULT_NCS_VERSION) -> str:
+    candidate = Path("/opt/nordic/ncs") / ncs_version / "nrf"
+    if candidate.exists():
+        return str(candidate)
+    return f"/home/thiago/Documents/ncs/{ncs_version}/nrf"
+
+
+def resolve_serial_device(configured: str) -> str:
+    if Path(configured).exists() or configured != "/dev/ttyACM0":
+        return configured
+    candidates = sorted(Path("/dev").glob("tty.usbmodem*"))
+    if candidates:
+        return str(candidates[0])
+    return configured
+
+
+def normalize_ble_addr(address: str) -> str:
+    compact = re.sub(r"[^0-9a-fA-F]", "", address)
+    if compact and set(compact) == {"0"}:
+        return ""
+    return address
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     config_parser = argparse.ArgumentParser(add_help=False)
     config_parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
@@ -790,7 +863,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--gateway-ready-timeout-sec", type=float, default=20.0)
     parser.add_argument("--board-ready-timeout-sec", type=float, default=20.0)
-    parser.add_argument("--board-rearm-timeout-sec", type=float, default=15.0)
+    parser.add_argument("--board-rearm-timeout-sec", type=float, default=30.0)
     parser.add_argument("--serial-device", default=config["serial-device"])
     parser.add_argument("--serial-baud", type=int, default=115200)
     parser.add_argument("--pi-host", default=config["pi-host"])
@@ -806,15 +879,27 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--ble-addr-type", choices=("public", "random"), default="random")
     parser.add_argument("--psm", default="0x0080")
     parser.add_argument("--mtu", type=int, default=672)
-    parser.add_argument("--nrfutil", default="/home/thiago/.local/bin/nrfutil")
-    parser.add_argument("--ncs-version", default="v3.3.0")
-    parser.add_argument("--ncs-chdir", default="/home/thiago/Documents/ncs/v3.3.0/nrf")
+    parser.add_argument(
+        "--disable-pi-wifi",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="disable Raspberry Pi Wi-Fi while each BLE bridge session runs",
+    )
+    parser.add_argument("--nrfutil", default=default_nrfutil())
+    parser.add_argument("--ncs-version", default=DEFAULT_NCS_VERSION)
+    parser.add_argument("--ncs-chdir", default=default_ncs_chdir())
     parser.add_argument("--board", default="nrf52840dk/nrf52840")
     parser.add_argument(
         "--mlkem-backend",
         choices=("wolfssl", "pqm4-m4fstack"),
         default="pqm4-m4fstack",
         help="ML-KEM implementation used by the nRF52840 TLS client",
+    )
+    parser.add_argument(
+        "--server-backend",
+        choices=SERVER_BACKEND_CHOICES,
+        default="auto",
+        help="server TLS backend selection",
     )
     parser.add_argument(
         "--reflash-known-unsupported-rsa",
@@ -827,6 +912,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     args = parser.parse_args(argv)
     args.ssh_key = os.path.expandvars(os.path.expanduser(args.ssh_key))
+    args.serial_device = resolve_serial_device(args.serial_device)
+    args.ble_addr = normalize_ble_addr(args.ble_addr)
     return args
 
 
@@ -953,6 +1040,7 @@ def main() -> int:
     generate_client_identity(client_dir, docker_log)
     supported: list[dict[str, str]] = []
     unsupported: dict[str, str] = {}
+    server_backends: dict[str, str] = {}
     signature_templates: dict[str, Path] = {}
     for case in cases:
         retry_large_rsa = (
@@ -962,6 +1050,13 @@ def main() -> int:
         if case["expected_support"] == "known_unsupported" and not retry_large_rsa:
             unsupported[case["case_id"]] = case["notes"] or "known unsupported case"
             continue
+        server_backend = server_backend_for_case(case, args.server_backend)
+        if server_backend is None:
+            unsupported[case["case_id"]] = unsupported_backend_reason(
+                case, args.server_backend
+            )
+            continue
+        server_backends[case["case_id"]] = server_backend
         try:
             generated = case_dirs[case["case_id"]] / "generated"
             template = signature_templates.get(case["cert_sig_alg"])
@@ -1073,7 +1168,11 @@ def main() -> int:
     gateway.start_master(run_dir / "gateway.log")
     atexit.register(gateway.stop_master)
     print(f"[gateway] Preparing Raspberry Pi bridge; log={run_dir / 'gateway.log'}", flush=True)
-    gateway.prepare(ROOT / "gateway" / "ble_mqtt_bridge.c", run_dir / "gateway.log")
+    gateway.prepare(
+        ROOT / "gateway" / "ble_mqtt_bridge.c",
+        ROOT / "gateway" / "wolfssl_tls_server.c",
+        run_dir / "gateway.log",
+    )
     print("[gateway] Raspberry Pi bridge is ready.", flush=True)
     remote_cases = {
         case["case_id"]: gateway.deploy_case(
@@ -1169,7 +1268,9 @@ def main() -> int:
                 else:
                     row = run_job(
                         job, case, case_dirs[job.case_id],
-                        remote_cases[job.case_id], gateway, serial_port, args,
+                        remote_cases[job.case_id],
+                        server_backends[job.case_id],
+                        gateway, serial_port, args,
                         len(attempts[job.case_id]) + 1,
                     )
                 row["mlkem_backend"] = args.mlkem_backend

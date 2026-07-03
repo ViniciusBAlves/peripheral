@@ -23,6 +23,10 @@
 #define BENCHMARK_VERBOSE_LOGS 0
 #endif
 
+#ifndef BENCH_REBOOT_AFTER_SESSION
+#define BENCH_REBOOT_AFTER_SESSION 1
+#endif
+
 #if BENCHMARK_VERBOSE_LOGS
 #define BENCH_LOG(...) printk(__VA_ARGS__)
 #else
@@ -221,11 +225,11 @@ K_SEM_DEFINE(l2cap_connected_sem, 0, 1);
 
 /* --- WOLFSSL TIME HOOKS --- */
 time_t time_sec(time_t *timer) {
-    /* * Unix timestamp for mid-2026. 
+    /* * Unix timestamp for 2030-01-01.
      * This tricks wolfSSL into thinking it is the modern day
-     * so it doesn't reject the Mosquitto certificate's activation date.
+     * so it doesn't reject generated certificate activation dates.
      */
-    time_t base_time = 1781350000; 
+    time_t base_time = 1893456000;
     
     /* Add the board's uptime to the 2026 baseline */
     time_t t = base_time + (time_t)(k_uptime_get_32() / 1000);
@@ -948,6 +952,19 @@ int main(void) {
         start_secure_mqtt_session(&l2cap_chan.chan);
         
         BENCH_LOG("Session ended. Re-arming for next connection...\n");
+
+#if BENCH_REBOOT_AFTER_SESSION
+        /*
+         * The nRF52840/BlueZ path is much more reliable when each benchmark
+         * starts from the board's boot-time advertising state.  Reboot only
+         * after the result line has been printed and TLS cleanup has run, so
+         * measurements are preserved while the next discovery avoids a stale
+         * controller/channel state.
+         */
+        BENCH_OUT("[BENCH_RECOVERY] reason=session_complete action=reboot\n");
+        k_msleep(100);
+        sys_reboot(SYS_REBOOT_COLD);
+#endif
         
         /* 1. Only request disconnect if the peer hasn't already dropped us */
         if (l2cap_chan.chan.conn && !l2cap_peer_disconnected) {

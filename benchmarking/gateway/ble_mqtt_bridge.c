@@ -46,10 +46,11 @@
 #define DEFAULT_TCP_PORT 8883
 #define DEFAULT_PSM 0x0080
 #define DEFAULT_MTU 672
-#define DEFAULT_SCAN_TIMEOUT_SEC 3
-#define DEFAULT_CONNECT_TIMEOUT_MS 10000
-#define DEFAULT_L2CAP_ATTEMPTS 60
+#define DEFAULT_SCAN_TIMEOUT_SEC 5
+#define DEFAULT_CONNECT_TIMEOUT_MS 2000
+#define DEFAULT_L2CAP_ATTEMPTS 10
 #define DEFAULT_ACL_ATTEMPTS 1
+#define DEFAULT_DISCOVERY_ATTEMPTS 3
 #define COMMAND_OUTPUT_MAX 8192
 #define BRIDGE_RECV_BUFFER_SIZE 65535
 
@@ -114,7 +115,7 @@ static void usage(const char *program)
             "  --tcp-host 127.0.0.1         TCP target for Mosquitto\n"
             "  --tcp-port 8883              TCP target port\n"
             "  --mtu 672                    BLE write chunk size\n"
-            "  --scan-timeout 3             BlueZ scan duration\n"
+            "  --scan-timeout 5             BlueZ scan duration\n"
             "  --forget-cache               Remove cached BlueZ device first\n"
             "  --no-acl-prime               Skip bluetoothctl connect before L2CAP\n"
             "  --reset-adapter              Power-cycle the adapter before scanning\n"
@@ -293,15 +294,9 @@ static void scan_adapter(int seconds)
     (void)command_status(command);
 }
 
-static int discover_device(const struct config *cfg, char address[18])
+static int find_cached_device(const char *device_name, char address[18])
 {
-    char command[256];
-    printf("[*] Raspberry Pi Bluetooth active. Scanning for %s...\n",
-           cfg->device_name);
-    scan_adapter(cfg->scan_timeout_sec);
-
-    snprintf(command, sizeof(command), "bluetoothctl devices 2>/dev/null");
-    FILE *devices = popen(command, "r");
+    FILE *devices = popen("bluetoothctl devices 2>/dev/null", "r");
     if (!devices) {
         fprintf(stderr, "[-] Bluetooth device list failed: %s\n",
                 strerror(errno));
@@ -315,22 +310,38 @@ static int discover_device(const struct config *cfg, char address[18])
         char found_name[256];
         if (sscanf(line, "Device %17s %255[^\n]",
                    found_address, found_name) == 2 &&
-            strcmp(found_name, cfg->device_name) == 0) {
+            strcmp(found_name, device_name) == 0) {
             memcpy(address, found_address, 18);
             ret = 0;
             break;
         }
     }
     (void)pclose(devices);
-
-    if (ret == 0) {
-        printf("[+] Found %s at %s. Attempting connection...\n",
-               cfg->device_name, address);
-    } else {
-        fprintf(stderr, "[-] Device named '%s' was not found\n",
-                cfg->device_name);
-    }
     return ret;
+}
+
+static int discover_device(const struct config *cfg, char address[18])
+{
+    printf("[*] Raspberry Pi Bluetooth active. Discovering %s...\n",
+           cfg->device_name);
+    for (int attempt = 1; attempt <= DEFAULT_DISCOVERY_ATTEMPTS; attempt++) {
+        printf("[*] Discovery attempt %d/%d for %s\n",
+               attempt, DEFAULT_DISCOVERY_ATTEMPTS, cfg->device_name);
+        scan_adapter(cfg->scan_timeout_sec);
+        int ret = find_cached_device(cfg->device_name, address);
+        if (ret == 0) {
+            printf("[+] Found %s at %s. Attempting connection...\n",
+                   cfg->device_name, address);
+            return 0;
+        }
+        if (attempt < DEFAULT_DISCOVERY_ATTEMPTS) {
+            usleep(500000);
+        }
+    }
+
+    fprintf(stderr, "[-] Device named '%s' was not found\n",
+            cfg->device_name);
+    return -1;
 }
 
 static void prepare_bluetooth_adapter(const char *address,
@@ -531,7 +542,7 @@ static int connect_tcp(const char *host, uint16_t port)
         return -1;
     }
 
-    printf("[+] TCP Bridge to Mosquitto Active. Pumping data.\n");
+    printf("[+] TCP Bridge to TLS server active. Pumping data.\n");
     return fd;
 }
 
@@ -735,8 +746,6 @@ int main(int argc, char **argv)
     if (cfg.disable_wifi) {
         set_wifi_enabled(false);
         cfg.wifi_disabled = true;
-        sleep(2);
-        recycle_adapter(true);
     }
 
     char discovered_address[18] = {0};
@@ -781,9 +790,22 @@ int main(int argc, char **argv)
             break;
         }
 
-        if (attempt % 10 == 0 && attempt < DEFAULT_L2CAP_ATTEMPTS) {
+        if (!cfg.device_addr && attempt % 3 == 0 &&
+            attempt < DEFAULT_L2CAP_ATTEMPTS) {
+            char refreshed_address[18] = {0};
+            scan_adapter(1);
+            if (find_cached_device(cfg.device_name, refreshed_address) == 0 &&
+                strcmp(refreshed_address, address) != 0) {
+                memcpy(discovered_address, refreshed_address, 18);
+                address = discovered_address;
+                printf("[*] Refreshed %s address to %s after L2CAP retries.\n",
+                       cfg.device_name, address);
+            }
+        }
+
+        if (attempt % 5 == 0 && attempt < DEFAULT_L2CAP_ATTEMPTS) {
             recycle_adapter(true);
-            scan_adapter(2);
+            scan_adapter(1);
             if (!cfg.no_acl_prime) {
                 (void)acl_connect_attempt(address, 1, 1);
             }

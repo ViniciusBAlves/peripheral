@@ -80,6 +80,12 @@ SIGNATURES = (
               "SLH-DSA-SHAKE-192s", "ec:secp384r1", "ECDSA-P-384"),
     Signature("SLH-DSA-SHAKE-256s", 5, 64, 128, 29792, "pqc",
               "SLH-DSA-SHAKE-256s", "ec:secp521r1", "ECDSA-P-521"),
+    Signature("LMS-HSS-L2-H10-W4", 5, 60, 64, 5076, "pqc",
+              "LMS-HSS-L2-H10-W4", "LMS-HSS-L2-H10-W4", "LMS-HSS-L2-H10-W4",
+              notes="LMS/HSS signs the chain; TLS CertificateVerify uses ECDSA"),
+    Signature("XMSS-SHA2_20_256", 5, 68, 2573, 2820, "pqc",
+              "XMSS-SHA2_20_256", "XMSS-SHA2_20_256", "XMSS-SHA2_20_256",
+              notes="XMSS signs the chain; TLS CertificateVerify uses ECDSA"),
 )
 
 KEMS_BY_NAME = {item.name: item for item in KEMS}

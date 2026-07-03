@@ -15,7 +15,8 @@ class PiGateway:
 
     def ssh_base(self) -> list[str]:
         command = [
-            "ssh", "-o", "BatchMode=yes", "-o", "ControlMaster=auto",
+            "ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
+            "-o", "ControlMaster=auto",
             "-o", "ControlPersist=10m", "-o", f"ControlPath={self.control_path}",
         ]
         if self.ssh_key:
@@ -35,10 +36,17 @@ class PiGateway:
             stream.write(f"$ {' '.join(command)}\n")
             proc = subprocess.run(command, text=True, stdout=stream, stderr=subprocess.STDOUT)
         if proc.returncode:
-            raise subprocess.CalledProcessError(proc.returncode, command)
+            detail = log.read_text(errors="replace").strip()
+            if len(detail) > 2000:
+                detail = detail[-2000:]
+            raise RuntimeError(
+                "local command failed with exit "
+                f"{proc.returncode}: {' '.join(command)}\n{detail}"
+            )
 
     def command(self, script: str, log: Path, *, check: bool = True) -> subprocess.CompletedProcess[str]:
         command = [*self.ssh_base(), self.host, f"bash -lc {shlex.quote(script)}"]
+        log.parent.mkdir(parents=True, exist_ok=True)
         with log.open("a") as stream:
             stream.write(f"$ remote: {script}\n")
             proc = subprocess.run(command, text=True, stdout=stream, stderr=subprocess.STDOUT)
@@ -53,12 +61,14 @@ class PiGateway:
             log,
         )
 
-    def prepare(self, bridge_source: Path, log: Path) -> None:
+    def prepare(self, bridge_source: Path, wolfssl_server_source: Path, log: Path) -> None:
         self.command(f"mkdir -p {shlex.quote(self.workdir)}/{{bin,cases,logs}}", log)
         self.deploy_file(bridge_source, f"{self.workdir}/bin/ble_mqtt_bridge.c", log)
         self.deploy_file(
             bridge_source.parent / "server_crypto_metrics.c",
             f"{self.workdir}/bin/server_crypto_metrics.c",
+            wolfssl_server_source,
+            f"{self.workdir}/bin/wolfssl_tls_server.c",
             log,
         )
         self.command(
@@ -83,6 +93,16 @@ class PiGateway:
             "| grep -q oqsprovider",
             log,
         )
+        self.command(
+            f"cd {shlex.quote(self.workdir)} && "
+            "if pkg-config --exists wolfssl; then "
+            "  gcc -O2 -Wall -Wextra -DWOLFSSL_HAVE_XMSS "
+            "    -o bin/wolfssl_tls_server bin/wolfssl_tls_server.c "
+            "    $(pkg-config --cflags --libs wolfssl); "
+            "fi; "
+            "test -x bin/wolfssl_tls_server",
+            log,
+        )
 
     def deploy_case(self, case_id: str, directory: Path, log: Path) -> str:
         remote = f"{self.workdir}/cases/{case_id}"
@@ -101,13 +121,29 @@ class PiGateway:
     def stop_session(self, log: Path, *, reset_adapter: bool = False) -> None:
         bridge_pattern = f"^{self.workdir}/bin/ble_mqtt_bridge( |$)"
         broker_pattern = f"^/usr/sbin/mosquitto -c {self.workdir}/cases/"
+        wolfssl_pattern = f"^{self.workdir}/bin/wolfssl_tls_server( |$)"
         reset_command = ""
         if reset_adapter:
             reset_command = (
+                "sudo -n /usr/sbin/rfkill block wifi >/dev/null 2>&1 || true; "
+                "sudo -n /usr/bin/nmcli radio wifi off >/dev/null 2>&1 || true; "
+                "sudo -n /usr/sbin/ip link set wlan0 down >/dev/null 2>&1 || true; "
+                "sleep 1; "
                 "sudo -n timeout -k 1 4 /usr/bin/btmgmt power off "
-                ">/dev/null 2>&1 || true; sleep 0.5; "
+                ">/dev/null 2>&1 || true; sleep 1; "
                 "sudo -n timeout -k 1 4 /usr/bin/btmgmt power on "
-                ">/dev/null 2>&1 || true; sleep 0.5; "
+                ">/dev/null 2>&1 || true; sleep 1; "
+                "sudo -n timeout -k 1 4 /usr/bin/btmgmt bredr off "
+                ">/dev/null 2>&1 || true; "
+                "sudo -n timeout -k 1 4 /usr/bin/btmgmt bondable off "
+                ">/dev/null 2>&1 || true; "
+                "sudo -n timeout -k 1 4 /usr/bin/btmgmt sc off "
+                ">/dev/null 2>&1 || true; "
+                "sudo -n timeout -k 1 4 /usr/bin/btmgmt privacy off "
+                ">/dev/null 2>&1 || true; "
+                "sudo -n /usr/sbin/rfkill unblock wifi >/dev/null 2>&1 || true; "
+                "sudo -n /usr/bin/nmcli radio wifi on >/dev/null 2>&1 || true; "
+                "sudo -n /usr/sbin/ip link set wlan0 up >/dev/null 2>&1 || true; "
             )
         self.command(
             f"if [ -f {self.workdir}/bridge.pid ]; then "
@@ -129,6 +165,8 @@ class PiGateway:
             "    sudo -n kill -KILL $pids 2>/dev/null || true; "
             f"pids=$(pgrep -f {shlex.quote(broker_pattern)} || true); "
             "  [ -z \"$pids\" ] || kill -KILL $pids 2>/dev/null || true; "
+            f"pids=$(pgrep -f {shlex.quote(wolfssl_pattern)} || true); "
+            "  [ -z \"$pids\" ] || kill -KILL $pids 2>/dev/null || true; "
             f"{reset_command}",
             log,
             check=False,
@@ -145,10 +183,13 @@ class PiGateway:
         psm: str,
         mtu: int,
         adapter: str,
+        disable_wifi: bool,
         ready_timeout: float,
         log: Path,
+        server_backend: str = "openssl-mosquitto",
+        wolfssl_group: str = "",
     ) -> None:
-        self.stop_session(log)
+        self.stop_session(log, reset_adapter=disable_wifi)
         broker_log = f"{self.workdir}/logs/{case_id}.broker.log"
         gateway_log = f"{self.workdir}/logs/{case_id}.gateway.log"
         address = f"--addr {shlex.quote(ble_addr)}" if ble_addr else ""
@@ -157,16 +198,32 @@ class PiGateway:
             f"--adapter {shlex.quote(adapter)} --name {shlex.quote(ble_name)} "
             f"{address} --addr-type {shlex.quote(ble_addr_type)} "
             f"--psm {shlex.quote(psm)} --tcp-host 127.0.0.1 --tcp-port 8883 "
-            f"--mtu {mtu} --scan-timeout 3 --forget-cache --no-acl-prime "
+            f"--mtu {mtu} --scan-timeout 5 --no-acl-prime "
+            f"{'--disable-wifi ' if disable_wifi else ''}"
             f"> {gateway_log} 2>&1 < /dev/null & "
             f"echo $! > {self.workdir}/bridge.pid"
         )
+        if server_backend == "wolfssl":
+            if not wolfssl_group:
+                raise ValueError("wolfssl_group is required for wolfssl backend")
+            server_command = (
+                f"setsid {shlex.quote(self.workdir)}/bin/wolfssl_tls_server "
+                f"--case-dir {remote_case_dir} "
+                f"--group {shlex.quote(wolfssl_group)} --port 8883 "
+                f"> {broker_log} 2>&1 < /dev/null & "
+                f"echo $! > {self.workdir}/broker.pid"
+            )
+        else:
+            server_command = (
+                f"setsid env OPENSSL_CONF={remote_case_dir}/openssl.cnf "
+                f"/usr/sbin/mosquitto -c {remote_case_dir}/mosquitto.conf -v "
+                f"> {broker_log} 2>&1 < /dev/null & "
+                f"echo $! > {self.workdir}/broker.pid"
+            )
         script = (
             f": > {broker_log}; : > {gateway_log}; "
-            f"setsid env OPENSSL_CONF={remote_case_dir}/openssl.cnf "
             f"LD_PRELOAD={self.workdir}/bin/server_crypto_metrics.so "
-            f"/usr/sbin/mosquitto -c {remote_case_dir}/mosquitto.conf -v "
-            f"> {broker_log} 2>&1 < /dev/null & echo $! > {self.workdir}/broker.pid; "
+            f"{server_command}; "
             "sleep 1; "
             f"kill -0 $(cat {self.workdir}/broker.pid) 2>/dev/null; "
             f"{bridge_command}"

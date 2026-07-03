@@ -2,14 +2,23 @@ from __future__ import annotations
 
 import os
 import re
+import shlex
 import shutil
 import subprocess
+import hashlib
 from pathlib import Path
 
-from .algorithms import KEMS_BY_NAME, SIGNATURES_BY_NAME, Signature
+from .algorithms import KEMS_BY_NAME, SIGNATURES_BY_NAME, Signature, slug
+from .server_backends import HASH_BASED_SIGNATURES
 
 
 IMAGE = "peripheral-pqc-openssl:3.5"
+ROOT = Path(__file__).resolve().parents[1]
+CERT_CACHE = ROOT / "work" / "certificate-cache" / "v3"
+LEGACY_CERT_CACHES = (ROOT / "work" / "certificate-cache" / "v1",)
+MIN_CACHE_VALID_SECONDS = 7 * 24 * 60 * 60
+CERT_NOT_BEFORE = "20200101000000Z"
+CERT_NOT_AFTER = "20360101000000Z"
 
 
 def run(command: list[str], *, log: Path | None = None) -> None:
@@ -27,13 +36,17 @@ def run(command: list[str], *, log: Path | None = None) -> None:
 def ensure_image(dockerfile: Path, log: Path) -> None:
     probe = subprocess.run(["docker", "image", "inspect", IMAGE], capture_output=True)
     if probe.returncode:
-        run(["docker", "build", "-t", IMAGE, "-f", str(dockerfile), str(dockerfile.parent)], log=log)
+        run(
+            ["docker", "build", "-t", IMAGE, "-f", str(dockerfile), str(dockerfile.parent.parent)],
+            log=log,
+        )
     run(
         [
             "docker", "run", "--rm", IMAGE, "sh", "-ec",
             "openssl version; "
             "openssl list -kem-algorithms | grep -Eq 'MLKEM512|ML-KEM-512'; "
-            "openssl list -signature-algorithms | grep -q 'SLH-DSA-SHAKE-256s'",
+            "openssl list -signature-algorithms | grep -q 'SLH-DSA-SHAKE-256s'; "
+            "command -v hbs_certgen",
         ],
         log=log,
     )
@@ -73,70 +86,231 @@ def _docker_script(output: Path, script: str, log: Path) -> None:
     )
 
 
+def _append_log(log: Path, message: str) -> None:
+    log.parent.mkdir(parents=True, exist_ok=True)
+    with log.open("a") as stream:
+        stream.write(message.rstrip() + "\n")
+
+
+def _copy_files(source: Path, destination: Path, names: tuple[str, ...]) -> None:
+    destination.mkdir(parents=True, exist_ok=True)
+    for name in names:
+        shutil.copy2(source / name, destination / name)
+
+
+def _cert_is_valid(path: Path, *, min_valid_seconds: int = MIN_CACHE_VALID_SECONDS) -> bool:
+    if not path.exists():
+        return False
+    proc = subprocess.run(
+        [
+            "docker", "run", "--rm",
+            "-v", f"{path.parent.resolve()}:/certs:ro",
+            IMAGE, "openssl", "x509",
+            "-checkend", str(min_valid_seconds),
+            "-noout", "-in", f"/certs/{path.name}",
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    return proc.returncode == 0
+
+
+def _all_present(directory: Path, names: tuple[str, ...]) -> bool:
+    return all((directory / name).exists() for name in names)
+
+
+def _digest_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()[:16]
+
+
 def generate_client_identity(output: Path, log: Path) -> None:
     required = (
         "client_ca.crt", "client.crt", "client.key", "client_ca.der",
         "client_cert.der", "client_key.der", "server_root.crt",
         "server_root.key", "server_root.der",
     )
-    if all((output / name).exists() for name in required):
+    certs = ("client_ca.crt", "client.crt", "server_root.crt")
+    if _all_present(output, required) and all(_cert_is_valid(output / name) for name in certs):
         return
-    script = """
+    cache = CERT_CACHE / "client-identity"
+    if _all_present(cache, required) and all(_cert_is_valid(cache / name) for name in certs):
+        _append_log(log, f"[cert-cache] Reusing client identity from {cache}")
+        _copy_files(cache, output, required)
+        return
+    _append_log(log, f"[cert-cache] Generating client identity into {cache}")
+    shutil.rmtree(cache, ignore_errors=True)
+    cache.mkdir(parents=True, exist_ok=True)
+    script = f"""
+cat > /out/client.ext <<'EOF'
+basicConstraints=critical,CA:FALSE
+keyUsage=critical,digitalSignature
+extendedKeyUsage=critical,clientAuth
+subjectKeyIdentifier=hash
+authorityKeyIdentifier=keyid,issuer
+EOF
 openssl req -x509 -new -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
   -keyout /out/client_ca.key -out /out/client_ca.crt -nodes \
-  -subj /CN=Peripheral_Benchmark_Client_CA -days 3650 \
+  -subj /CN=Peripheral_Benchmark_Client_CA \
+  -not_before {CERT_NOT_BEFORE} -not_after {CERT_NOT_AFTER} \
   -addext basicConstraints=critical,CA:TRUE \
   -addext keyUsage=critical,keyCertSign,cRLSign
 openssl req -new -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
   -keyout /out/client.key -out /out/client.csr -nodes -subj /CN=nrf52840-benchmark
 openssl x509 -req -in /out/client.csr -CA /out/client_ca.crt \
-  -CAkey /out/client_ca.key -CAcreateserial -out /out/client.crt -days 3650
+  -CAkey /out/client_ca.key -CAcreateserial -out /out/client.crt \
+  -not_before {CERT_NOT_BEFORE} -not_after {CERT_NOT_AFTER} \
+  -extfile /out/client.ext
 openssl x509 -in /out/client_ca.crt -outform DER -out /out/client_ca.der
 openssl x509 -in /out/client.crt -outform DER -out /out/client_cert.der
 openssl pkey -in /out/client.key -outform DER -out /out/client_key.der
 openssl req -x509 -new -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
   -keyout /out/server_root.key -out /out/server_root.crt -nodes \
-  -subj /CN=Peripheral_Benchmark_Server_Root -days 3650 \
+  -subj /CN=Peripheral_Benchmark_Server_Root \
+  -not_before {CERT_NOT_BEFORE} -not_after {CERT_NOT_AFTER} \
   -addext basicConstraints=critical,CA:TRUE \
   -addext keyUsage=critical,keyCertSign,cRLSign
 openssl x509 -in /out/server_root.crt -outform DER -out /out/server_root.der
+openssl verify -purpose sslclient -CAfile /out/client_ca.crt /out/client.crt
 """
-    _docker_script(output, script, log)
+    _docker_script(cache, script, log)
+    _copy_files(cache, output, required)
 
 
 def generate_server_case(case: dict[str, str], output: Path, client_dir: Path, log: Path) -> None:
-    required = ("server_intermediate.crt", "server.crt", "server.key",
-                "server_chain.crt", "openssl.cnf", "mosquitto.conf")
-    if all((output / name).exists() for name in required):
-        return
     signature: Signature = SIGNATURES_BY_NAME[case["cert_sig_alg"]]
-    kem = KEMS_BY_NAME[case["kex_group"]]
+    if signature.name in HASH_BASED_SIGNATURES:
+        cached_required = (
+            "server_root.crt", "server_root.der", "server.crt",
+            "server.key", "server_chain.crt",
+        )
+        output_required = (
+            *cached_required, "client_ca.crt", "client_ca.der",
+            "openssl.cnf", "mosquitto.conf",
+        )
+        if (
+            _all_present(output, output_required)
+            and _cert_is_valid(output / "server_root.crt")
+            and _cert_is_valid(output / "server.crt")
+        ):
+            return
+        cache = CERT_CACHE / "server" / slug(signature.name)
+        legacy_caches = [
+            legacy / "server" / slug(signature.name)
+            for legacy in LEGACY_CERT_CACHES
+        ]
+        if not (
+            _all_present(cache, cached_required)
+            and _cert_is_valid(cache / "server_root.crt")
+            and _cert_is_valid(cache / "server.crt")
+        ):
+            legacy_cache = next(
+                (
+                    item for item in legacy_caches
+                    if _all_present(item, cached_required)
+                    and _cert_is_valid(item / "server_root.crt")
+                    and _cert_is_valid(item / "server.crt")
+                ),
+                None,
+            )
+            if legacy_cache is not None:
+                _append_log(
+                    log,
+                    f"[cert-cache] Migrating {signature.name} server chain "
+                    f"from {legacy_cache}",
+                )
+                shutil.rmtree(cache, ignore_errors=True)
+                _copy_files(legacy_cache, cache, cached_required)
+            else:
+                _append_log(log, f"[cert-cache] Generating {signature.name} server chain into {cache}")
+                shutil.rmtree(cache, ignore_errors=True)
+                generate_hash_based_server_case(signature.name, cache, client_dir, log)
+        else:
+            _append_log(log, f"[cert-cache] Reusing {signature.name} server chain from {cache}")
+        _copy_files(cache, output, cached_required)
+        shutil.copy2(client_dir / "client_ca.crt", output / "client_ca.crt")
+        shutil.copy2(client_dir / "client_ca.der", output / "client_ca.der")
+        write_case_configs(case, output)
+        return
+    cached_required = (
+        "server_root.crt", "server_root.key", "server_intermediate.crt",
+        "server_intermediate.key", "server.crt", "server.key",
+        "server_chain.crt",
+    )
+    output_required = (
+        *cached_required, "client_ca.crt", "client_ca.der",
+        "openssl.cnf", "mosquitto.conf",
+    )
+    if (
+        _all_present(output, output_required)
+        and _cert_is_valid(output / "server_intermediate.crt")
+        and _cert_is_valid(output / "server.crt")
+    ):
+        return
+    root_digest = _digest_file(client_dir / "server_root.crt")
+    cache = CERT_CACHE / "server" / f"{root_digest}_{slug(signature.name)}"
+    if (
+        _all_present(cache, cached_required)
+        and _cert_is_valid(cache / "server_intermediate.crt")
+        and _cert_is_valid(cache / "server.crt")
+    ):
+        _append_log(log, f"[cert-cache] Reusing {signature.name} server chain from {cache}")
+        _copy_files(cache, output, cached_required)
+        shutil.copy2(client_dir / "client_ca.crt", output / "client_ca.crt")
+        shutil.copy2(client_dir / "client_ca.der", output / "client_ca.der")
+        write_case_configs(case, output)
+        return
+    _append_log(log, f"[cert-cache] Generating {signature.name} server chain into {cache}")
+    shutil.rmtree(cache, ignore_errors=True)
+    cache.mkdir(parents=True, exist_ok=True)
     issuer_args = _key_args(signature.issuer_key_type)
     leaf_args = _key_args(signature.leaf_key_type)
     issuer_hash = _hash_arg(signature.issuer_key_type)
     leaf_hash = _hash_arg(signature.leaf_key_type)
-    output.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(client_dir / "server_root.crt", output / "server_root.crt")
-    shutil.copy2(client_dir / "server_root.key", output / "server_root.key")
+    shutil.copy2(client_dir / "server_root.crt", cache / "server_root.crt")
+    shutil.copy2(client_dir / "server_root.key", cache / "server_root.key")
     script = f"""
-printf 'basicConstraints=critical,CA:TRUE\\nkeyUsage=critical,keyCertSign,cRLSign\\n' \
+printf 'basicConstraints=critical,CA:TRUE\\nkeyUsage=critical,keyCertSign,cRLSign\\nsubjectKeyIdentifier=hash\\nauthorityKeyIdentifier=keyid,issuer\\n' \
   > /out/intermediate.ext
+printf 'basicConstraints=critical,CA:FALSE\\nkeyUsage=critical,digitalSignature,keyEncipherment\\nextendedKeyUsage=critical,serverAuth\\nsubjectAltName=DNS:localhost,IP:127.0.0.1\\nsubjectKeyIdentifier=hash\\nauthorityKeyIdentifier=keyid,issuer\\n' \
+  > /out/server.ext
 openssl req -new {issuer_args} -keyout /out/server_intermediate.key \
   -out /out/server_intermediate.csr -nodes -subj /CN={signature.name}_Intermediate \
   {issuer_hash}
 openssl x509 -req -in /out/server_intermediate.csr -CA /out/server_root.crt \
   -CAkey /out/server_root.key -CAcreateserial -out /out/server_intermediate.crt \
-  -days 3650 -extfile /out/intermediate.ext
+  -not_before {CERT_NOT_BEFORE} -not_after {CERT_NOT_AFTER} \
+  -extfile /out/intermediate.ext
 openssl req -new {leaf_args} -keyout /out/server.key -out /out/server.csr \
   -nodes -subj /CN=localhost {leaf_hash}
 openssl x509 -req -in /out/server.csr -CA /out/server_intermediate.crt \
   -CAkey /out/server_intermediate.key -CAcreateserial -out /out/server.crt \
-  -days 3650 {issuer_hash}
+  -not_before {CERT_NOT_BEFORE} -not_after {CERT_NOT_AFTER} \
+  -extfile /out/server.ext {issuer_hash}
 cat /out/server.crt /out/server_intermediate.crt > /out/server_chain.crt
+openssl verify -purpose sslserver -CAfile /out/server_root.crt \
+  -untrusted /out/server_intermediate.crt /out/server.crt
 """
-    _docker_script(output, script, log)
+    _docker_script(cache, script, log)
+    _copy_files(cache, output, cached_required)
     shutil.copy2(client_dir / "client_ca.crt", output / "client_ca.crt")
+    shutil.copy2(client_dir / "client_ca.der", output / "client_ca.der")
     write_case_configs(case, output)
+
+
+def generate_hash_based_server_case(
+    signature: str,
+    output: Path,
+    client_dir: Path,
+    log: Path,
+) -> None:
+    output.mkdir(parents=True, exist_ok=True)
+    _docker_script(output, f"hbs_certgen {shlex.quote(signature)} /out", log)
+    shutil.copy2(client_dir / "client_ca.crt", output / "client_ca.crt")
+    shutil.copy2(client_dir / "client_ca.der", output / "client_ca.der")
 
 
 def write_case_configs(case: dict[str, str], output: Path) -> None:
@@ -176,18 +350,35 @@ def generate_universal_header(
     case_dirs: list[tuple[str, Path]],
     output: Path,
 ) -> None:
+    roots: list[tuple[str, bytes]] = [
+        ("benchmark_server_root", (client_dir / "server_root.der").read_bytes())
+    ]
+    seen = {roots[0][1]}
+    for case_id, case_dir in case_dirs:
+        root = case_dir / "server_root.der"
+        if not root.exists():
+            continue
+        data = root.read_bytes()
+        if data in seen:
+            continue
+        seen.add(data)
+        roots.append((f"benchmark_server_root_{len(roots)}", data))
+
     parts = [
         "#ifndef BENCHMARK_CREDENTIALS_H\n#define BENCHMARK_CREDENTIALS_H\n\n",
         "#include <stddef.h>\n\n",
         c_array("benchmark_client_cert", (client_dir / "client_cert.der").read_bytes()),
         c_array("benchmark_client_key", (client_dir / "client_key.der").read_bytes()),
-        c_array("benchmark_server_root", (client_dir / "server_root.der").read_bytes()),
     ]
+    parts.extend(c_array(name, data) for name, data in roots)
     parts.extend(
         [
             "\nstruct benchmark_ca_entry { const unsigned char *data; size_t length; };\n",
             "static const struct benchmark_ca_entry benchmark_ca_bundle[] = {\n",
-            "    { benchmark_server_root, sizeof(benchmark_server_root) }",
+            ",\n".join(
+                f"    {{ {name}, sizeof({name}) }}"
+                for name, _data in roots
+            ),
             "\n};\n",
             "#define BENCHMARK_CA_COUNT "
             "(sizeof(benchmark_ca_bundle) / sizeof(benchmark_ca_bundle[0]))\n",
