@@ -8,8 +8,10 @@ the build products, generated certificates, or source files in the parent
 
 The nRF52840 runs wolfSSL and sends TLS records over a BLE LE Credit-Based
 L2CAP channel on PSM `0x0080`. A Raspberry Pi bridges that channel to a local
-Mosquitto TCP listener. Mosquitto uses OpenSSL 3.5+ and its available
-post-quantum providers.
+TLS server on `127.0.0.1:8883`. By default, normal cases use a Mosquitto TCP
+listener backed by OpenSSL 3.5+ and its available post-quantum providers, while
+LMS/HSS and XMSS cases use a small wolfSSL TLS server with a minimal MQTT
+CONNACK responder.
 
 The firmware contains every supported TLS key-exchange group and a trust bundle
 for the server CAs in the selected run. The server offers one group and one
@@ -19,6 +21,10 @@ mutual TLS, so the benchmark signature algorithm describes the server side.
 SLH-DSA signs the server certificate chain. Its TLS `CertificateVerify` leaf
 remains ECDSA because the current TLS stacks do not negotiate SLH-DSA as a TLS
 signature scheme. Both values are recorded explicitly in the CSV.
+
+LMS/HSS and XMSS also sign the server certificate chain while keeping an ECDSA
+TLS leaf key. OpenSSL/Mosquitto cannot load those chains for TLS, so the runner
+uses wolfSSL for those cases when `--server-backend auto` is selected.
 
 RSA-PSS-15360 cases are emitted as `known_unsupported` by default because the
 normal wolfSSL `USE_FAST_MATH` profile caps TLS RSA keys at 8192 bits. They are
@@ -38,7 +44,10 @@ benchmarking/gateway/deploy_pi_gateway.sh
 ```
 
 The benchmark user must be able to start `ble_mqtt_bridge` with non-interactive
-sudo. Add a narrow sudoers rule for the deployed binary if needed.
+sudo. Add a narrow sudoers rule for the deployed binary if needed. Runs that
+use `--server-backend auto` with LMS/XMSS cases, or `--server-backend wolfssl`,
+also require wolfSSL development files on the Pi so the runner can compile
+`wolfssl_tls_server` with `pkg-config wolfssl`.
 
 ## Generate Cases
 
@@ -81,6 +90,23 @@ python benchmarking/run_benchmarks.py \
   --limit 2
 ```
 
+## Server Backend
+
+The runner supports three server backend modes:
+
+- `--server-backend auto`: use OpenSSL/Mosquitto for ordinary cases and wolfSSL
+  for LMS/HSS or XMSS certificate chains.
+- `--server-backend openssl-mosquitto`: use OpenSSL/Mosquitto for every case it
+  can run; LMS/HSS and XMSS are recorded as unsupported instead of attempted.
+- `--server-backend wolfssl`: use the wolfSSL TLS server for every selected
+  case.
+
+The wolfSSL server is not a full MQTT broker. It accepts one mutual-TLS
+connection through the existing BLE bridge, reads the benchmark firmware's MQTT
+CONNECT packet, sends CONNACK, and closes cleanly. The resolved backend is saved
+in `run_manifest.csv`, `session_manifest.csv`, `attempts.csv`, and
+`summary.csv`.
+
 ## Hardware Run
 
 To execute the benchmark, use the same command **without `--dry-run`**:
@@ -111,16 +137,23 @@ Hardware connection defaults are read from `benchmarking/config.json`:
 
 Use `--config path/to/config.json` to select another configuration. The four
 corresponding command-line options remain available and override JSON values.
+The placeholder BLE address `00:00:00:00:00:00` means "discover by
+`--ble-name`"; set a real BLE address only when you want to skip discovery.
 
 The runner generates every certificate first, builds and flashes one universal
 firmware image, then executes the saved schedule. Use `--skip-build
 --skip-flash` only when the already flashed image was built from the same
 universal credential bundle.
 
+Generated certificate identities are cached across runs in
+`benchmarking/work/certificate-cache`. Cached certificates are reused while
+they remain valid for at least seven more days; per-case OpenSSL and Mosquitto
+configuration files are still regenerated inside each run directory.
+
 Attempt timeouts are selected automatically from the KEM and signature cost.
 `--attempt-timeout-sec N` overrides that policy. Gateway readiness has a
-separate 20-second timeout, so a failed BLE channel does not consume a full
-cryptographic timeout.
+separate 90-second timeout, giving the raw BLE L2CAP bridge enough time to
+retry controller setup without consuming a full cryptographic timeout.
 
 The adaptive base timeout is 60 seconds for ECDSA, 45 seconds for ML-DSA and
 RSA-3072, 75/120/180 seconds for SLH-DSA-128/192/256, and 120/240 seconds for

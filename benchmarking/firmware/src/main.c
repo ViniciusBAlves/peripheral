@@ -225,11 +225,11 @@ K_SEM_DEFINE(l2cap_connected_sem, 0, 1);
 
 /* --- WOLFSSL TIME HOOKS --- */
 time_t time_sec(time_t *timer) {
-    /* * Unix timestamp for mid-2026. 
+    /* * Unix timestamp for 2030-01-01.
      * This tricks wolfSSL into thinking it is the modern day
-     * so it doesn't reject the Mosquitto certificate's activation date.
+     * so it doesn't reject generated certificate activation dates.
      */
-    time_t base_time = 1781350000; 
+    time_t base_time = 1893456000;
     
     /* Add the board's uptime to the 2026 baseline */
     time_t t = base_time + (time_t)(k_uptime_get_32() / 1000);

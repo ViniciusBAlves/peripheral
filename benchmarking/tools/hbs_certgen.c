@@ -13,6 +13,8 @@
 
 #define DER_CAP 32768
 #define KEY_CAP 8192
+#define CERT_NOT_BEFORE "\x18\x0f""20200101000000Z"
+#define CERT_NOT_AFTER  "\x18\x0f""20360101000000Z"
 
 static const char* g_state_path = NULL;
 
@@ -128,6 +130,14 @@ static void set_leaf_name(Cert* cert)
     XSTRNCPY(cert->subject.commonName, "localhost", CTC_NAME_SIZE);
 }
 
+static void set_fixed_validity(Cert* cert)
+{
+    XMEMCPY(cert->beforeDate, CERT_NOT_BEFORE, sizeof(CERT_NOT_BEFORE) - 1);
+    cert->beforeDateSz = sizeof(CERT_NOT_BEFORE) - 1;
+    XMEMCPY(cert->afterDate, CERT_NOT_AFTER, sizeof(CERT_NOT_AFTER) - 1);
+    cert->afterDateSz = sizeof(CERT_NOT_AFTER) - 1;
+}
+
 static int make_root(void* key, int keyType, int sigType, WC_RNG* rng,
     const char* cn, unsigned char* rootDer)
 {
@@ -141,6 +151,7 @@ static int make_root(void* key, int keyType, int sigType, WC_RNG* rng,
     cert.isCA = 1;
     cert.selfSigned = 1;
     cert.daysValid = 3650;
+    set_fixed_validity(&cert);
     if (wc_SetKeyUsage(&cert, "keyCertSign,cRLSign") != 0)
         return -1;
     if (wc_MakeCert_ex(&cert, rootDer, DER_CAP, keyType, key, rng) <= 0)
@@ -183,6 +194,7 @@ static int make_leaf(void* caKey, int caKeyType, int caSigType, WC_RNG* rng,
     set_leaf_name(&leaf);
     leaf.sigType = caSigType;
     leaf.daysValid = 3650;
+    set_fixed_validity(&leaf);
     if (wc_SetIssuerBuffer(&leaf, rootDer, rootSz) != 0) {
         wc_ecc_free(&leafKey);
         return -1;

@@ -31,7 +31,11 @@ from benchmarklib.firmware import flash as flash_firmware
 from benchmarklib.gateway import PiGateway
 from benchmarklib.metrics import aggregate, number, parse_bench_line
 from benchmarklib.scheduler import SessionJob, build_jobs
-from benchmarklib.server_backends import SERVER_BACKEND_CHOICES
+from benchmarklib.server_backends import (
+    SERVER_BACKEND_CHOICES,
+    server_backend_for_case,
+    unsupported_backend_reason,
+)
 from generate_cases import FIELDS as INPUT_FIELDS
 
 
@@ -268,6 +272,7 @@ def run_job(
     case: dict[str, str],
     case_dir: Path,
     remote_case: str,
+    server_backend: str,
     gateway: PiGateway,
     serial_port,
     args: argparse.Namespace,
@@ -295,6 +300,8 @@ def run_job(
                 disable_wifi=args.disable_pi_wifi,
                 ready_timeout=args.gateway_ready_timeout_sec,
                 log=case_dir / "gateway-control.log",
+                server_backend=server_backend,
+                wolfssl_group=KEMS_BY_NAME[case["kex_group"]].wolfssl_group,
             )
             final = wait_for_result(serial_port, board_log, attempt_timeout)
         except Exception as error:
@@ -856,6 +863,7 @@ def main() -> int:
     generate_client_identity(client_dir, docker_log)
     supported: list[dict[str, str]] = []
     unsupported: dict[str, str] = {}
+    server_backends: dict[str, str] = {}
     signature_templates: dict[str, Path] = {}
     for case in cases:
         retry_large_rsa = (
@@ -865,6 +873,13 @@ def main() -> int:
         if case["expected_support"] == "known_unsupported" and not retry_large_rsa:
             unsupported[case["case_id"]] = case["notes"] or "known unsupported case"
             continue
+        server_backend = server_backend_for_case(case, args.server_backend)
+        if server_backend is None:
+            unsupported[case["case_id"]] = unsupported_backend_reason(
+                case, args.server_backend
+            )
+            continue
+        server_backends[case["case_id"]] = server_backend
         try:
             generated = case_dirs[case["case_id"]] / "generated"
             template = signature_templates.get(case["cert_sig_alg"])
@@ -976,7 +991,11 @@ def main() -> int:
     gateway.start_master(run_dir / "gateway.log")
     atexit.register(gateway.stop_master)
     print(f"[gateway] Preparing Raspberry Pi bridge; log={run_dir / 'gateway.log'}", flush=True)
-    gateway.prepare(ROOT / "gateway" / "ble_mqtt_bridge.c", run_dir / "gateway.log")
+    gateway.prepare(
+        ROOT / "gateway" / "ble_mqtt_bridge.c",
+        ROOT / "gateway" / "wolfssl_tls_server.c",
+        run_dir / "gateway.log",
+    )
     print("[gateway] Raspberry Pi bridge is ready.", flush=True)
     remote_cases = {
         case["case_id"]: gateway.deploy_case(
@@ -1072,7 +1091,9 @@ def main() -> int:
                 else:
                     row = run_job(
                         job, case, case_dirs[job.case_id],
-                        remote_cases[job.case_id], gateway, serial_port, args,
+                        remote_cases[job.case_id],
+                        server_backends[job.case_id],
+                        gateway, serial_port, args,
                         len(attempts[job.case_id]) + 1,
                     )
                 row["mlkem_backend"] = args.mlkem_backend

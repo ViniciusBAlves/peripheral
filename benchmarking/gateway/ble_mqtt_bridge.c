@@ -542,7 +542,7 @@ static int connect_tcp(const char *host, uint16_t port)
         return -1;
     }
 
-    printf("[+] TCP Bridge to Mosquitto Active. Pumping data.\n");
+    printf("[+] TCP Bridge to TLS server active. Pumping data.\n");
     return fd;
 }
 

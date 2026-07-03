@@ -14,7 +14,8 @@ from .server_backends import HASH_BASED_SIGNATURES
 
 IMAGE = "peripheral-pqc-openssl:3.5"
 ROOT = Path(__file__).resolve().parents[1]
-CERT_CACHE = ROOT / "work" / "certificate-cache" / "v2"
+CERT_CACHE = ROOT / "work" / "certificate-cache" / "v3"
+LEGACY_CERT_CACHES = (ROOT / "work" / "certificate-cache" / "v1",)
 MIN_CACHE_VALID_SECONDS = 7 * 24 * 60 * 60
 CERT_NOT_BEFORE = "20200101000000Z"
 CERT_NOT_AFTER = "20360101000000Z"
@@ -197,14 +198,36 @@ def generate_server_case(case: dict[str, str], output: Path, client_dir: Path, l
         ):
             return
         cache = CERT_CACHE / "server" / slug(signature.name)
+        legacy_caches = [
+            legacy / "server" / slug(signature.name)
+            for legacy in LEGACY_CERT_CACHES
+        ]
         if not (
             _all_present(cache, cached_required)
             and _cert_is_valid(cache / "server_root.crt")
             and _cert_is_valid(cache / "server.crt")
         ):
-            _append_log(log, f"[cert-cache] Generating {signature.name} server chain into {cache}")
-            shutil.rmtree(cache, ignore_errors=True)
-            generate_hash_based_server_case(signature.name, cache, client_dir, log)
+            legacy_cache = next(
+                (
+                    item for item in legacy_caches
+                    if _all_present(item, cached_required)
+                    and _cert_is_valid(item / "server_root.crt")
+                    and _cert_is_valid(item / "server.crt")
+                ),
+                None,
+            )
+            if legacy_cache is not None:
+                _append_log(
+                    log,
+                    f"[cert-cache] Migrating {signature.name} server chain "
+                    f"from {legacy_cache}",
+                )
+                shutil.rmtree(cache, ignore_errors=True)
+                _copy_files(legacy_cache, cache, cached_required)
+            else:
+                _append_log(log, f"[cert-cache] Generating {signature.name} server chain into {cache}")
+                shutil.rmtree(cache, ignore_errors=True)
+                generate_hash_based_server_case(signature.name, cache, client_dir, log)
         else:
             _append_log(log, f"[cert-cache] Reusing {signature.name} server chain from {cache}")
         _copy_files(cache, output, cached_required)
