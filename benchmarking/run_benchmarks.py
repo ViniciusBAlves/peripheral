@@ -31,6 +31,7 @@ from benchmarklib.firmware import flash as flash_firmware
 from benchmarklib.gateway import PiGateway
 from benchmarklib.metrics import aggregate, number, parse_bench_line
 from benchmarklib.scheduler import SessionJob, build_jobs
+from benchmarklib.server_backends import SERVER_BACKEND_CHOICES
 from generate_cases import FIELDS as INPUT_FIELDS
 
 
@@ -222,6 +223,10 @@ def timeout_for_case(case: dict[str, str], override: float | None) -> float:
         timeout = 120.0
     elif signature == "RSA-PSS-3072":
         timeout = 45.0
+    elif signature == "LMS-HSS-L2-H10-W4":
+        timeout = 180.0
+    elif signature == "XMSS-SHA2_20_256":
+        timeout = 210.0
     elif signature.startswith("ML-DSA"):
         timeout = 45.0
     else:
@@ -234,6 +239,28 @@ def timeout_for_case(case: dict[str, str], override: float | None) -> float:
     elif "MLKEM512" in group:
         timeout += 20.0
     return timeout
+
+
+def classify_gateway_start_failure(
+    gateway_log: Path,
+    final: dict[str, str],
+) -> dict[str, str]:
+    if final.get("stage") != "gateway_start":
+        return final
+    try:
+        text = gateway_log.read_text(errors="replace")
+    except OSError:
+        return final
+    if "Device named" in text and "was not found" in text:
+        final["stage"] = "ble_discovery"
+    elif "L2CAP Channel failed to open" in text:
+        if final.get("error") == "CalledProcessError":
+            final["stage"] = "ble_l2cap_ready_timeout"
+        else:
+            final["stage"] = "ble_l2cap_connect"
+    elif "TCP connect failed" in text:
+        final["stage"] = "gateway_tcp_connect"
+    return final
 
 
 def run_job(
@@ -265,6 +292,7 @@ def run_job(
                 psm=args.psm,
                 mtu=args.mtu,
                 adapter=args.pi_adapter,
+                disable_wifi=args.disable_pi_wifi,
                 ready_timeout=args.gateway_ready_timeout_sec,
                 log=case_dir / "gateway-control.log",
             )
@@ -283,6 +311,7 @@ def run_job(
                 case["case_id"], broker_log, gateway_log,
                 case_dir / "gateway-control.log",
             )
+            final = classify_gateway_start_failure(gateway_log, final)
             try:
                 wait_for_board_ready(
                     serial_port, board_log, args.board_rearm_timeout_sec
@@ -607,6 +636,13 @@ def resolve_serial_device(configured: str) -> str:
     return configured
 
 
+def normalize_ble_addr(address: str) -> str:
+    compact = re.sub(r"[^0-9a-fA-F]", "", address)
+    if compact and set(compact) == {"0"}:
+        return ""
+    return address
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     config_parser = argparse.ArgumentParser(add_help=False)
     config_parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
@@ -643,7 +679,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--gateway-ready-timeout-sec", type=float, default=20.0)
     parser.add_argument("--board-ready-timeout-sec", type=float, default=20.0)
-    parser.add_argument("--board-rearm-timeout-sec", type=float, default=15.0)
+    parser.add_argument("--board-rearm-timeout-sec", type=float, default=30.0)
     parser.add_argument("--serial-device", default=config["serial-device"])
     parser.add_argument("--serial-baud", type=int, default=115200)
     parser.add_argument("--pi-host", default=config["pi-host"])
@@ -659,6 +695,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--ble-addr-type", choices=("public", "random"), default="random")
     parser.add_argument("--psm", default="0x0080")
     parser.add_argument("--mtu", type=int, default=672)
+    parser.add_argument(
+        "--disable-pi-wifi",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="disable Raspberry Pi Wi-Fi while each BLE bridge session runs",
+    )
     parser.add_argument("--nrfutil", default=default_nrfutil())
     parser.add_argument("--ncs-version", default=DEFAULT_NCS_VERSION)
     parser.add_argument("--ncs-chdir", default=default_ncs_chdir())
@@ -668,6 +710,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         choices=("wolfssl", "pqm4-m4fstack"),
         default="pqm4-m4fstack",
         help="ML-KEM implementation used by the nRF52840 TLS client",
+    )
+    parser.add_argument(
+        "--server-backend",
+        choices=SERVER_BACKEND_CHOICES,
+        default="auto",
+        help="server TLS backend selection",
     )
     parser.add_argument(
         "--reflash-known-unsupported-rsa",
@@ -681,6 +729,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     args = parser.parse_args(argv)
     args.ssh_key = os.path.expandvars(os.path.expanduser(args.ssh_key))
     args.serial_device = resolve_serial_device(args.serial_device)
+    args.ble_addr = normalize_ble_addr(args.ble_addr)
     return args
 
 

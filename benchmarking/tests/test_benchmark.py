@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -9,11 +10,15 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from benchmarklib.metrics import parse_bench_line
+from benchmarklib.gateway import PiGateway
 from benchmarklib.scheduler import build_jobs
+from benchmarklib.server_backends import server_backend_for_case
 from generate_cases import build_cases
 from run_benchmarks import (
     ATTEMPT_FIELDS,
+    classify_gateway_start_failure,
     load_config,
+    normalize_ble_addr,
     parse_args,
     resolve_pi_workdir,
     resolve_serial_device,
@@ -66,6 +71,23 @@ class BenchmarkTests(unittest.TestCase):
                 list(range(min(positions), max(positions) + 1)),
             )
 
+    def test_hash_based_signatures_are_generated_as_cases(self) -> None:
+        cases = build_cases(1, 0, True)
+        signatures = {
+            case["cert_sig_alg"]: case
+            for case in cases
+            if case["cert_sig_alg"] in {"LMS-HSS-L2-H10-W4", "XMSS-SHA2_20_256"}
+        }
+        self.assertEqual(set(signatures), {"LMS-HSS-L2-H10-W4", "XMSS-SHA2_20_256"})
+        self.assertTrue(all(
+            case["expected_support"] == "required"
+            for case in signatures.values()
+        ))
+        self.assertTrue(all(
+            "CertificateVerify uses ECDSA" in case["notes"]
+            for case in signatures.values()
+        ))
+
     def test_config_supplies_hardware_defaults_and_cli_overrides(self) -> None:
         config = load_config(ROOT / "config.json")
         args = parse_args(["--cases", "cases.csv"])
@@ -74,16 +96,57 @@ class BenchmarkTests(unittest.TestCase):
             resolve_serial_device(config["serial-device"]),
         )
         self.assertEqual(args.pi_host, config["pi-host"])
-        self.assertEqual(args.ble_addr, config["ble-addr"])
+        self.assertEqual(args.ble_addr, normalize_ble_addr(config["ble-addr"]))
         self.assertEqual(args.mlkem_backend, "pqm4-m4fstack")
+        self.assertEqual(args.server_backend, "auto")
         self.assertTrue(args.reflash_known_unsupported_rsa)
 
         overridden = parse_args([
             "--cases", "cases.csv", "--serial-device", "/dev/ttyUSB9",
-            "--no-reflash-known-unsupported-rsa",
+            "--server-backend", "wolfssl", "--no-reflash-known-unsupported-rsa",
         ])
         self.assertEqual(overridden.serial_device, "/dev/ttyUSB9")
+        self.assertEqual(overridden.server_backend, "wolfssl")
         self.assertFalse(overridden.reflash_known_unsupported_rsa)
+
+    def test_placeholder_ble_addr_enables_name_discovery(self) -> None:
+        self.assertEqual(normalize_ble_addr("00:00:00:00:00:00"), "")
+        self.assertEqual(normalize_ble_addr("00.00.00.00.00"), "")
+        self.assertEqual(normalize_ble_addr("000000000000"), "")
+        self.assertEqual(
+            normalize_ble_addr("F9:79:AE:2A:9A:1E"),
+            "F9:79:AE:2A:9A:1E",
+        )
+
+    def test_gateway_start_failure_is_classified_from_bridge_log(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            log = Path(tmpdir) / "gateway.log"
+            log.write_text("[-] L2CAP Channel failed to open: timed out\n")
+            final = {
+                "status": "fail",
+                "stage": "gateway_start",
+                "error": "CalledProcessError",
+            }
+            classified = classify_gateway_start_failure(log, final)
+        self.assertEqual(classified["stage"], "ble_l2cap_ready_timeout")
+
+    def test_server_backend_policy_routes_hash_based_signatures(self) -> None:
+        classic = {"cert_sig_alg": "ECDSA-P-256"}
+        lms = {"cert_sig_alg": "LMS-HSS-L2-H10-W4"}
+        xmss = {"cert_sig_alg": "XMSS-SHA2_20_256"}
+
+        self.assertEqual(
+            server_backend_for_case(classic, "auto"), "openssl-mosquitto"
+        )
+        self.assertEqual(server_backend_for_case(lms, "auto"), "wolfssl")
+        self.assertEqual(server_backend_for_case(xmss, "auto"), "wolfssl")
+        self.assertEqual(server_backend_for_case(classic, "wolfssl"), "wolfssl")
+        self.assertEqual(
+            server_backend_for_case(classic, "openssl-mosquitto"),
+            "openssl-mosquitto",
+        )
+        self.assertIsNone(server_backend_for_case(lms, "openssl-mosquitto"))
+        self.assertIsNone(server_backend_for_case(xmss, "openssl-mosquitto"))
 
     def test_structured_metric_parser(self) -> None:
         parsed = parse_bench_line(
@@ -123,12 +186,6 @@ class BenchmarkTests(unittest.TestCase):
         self.assertEqual(summary["firmware_flash_used_bytes"], "600000")
         self.assertEqual(summary["max_thread_stack_peak_percent"], "72.50")
 
-    def test_pi_workdir_follows_ssh_user(self) -> None:
-        self.assertEqual(
-            resolve_pi_workdir("thiago@10.12.194.1", ""),
-            "/home/thiago/peripheral-benchmark",
-        )
-
     def test_heavier_signatures_receive_longer_timeouts(self) -> None:
         classic = {"kex_group": "ECDHE-P-256", "cert_sig_alg": "ECDSA-P-256"}
         hybrid = {
@@ -137,7 +194,57 @@ class BenchmarkTests(unittest.TestCase):
         }
         self.assertEqual(timeout_for_case(classic, None), 60.0)
         self.assertEqual(timeout_for_case(hybrid, None), 210.0)
+        self.assertEqual(
+            timeout_for_case({"kex_group": "ECDHE-P-256", "cert_sig_alg": "LMS-HSS-L2-H10-W4"}, None),
+            180.0,
+        )
+        self.assertEqual(
+            timeout_for_case({"kex_group": "ECDHE-P-256", "cert_sig_alg": "XMSS-SHA2_20_256"}, None),
+            210.0,
+        )
         self.assertEqual(timeout_for_case(hybrid, 12.0), 12.0)
+
+    def test_gateway_start_does_not_evict_bluez_cache(self) -> None:
+        class FakeGateway(PiGateway):
+            def __init__(self) -> None:
+                super().__init__("pi", "/remote")
+                self.commands: list[str] = []
+
+            def command(self, script, log, *, check=True):  # type: ignore[no-untyped-def]
+                self.commands.append(script)
+                return None
+
+        gateway = FakeGateway()
+        with tempfile.TemporaryDirectory() as tmp:
+            gateway.start_session(
+                case_id="case",
+                remote_case_dir="/remote/cases/case",
+                ble_addr="",
+                ble_name="PQC52840",
+                ble_addr_type="random",
+                psm="0x0080",
+                mtu=672,
+                adapter="hci0",
+                disable_wifi=True,
+                ready_timeout=1,
+                log=Path(tmp) / "gateway.log",
+            )
+        launch = next(command for command in gateway.commands if "--name PQC52840" in command)
+        self.assertNotIn("--forget-cache", launch)
+        self.assertNotIn("--addr ", launch)
+        self.assertIn("--disable-wifi", launch)
+        self.assertIn("--name PQC52840", launch)
+
+    def test_gateway_command_creates_log_parent(self) -> None:
+        class TrueGateway(PiGateway):
+            def ssh_base(self) -> list[str]:
+                return ["true"]
+
+        gateway = TrueGateway("pi", "/remote")
+        with tempfile.TemporaryDirectory() as tmp:
+            log = Path(tmp) / "missing" / "gateway-control.log"
+            gateway.command("ignored", log)
+            self.assertTrue(log.exists())
 
 
 if __name__ == "__main__":

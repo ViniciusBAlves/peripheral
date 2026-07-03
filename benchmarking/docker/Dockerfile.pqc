@@ -12,6 +12,7 @@ RUN apt-get update \
         libssl-dev \
         ninja-build \
         openssl \
+        pkg-config \
     && git clone --depth 1 --branch "${LIBOQS_VERSION}" \
         https://github.com/open-quantum-safe/liboqs.git /tmp/liboqs \
     && cmake -S /tmp/liboqs -B /tmp/liboqs/build -GNinja \
@@ -57,5 +58,34 @@ ENV OPENSSL_MODULES=/usr/local/lib/ossl-modules
 RUN openssl list -providers | grep -q oqsprovider \
     && openssl list -kem-algorithms | grep -Eq 'MLKEM512|ML-KEM-512' \
     && openssl list -signature-algorithms | grep -q 'SLH-DSA-SHAKE-256s'
+
+ARG WOLFSSL_REV=dd6da70d395a0cb26446326f329678fe3bfb212c
+RUN git clone https://github.com/wolfSSL/wolfssl.git /tmp/wolfssl \
+    && cd /tmp/wolfssl \
+    && git checkout "${WOLFSSL_REV}" \
+    && perl -0pi -e 's/# SLH-DSA/if (WOLFSSL_XMSS)\n    list(APPEND WOLFSSL_DEFINITIONS "-DWOLFSSL_HAVE_XMSS")\n    set_wolfssl_definitions("WOLFSSL_HAVE_XMSS" RESULT)\nendif()\n\n# SLH-DSA/' CMakeLists.txt \
+    && cmake -S . -B build -GNinja \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_INSTALL_PREFIX=/usr/local \
+        -DWOLFSSL_TLS13=yes \
+        -DWOLFSSL_ECC=yes \
+        -DWOLFSSL_TLS_NO_MLKEM_STANDALONE=no \
+        -DWOLFSSL_LMS=yes \
+        -DWOLFSSL_XMSS=yes \
+        -DWOLFSSL_CERTGEN=yes \
+        -DWOLFSSL_CERTREQ=yes \
+        -DWOLFSSL_CERTEXT=yes \
+        -DWOLFSSL_KEYGEN=yes \
+        -DWOLFSSL_OPENSSLEXTRA=yes \
+    && cmake --build build \
+    && cmake --install build \
+    && ldconfig \
+    && rm -rf /tmp/wolfssl
+
+COPY tools/hbs_certgen.c /tmp/hbs_certgen.c
+RUN cc -O2 -Wall -Wextra -DWOLFSSL_HAVE_XMSS \
+        -o /usr/local/bin/hbs_certgen /tmp/hbs_certgen.c \
+        $(pkg-config --cflags --libs wolfssl) \
+    && rm -f /tmp/hbs_certgen.c
 
 CMD ["sleep", "infinity"]

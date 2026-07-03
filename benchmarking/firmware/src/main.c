@@ -23,6 +23,10 @@
 #define BENCHMARK_VERBOSE_LOGS 0
 #endif
 
+#ifndef BENCH_REBOOT_AFTER_SESSION
+#define BENCH_REBOOT_AFTER_SESSION 1
+#endif
+
 #if BENCHMARK_VERBOSE_LOGS
 #define BENCH_LOG(...) printk(__VA_ARGS__)
 #else
@@ -933,6 +937,19 @@ int main(void) {
         start_secure_mqtt_session(&l2cap_chan.chan);
         
         BENCH_LOG("Session ended. Re-arming for next connection...\n");
+
+#if BENCH_REBOOT_AFTER_SESSION
+        /*
+         * The nRF52840/BlueZ path is much more reliable when each benchmark
+         * starts from the board's boot-time advertising state.  Reboot only
+         * after the result line has been printed and TLS cleanup has run, so
+         * measurements are preserved while the next discovery avoids a stale
+         * controller/channel state.
+         */
+        BENCH_OUT("[BENCH_RECOVERY] reason=session_complete action=reboot\n");
+        k_msleep(100);
+        sys_reboot(SYS_REBOOT_COLD);
+#endif
         
         /* 1. Only request disconnect if the peer hasn't already dropped us */
         if (l2cap_chan.chan.conn && !l2cap_peer_disconnected) {

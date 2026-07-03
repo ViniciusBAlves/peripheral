@@ -46,6 +46,7 @@ class PiGateway:
 
     def command(self, script: str, log: Path, *, check: bool = True) -> subprocess.CompletedProcess[str]:
         command = [*self.ssh_base(), self.host, f"bash -lc {shlex.quote(script)}"]
+        log.parent.mkdir(parents=True, exist_ok=True)
         with log.open("a") as stream:
             stream.write(f"$ remote: {script}\n")
             proc = subprocess.run(command, text=True, stdout=stream, stderr=subprocess.STDOUT)
@@ -103,10 +104,25 @@ class PiGateway:
         reset_command = ""
         if reset_adapter:
             reset_command = (
+                "sudo -n /usr/sbin/rfkill block wifi >/dev/null 2>&1 || true; "
+                "sudo -n /usr/bin/nmcli radio wifi off >/dev/null 2>&1 || true; "
+                "sudo -n /usr/sbin/ip link set wlan0 down >/dev/null 2>&1 || true; "
+                "sleep 1; "
                 "sudo -n timeout -k 1 4 /usr/bin/btmgmt power off "
-                ">/dev/null 2>&1 || true; sleep 0.5; "
+                ">/dev/null 2>&1 || true; sleep 1; "
                 "sudo -n timeout -k 1 4 /usr/bin/btmgmt power on "
-                ">/dev/null 2>&1 || true; sleep 0.5; "
+                ">/dev/null 2>&1 || true; sleep 1; "
+                "sudo -n timeout -k 1 4 /usr/bin/btmgmt bredr off "
+                ">/dev/null 2>&1 || true; "
+                "sudo -n timeout -k 1 4 /usr/bin/btmgmt bondable off "
+                ">/dev/null 2>&1 || true; "
+                "sudo -n timeout -k 1 4 /usr/bin/btmgmt sc off "
+                ">/dev/null 2>&1 || true; "
+                "sudo -n timeout -k 1 4 /usr/bin/btmgmt privacy off "
+                ">/dev/null 2>&1 || true; "
+                "sudo -n /usr/sbin/rfkill unblock wifi >/dev/null 2>&1 || true; "
+                "sudo -n /usr/bin/nmcli radio wifi on >/dev/null 2>&1 || true; "
+                "sudo -n /usr/sbin/ip link set wlan0 up >/dev/null 2>&1 || true; "
             )
         self.command(
             f"if [ -f {self.workdir}/bridge.pid ]; then "
@@ -144,10 +160,11 @@ class PiGateway:
         psm: str,
         mtu: int,
         adapter: str,
+        disable_wifi: bool,
         ready_timeout: float,
         log: Path,
     ) -> None:
-        self.stop_session(log)
+        self.stop_session(log, reset_adapter=disable_wifi)
         broker_log = f"{self.workdir}/logs/{case_id}.broker.log"
         gateway_log = f"{self.workdir}/logs/{case_id}.gateway.log"
         address = f"--addr {shlex.quote(ble_addr)}" if ble_addr else ""
@@ -156,7 +173,8 @@ class PiGateway:
             f"--adapter {shlex.quote(adapter)} --name {shlex.quote(ble_name)} "
             f"{address} --addr-type {shlex.quote(ble_addr_type)} "
             f"--psm {shlex.quote(psm)} --tcp-host 127.0.0.1 --tcp-port 8883 "
-            f"--mtu {mtu} --scan-timeout 3 --forget-cache --no-acl-prime "
+            f"--mtu {mtu} --scan-timeout 5 --no-acl-prime "
+            f"{'--disable-wifi ' if disable_wifi else ''}"
             f"> {gateway_log} 2>&1 < /dev/null & "
             f"echo $! > {self.workdir}/bridge.pid"
         )

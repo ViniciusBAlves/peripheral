@@ -117,6 +117,10 @@ target_sources(app PRIVATE src/main.c src/benchmark_metrics.c
     ${WOLFSSL_ROOT_DIR}/wolfcrypt/src/wc_mlkem_poly.c
     ${WOLFSSL_ROOT_DIR}/wolfcrypt/src/wc_mldsa.c
     ${WOLFSSL_ROOT_DIR}/wolfcrypt/src/wc_slhdsa.c
+    ${WOLFSSL_ROOT_DIR}/wolfcrypt/src/wc_lms.c
+    ${WOLFSSL_ROOT_DIR}/wolfcrypt/src/wc_lms_impl.c
+    ${WOLFSSL_ROOT_DIR}/wolfcrypt/src/wc_xmss.c
+    ${WOLFSSL_ROOT_DIR}/wolfcrypt/src/wc_xmss_impl.c
     
     # --- Core Cryptography & Hashes ---
     ${WOLFSSL_ROOT_DIR}/wolfcrypt/src/random.c
