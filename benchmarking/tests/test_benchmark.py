@@ -23,10 +23,12 @@ from run_benchmarks import (
     parse_args,
     resolve_pi_workdir,
     resolve_serial_device,
+    read_checkpoint,
     run_job,
     summarize,
     timeout_for_case,
     wait_for_result,
+    write_checkpoint,
 )
 
 
@@ -111,6 +113,32 @@ class BenchmarkTests(unittest.TestCase):
         self.assertEqual(overridden.serial_device, "/dev/ttyUSB9")
         self.assertEqual(overridden.server_backend, "wolfssl")
         self.assertFalse(overridden.reflash_known_unsupported_rsa)
+
+    def test_resume_cli_does_not_require_cases(self) -> None:
+        args = parse_args(["--resume", "run-123"])
+        self.assertEqual(args.resume, "run-123")
+        self.assertIsNone(args.cases)
+
+    def test_checkpoint_advances_only_to_committed_execution(self) -> None:
+        job = build_jobs(
+            build_cases(1, 0, True)[:1],
+            seed=123,
+            sessions_per_case=1,
+        )[0]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            run_dir = Path(tmpdir)
+            write_checkpoint(
+                run_dir,
+                execution_order=3,
+                total_jobs=7,
+                job=job,
+            )
+            checkpoint = read_checkpoint(run_dir)
+
+        self.assertEqual(checkpoint["last_completed_execution_order"], 3)
+        self.assertEqual(checkpoint["next_execution_order"], 4)
+        self.assertEqual(checkpoint["case_id"], job.case_id)
+        self.assertEqual(checkpoint["status"], "running")
 
     def test_placeholder_ble_addr_enables_name_discovery(self) -> None:
         self.assertEqual(normalize_ble_addr("00:00:00:00:00:00"), "")

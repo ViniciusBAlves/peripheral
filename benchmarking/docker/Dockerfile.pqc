@@ -66,12 +66,19 @@ RUN git init /tmp/wolfssl \
     && git fetch --depth 1 origin "${WOLFSSL_REV}" \
     && git checkout --detach FETCH_HEAD \
     && perl -0pi -e 's/# SLH-DSA/if (WOLFSSL_XMSS)\n    list(APPEND WOLFSSL_DEFINITIONS "-DWOLFSSL_HAVE_XMSS")\n    set_wolfssl_definitions("WOLFSSL_HAVE_XMSS" RESULT)\nendif()\n\n# SLH-DSA/' CMakeLists.txt \
+    && perl -0pi -e 's{#define ENCRYPT_BASE_BITS  8192}{#define ENCRYPT_BASE_BITS  (FP_MAX_BITS / 2)}' wolfssl/internal.h \
     && cmake -S . -B build -GNinja \
         -DCMAKE_BUILD_TYPE=Release \
         -DCMAKE_INSTALL_PREFIX=/usr/local \
-        -DCMAKE_C_FLAGS="-Wno-error=maybe-uninitialized" \
+        -DCMAKE_C_FLAGS="-Wno-error=maybe-uninitialized -DFP_MAX_BITS=32768 -DRSA_MAX_SIZE=16384 -DWC_MAX_RSA_BITS=16384" \
         -DWOLFSSL_TLS13=yes \
         -DWOLFSSL_ECC=yes \
+        -DWOLFSSL_CURVE25519=yes \
+        -DWOLFSSL_PQC_HYBRIDS=yes \
+        -DWOLFSSL_FAST_MATH=yes \
+        -DWOLFSSL_SP_MATH_ALL=no \
+        -DWOLFSSL_EXAMPLES=no \
+        -DWOLFSSL_CRYPT_TESTS=no \
         -DWOLFSSL_TLS_NO_MLKEM_STANDALONE=no \
         -DWOLFSSL_MLDSA=yes \
         -DWOLFSSL_SLHDSA=yes \

@@ -5,7 +5,7 @@ prefix="${1:?usage: setup_pi_wolfssl.sh INSTALL_PREFIX}"
 mkdir -p "${prefix}"
 prefix="$(cd "${prefix}" && pwd)"
 revision="dd6da70d395a0cb26446326f329678fe3bfb212c"
-profile="tls13-mlkem-hybrids-curve25519-mldsa-slhdsa-lms-xmss-v2"
+profile="tls13-all-kem-signatures-rsa16384-fast-math-v7"
 source_dir="${prefix%/}/src"
 build_dir="${source_dir}/build"
 profile_file="${prefix}/.benchmark-profile"
@@ -48,16 +48,23 @@ fi
 perl -0pi -e \
     's/# SLH-DSA/if (WOLFSSL_XMSS)\n    list(APPEND WOLFSSL_DEFINITIONS "-DWOLFSSL_HAVE_XMSS")\n    set_wolfssl_definitions("WOLFSSL_HAVE_XMSS" RESULT)\nendif()\n\n# SLH-DSA/' \
     "${source_dir}/CMakeLists.txt"
+perl -0pi -e \
+    's{#define ENCRYPT_BASE_BITS  8192}{#define ENCRYPT_BASE_BITS  (FP_MAX_BITS / 2)}' \
+    "${source_dir}/wolfssl/internal.h"
 touch "${source_dir}/CMakeLists.txt"
 
 cmake -S "${source_dir}" -B "${build_dir}" -GNinja \
     -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_INSTALL_PREFIX="${prefix}" \
-    -DCMAKE_C_FLAGS=-Wno-error=maybe-uninitialized \
+    -DCMAKE_C_FLAGS="-Wno-error=maybe-uninitialized -DFP_MAX_BITS=32768 -DRSA_MAX_SIZE=16384 -DWC_MAX_RSA_BITS=16384" \
     -DWOLFSSL_TLS13=yes \
     -DWOLFSSL_ECC=yes \
     -DWOLFSSL_CURVE25519=yes \
     -DWOLFSSL_PQC_HYBRIDS=yes \
+    -DWOLFSSL_FAST_MATH=yes \
+    -DWOLFSSL_SP_MATH_ALL=no \
+    -DWOLFSSL_EXAMPLES=no \
+    -DWOLFSSL_CRYPT_TESTS=no \
     -DWOLFSSL_TLS_NO_MLKEM_STANDALONE=no \
     -DWOLFSSL_MLDSA=yes \
     -DWOLFSSL_SLHDSA=yes \

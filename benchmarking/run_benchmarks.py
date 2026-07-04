@@ -161,6 +161,92 @@ def read_cases(path: Path) -> list[dict[str, str]]:
     return rows
 
 
+def resolve_resume_dir(value: str) -> Path:
+    path = Path(value).expanduser()
+    if path.is_dir():
+        return path.resolve()
+    candidate = RESULTS / value
+    if candidate.is_dir():
+        return candidate.resolve()
+    raise FileNotFoundError(f"benchmark run to resume was not found: {value}")
+
+
+def load_manifest_cases(run_dir: Path) -> list[dict[str, str]]:
+    with (run_dir / "run_manifest.csv").open(newline="") as stream:
+        rows = sorted(
+            csv.DictReader(stream),
+            key=lambda row: int(row["sequence"]),
+        )
+    return [{field: row[field] for field in INPUT_FIELDS} for row in rows]
+
+
+def load_session_jobs(run_dir: Path) -> list[SessionJob]:
+    with (run_dir / "session_manifest.csv").open(newline="") as stream:
+        rows = sorted(
+            csv.DictReader(stream),
+            key=lambda row: int(row["execution_order"]),
+        )
+    return [
+        SessionJob(
+            sequence=int(row["source_sequence"]),
+            case_id=row["case_id"],
+            session=int(row["session"]),
+            attempt_in_session=int(row["attempt_in_session"]),
+            warmup=int(row["warmup"]),
+            measured_index=int(row["measured_index"]),
+        )
+        for row in rows
+    ]
+
+
+def load_attempts(
+    case_dirs: dict[str, Path],
+) -> dict[str, list[dict[str, object]]]:
+    attempts: dict[str, list[dict[str, object]]] = defaultdict(list)
+    for case_id, directory in case_dirs.items():
+        path = directory / "attempts.csv"
+        if not path.exists():
+            continue
+        with path.open(newline="") as stream:
+            attempts[case_id].extend(dict(row) for row in csv.DictReader(stream))
+    return attempts
+
+
+def read_checkpoint(run_dir: Path) -> dict[str, object]:
+    path = run_dir / "checkpoint.json"
+    if not path.exists():
+        raise FileNotFoundError(
+            f"{run_dir} has no checkpoint.json; only checkpoint-enabled runs "
+            "can be resumed safely"
+        )
+    return json.loads(path.read_text())
+
+
+def write_checkpoint(
+    run_dir: Path,
+    *,
+    execution_order: int,
+    total_jobs: int,
+    job: SessionJob,
+) -> None:
+    path = run_dir / "checkpoint.json"
+    temporary = path.with_suffix(".json.tmp")
+    payload = {
+        "version": 1,
+        "status": "complete" if execution_order >= total_jobs else "running",
+        "last_completed_execution_order": execution_order,
+        "next_execution_order": (
+            execution_order + 1 if execution_order < total_jobs else None
+        ),
+        "case_id": job.case_id,
+        "session": job.session,
+        "attempt_in_session": job.attempt_in_session,
+        "updated_at": datetime.now().astimezone().isoformat(),
+    }
+    temporary.write_text(json.dumps(payload, indent=2) + "\n")
+    temporary.replace(path)
+
+
 def case_metadata(case: dict[str, str]) -> dict[str, str]:
     return {
         key: case[key] for key in (
@@ -840,6 +926,7 @@ def default_nrfutil() -> str:
     if discovered:
         return discovered
     for candidate in (
+        str(Path.home() / ".local/bin/nrfutil"),
         "/opt/nordic/ncs/toolchains/0c0f19d91c/nrfutil/bin/nrfutil",
         "/opt/nordic/ncs/toolchains/0c0f19d91c/nrfutil/home/bin/nrfutil",
     ):
@@ -884,7 +971,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=config_args.config,
         help="JSON file containing serial-device, pi-host, ssh-key and ble-addr",
     )
-    parser.add_argument("--cases", type=Path, required=True)
+    parser.add_argument("--cases", type=Path)
+    parser.add_argument(
+        "--resume",
+        metavar="RUN_ID",
+        help=(
+            "resume an existing result directory from its last atomically "
+            "committed session"
+        ),
+    )
     parser.add_argument("--seed", type=int)
     parser.add_argument("--run-id")
     parser.add_argument(
@@ -955,6 +1050,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         ),
     )
     args = parser.parse_args(argv)
+    if bool(args.cases) == bool(args.resume):
+        parser.error("provide exactly one of --cases or --resume")
     args.ssh_key = os.path.expandvars(os.path.expanduser(args.ssh_key))
     args.serial_device = resolve_serial_device(args.serial_device)
     args.ble_addr = normalize_ble_addr(args.ble_addr)
@@ -979,16 +1076,104 @@ def main() -> int:
         raise ValueError("sessions and reconnect retries must be non-negative")
     if args.limit is not None and args.limit < 1:
         raise ValueError("--limit must be at least 1")
-    cases = read_cases(args.cases)
-    if args.only_case:
-        selected = set(args.only_case)
-        cases = [case for case in cases if case["case_id"] in selected]
-    seed = args.seed if args.seed is not None else random.SystemRandom().randint(1, 2**31 - 1)
-    random.Random(seed).shuffle(cases)
-    if args.limit is not None:
-        cases = cases[:args.limit]
-    if not cases:
-        raise ValueError("no cases selected")
+    resuming = args.resume is not None
+    if resuming:
+        if args.limit is not None or args.only_case or args.run_id:
+            raise ValueError(
+                "--resume cannot be combined with --limit, --only-case, or --run-id"
+            )
+        run_dir = resolve_resume_dir(args.resume)
+        run_id = run_dir.name
+        cases = load_manifest_cases(run_dir)
+        seed = int((run_dir / "seed.txt").read_text().strip())
+        jobs = load_session_jobs(run_dir)
+        saved_config_path = run_dir / "run_config.json"
+        if saved_config_path.exists():
+            saved_config = json.loads(saved_config_path.read_text())
+            args.mlkem_backend = saved_config["mlkem_backend"]
+            args.server_backend = saved_config["server_backend"]
+            args.reflash_known_unsupported_rsa = saved_config[
+                "reflash_known_unsupported_rsa"
+            ]
+        checkpoint = read_checkpoint(run_dir)
+        last_completed_execution_order = int(
+            checkpoint.get("last_completed_execution_order", 0)
+        )
+        print(
+            f"[resume] run={run_id} completed={last_completed_execution_order}/"
+            f"{len(jobs)} next={last_completed_execution_order + 1}",
+            flush=True,
+        )
+    else:
+        cases = read_cases(args.cases)
+        if args.only_case:
+            selected = set(args.only_case)
+            cases = [case for case in cases if case["case_id"] in selected]
+        seed = (
+            args.seed if args.seed is not None
+            else random.SystemRandom().randint(1, 2**31 - 1)
+        )
+        random.Random(seed).shuffle(cases)
+        if args.limit is not None:
+            cases = cases[:args.limit]
+        if not cases:
+            raise ValueError("no cases selected")
+        run_id = args.run_id or f"{datetime.now():%Y%m%d_%H%M%S}_{seed}"
+        run_dir = RESULTS / run_id
+        if run_dir.exists():
+            raise FileExistsError(f"refusing to overwrite {run_dir}")
+        run_dir.mkdir(parents=True)
+        (run_dir / "seed.txt").write_text(f"{seed}\n")
+        (run_dir / "mlkem_backend.txt").write_text(f"{args.mlkem_backend}\n")
+        (run_dir / "run_config.json").write_text(json.dumps({
+            "sessions_per_case": args.sessions_per_case,
+            "mlkem_backend": args.mlkem_backend,
+            "server_backend": args.server_backend,
+            "reflash_known_unsupported_rsa": args.reflash_known_unsupported_rsa,
+        }, indent=2) + "\n")
+        shutil.copy2(args.cases, run_dir / "input_cases.csv")
+        manifest = [
+            {"sequence": index, **case, "seed": seed, "run_id": run_id}
+            for index, case in enumerate(cases, 1)
+        ]
+        write_csv(
+            run_dir / "run_manifest.csv",
+            ["sequence", *INPUT_FIELDS, "seed", "run_id"],
+            manifest,
+        )
+        jobs = build_jobs(
+            cases, seed=seed, sessions_per_case=args.sessions_per_case
+        )
+        session_rows = [
+            {
+                "execution_order": order,
+                "source_sequence": job.sequence,
+                "case_id": job.case_id,
+                "session": job.session,
+                "attempt_in_session": job.attempt_in_session,
+                "warmup": job.warmup,
+                "measured_index": job.measured_index,
+                "seed": seed,
+            }
+            for order, job in enumerate(jobs, 1)
+        ]
+        write_csv(
+            run_dir / "session_manifest.csv",
+            ["execution_order", "source_sequence", "case_id", "session",
+             "attempt_in_session", "warmup", "measured_index", "seed"],
+            session_rows,
+        )
+        (run_dir / "checkpoint.json").write_text(json.dumps({
+            "version": 1,
+            "status": "new",
+            "last_completed_execution_order": 0,
+            "next_execution_order": 1,
+            "case_id": None,
+            "session": None,
+            "attempt_in_session": None,
+            "updated_at": datetime.now().astimezone().isoformat(),
+        }, indent=2) + "\n")
+        last_completed_execution_order = 0
     has_large_rsa = any(needs_large_rsa_firmware(case) for case in cases)
     if (
         args.reflash_known_unsupported_rsa
@@ -1006,43 +1191,6 @@ def main() -> int:
         flush=True,
     )
 
-    run_id = args.run_id or f"{datetime.now():%Y%m%d_%H%M%S}_{seed}"
-    run_dir = RESULTS / run_id
-    if run_dir.exists():
-        raise FileExistsError(f"refusing to overwrite {run_dir}")
-    run_dir.mkdir(parents=True)
-    (run_dir / "seed.txt").write_text(f"{seed}\n")
-    (run_dir / "mlkem_backend.txt").write_text(f"{args.mlkem_backend}\n")
-    shutil.copy2(args.cases, run_dir / "input_cases.csv")
-    manifest = [
-        {"sequence": index, **case, "seed": seed, "run_id": run_id}
-        for index, case in enumerate(cases, 1)
-    ]
-    write_csv(
-        run_dir / "run_manifest.csv",
-        ["sequence", *INPUT_FIELDS, "seed", "run_id"],
-        manifest,
-    )
-    jobs = build_jobs(cases, seed=seed, sessions_per_case=args.sessions_per_case)
-    session_rows = [
-        {
-            "execution_order": order,
-            "source_sequence": job.sequence,
-            "case_id": job.case_id,
-            "session": job.session,
-            "attempt_in_session": job.attempt_in_session,
-            "warmup": job.warmup,
-            "measured_index": job.measured_index,
-            "seed": seed,
-        }
-        for order, job in enumerate(jobs, 1)
-    ]
-    write_csv(
-        run_dir / "session_manifest.csv",
-        ["execution_order", "source_sequence", "case_id", "session",
-         "attempt_in_session", "warmup", "measured_index", "seed"],
-        session_rows,
-    )
     case_sequence = {case["case_id"]: index for index, case in enumerate(cases, 1)}
     case_by_id = {case["case_id"]: case for case in cases}
     case_dirs = {
@@ -1050,7 +1198,13 @@ def main() -> int:
         for case_id in case_by_id
     }
     for directory in case_dirs.values():
-        (directory / "generated").mkdir(parents=True)
+        (directory / "generated").mkdir(parents=True, exist_ok=True)
+    attempts = load_attempts(case_dirs) if resuming else defaultdict(list)
+    scheduled_jobs = [
+        (execution_order, job)
+        for execution_order, job in enumerate(jobs, 1)
+        if execution_order > last_completed_execution_order
+    ]
 
     if args.dry_run:
         summaries = [
@@ -1073,6 +1227,10 @@ def main() -> int:
         print(f"[dry-run] cases={len(cases)} blocks={len(jobs)} seed={seed}")
         print(f"[dry-run] schedule={run_dir / 'session_manifest.csv'}")
         print("[dry-run] Remove --dry-run to build, flash, connect to the Pi, and execute.")
+        print(f"results={run_dir}")
+        return 0
+    if not scheduled_jobs:
+        print(f"[resume] Run {run_id} is already complete.", flush=True)
         print(f"results={run_dir}")
         return 0
 
@@ -1156,7 +1314,12 @@ def main() -> int:
         pqm4_dir = WORK / "pqm4"
         print(f"[firmware] Preparing pinned pqm4 sources in {pqm4_dir}...", flush=True)
         ensure_pqm4(pqm4_dir, run_dir / "build.log")
-    if normal_cases and not args.skip_build:
+    normal_build_ready = (build_dir / "zephyr/zephyr.hex").exists()
+    if (
+        normal_cases
+        and not args.skip_build
+        and not (resuming and normal_build_ready)
+    ):
         print(f"[firmware] Building universal image; log={run_dir / 'build.log'}", flush=True)
         build_firmware(
             firmware_dir=ROOT / "firmware", build_dir=build_dir,
@@ -1168,7 +1331,15 @@ def main() -> int:
         )
         print("[firmware] Build completed.", flush=True)
     large_rsa_build_dir = WORK / "firmware-build" / f"{run_id}-large-rsa"
-    if args.reflash_known_unsupported_rsa and large_rsa_cases and not args.skip_build:
+    large_rsa_build_ready = (
+        large_rsa_build_dir / "zephyr/zephyr.hex"
+    ).exists()
+    if (
+        args.reflash_known_unsupported_rsa
+        and large_rsa_cases
+        and not args.skip_build
+        and not (resuming and large_rsa_build_ready)
+    ):
         print(
             f"[firmware] Building RSA-16384 image; log={run_dir / 'build-large-rsa.log'}",
             flush=True,
@@ -1185,8 +1356,8 @@ def main() -> int:
         print("[firmware] RSA-16384 build completed.", flush=True)
     initial_large_rsa = (
         args.reflash_known_unsupported_rsa
-        and needs_large_rsa_firmware(case_by_id[jobs[0].case_id])
-        and jobs[0].case_id not in unsupported
+        and needs_large_rsa_firmware(case_by_id[scheduled_jobs[0][1].case_id])
+        and scheduled_jobs[0][1].case_id not in unsupported
     )
     initial_build_dir = large_rsa_build_dir if initial_large_rsa else build_dir
     if not args.skip_flash:
@@ -1244,7 +1415,6 @@ def main() -> int:
             "and install 'pyserial>=3.5'."
         )
 
-    attempts: dict[str, list[dict[str, object]]] = defaultdict(list)
     interrupted = False
     serial_port = None
     active_large_rsa = initial_large_rsa
@@ -1261,7 +1431,7 @@ def main() -> int:
                 serial_port, run_dir / "board.log", args.board_ready_timeout_sec
             )
             print("[board] Firmware is ready.", flush=True)
-            for execution_order, job in enumerate(jobs, 1):
+            for execution_order, job in scheduled_jobs:
                 case = case_by_id[job.case_id]
                 desired_large_rsa = (
                     args.reflash_known_unsupported_rsa
@@ -1331,6 +1501,12 @@ def main() -> int:
                 write_csv(
                     case_dirs[job.case_id] / "attempts.csv",
                     ATTEMPT_FIELDS, attempts[job.case_id],
+                )
+                write_checkpoint(
+                    run_dir,
+                    execution_order=execution_order,
+                    total_jobs=len(jobs),
+                    job=job,
                 )
         finally:
             if serial_port is not None and serial_port.is_open:

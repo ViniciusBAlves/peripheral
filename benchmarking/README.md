@@ -181,6 +181,24 @@ firmware image, then executes the saved schedule. Use `--skip-build
 --skip-flash` only when the already flashed image was built from the same
 universal credential bundle.
 
+### Save and resume
+
+Every completed schedule block is committed to its case `attempts.csv` and
+then to an atomic `checkpoint.json`. If the process is interrupted during a
+block, that block is absent from the checkpoint and is executed again.
+
+Resume using the run ID printed after `results=`:
+
+```bash
+python benchmarking/run_benchmarks.py \
+  --resume 20260704_004453_123
+```
+
+The saved seed, shuffled `session_manifest.csv`, client ML-KEM backend, server
+backend, and RSA fallback policy are reused. Existing attempts are loaded and
+new rows are appended without overwriting completed work. `--resume` cannot be
+combined with `--cases`, `--run-id`, `--limit`, or `--only-case`.
+
 Generated certificate identities are cached across runs in
 `benchmarking/work/certificate-cache`. Cached certificates are reused while
 they remain valid for at least seven more days; per-case OpenSSL and Mosquitto
@@ -341,6 +359,15 @@ attempts. The raw values remain available in each case's `attempts.csv`.
 Each run writes immutable artifacts below `results/<timestamp>_<seed>/`,
 including the input CSV, run and session manifests, per-case attempts and logs,
 and the aggregate `summary.csv`.
+
+To require every recorded execution, including warmups, to have succeeded:
+
+```bash
+python benchmarking/check_results.py <run_id>
+```
+
+The checker prints `PASS` or `FAIL` for every case and exits with status `1`
+when at least one case is missing attempts or contains a non-success status.
 
 ## Tests
 
