@@ -68,23 +68,22 @@ rejects unknown fields, which helps catch misspelled configuration names.
 
 ## Raspberry Pi
 
-Configure SSH key authentication first. Then install the gateway dependencies:
+Configure SSH key authentication first. Install the system build and Bluetooth
+dependencies on the Pi:
 
 ```bash
-ssh thiago@10.12.194.1 'bash -s' < benchmarking/gateway/setup_pi_gateway.sh
-PI_HOST=thiago@10.12.194.1 \
-SSH_KEY="$HOME/.ssh/id_ed25519_pi_gateway" \
-benchmarking/gateway/deploy_pi_gateway.sh
+ssh thiago@10.12.194.1 \
+  'sudo apt update && sudo apt install -y build-essential bluez cmake git \
+   libbluetooth-dev libcap2-bin libssl-dev mosquitto ninja-build perl pkg-config'
 ```
 
-These standalone gateway shell scripts use `PI_HOST` and `SSH_KEY`; the Python
-benchmark runner uses the matching values from `config.json`.
+The Python runner deploys and compiles the bridge automatically using the SSH
+values from `config.json`. It also builds the pinned wolfSSL revision once
+under `/home/<user>/peripheral-benchmark/deps/wolfssl`; subsequent runs reuse
+that user-local installation and do not require a system wolfSSL package.
 
 The benchmark user must be able to start `ble_mqtt_bridge` with non-interactive
-sudo. Add a narrow sudoers rule for the deployed binary if needed. Runs that
-use `--server-backend auto` with LMS/XMSS cases, or `--server-backend wolfssl`,
-also require wolfSSL development files on the Pi so the runner can compile
-`wolfssl_tls_server` with `pkg-config wolfssl`.
+sudo. Add a narrow sudoers rule for the deployed binary if needed.
 
 ## Generate Cases
 

@@ -74,6 +74,11 @@ class PiGateway:
             f"{self.workdir}/bin/wolfssl_tls_server.c",
             log,
         )
+        self.deploy_file(
+            wolfssl_server_source.parent / "setup_pi_wolfssl.sh",
+            f"{self.workdir}/bin/setup_pi_wolfssl.sh",
+            log,
+        )
         self.command(
             f"cd {shlex.quote(self.workdir)} && "
             "gcc -O2 -Wall -Wextra -o bin/ble_mqtt_bridge "
@@ -98,11 +103,14 @@ class PiGateway:
         )
         self.command(
             f"cd {shlex.quote(self.workdir)} && "
-            "if pkg-config --exists wolfssl; then "
-            "  gcc -O2 -Wall -Wextra -DWOLFSSL_HAVE_XMSS "
-            "    -o bin/wolfssl_tls_server bin/wolfssl_tls_server.c "
-            "    $(pkg-config --cflags --libs wolfssl); "
-            "fi; "
+            "chmod +x bin/setup_pi_wolfssl.sh && "
+            "./bin/setup_pi_wolfssl.sh deps/wolfssl && "
+            "export PKG_CONFIG_PATH=\"$PWD/deps/wolfssl/lib/pkgconfig\" && "
+            "pkg-config --exists wolfssl && "
+            "gcc -O2 -Wall -Wextra -DWOLFSSL_HAVE_XMSS "
+            "  -o bin/wolfssl_tls_server bin/wolfssl_tls_server.c "
+            "  $(pkg-config --cflags --libs wolfssl) "
+            "  -Wl,-rpath,\"$PWD/deps/wolfssl/lib\" && "
             "test -x bin/wolfssl_tls_server",
             log,
         )

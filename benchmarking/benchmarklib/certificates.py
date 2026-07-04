@@ -34,22 +34,43 @@ def run(command: list[str], *, log: Path | None = None) -> None:
 
 
 def ensure_image(dockerfile: Path, log: Path) -> None:
-    probe = subprocess.run(["docker", "image", "inspect", IMAGE], capture_output=True)
-    if probe.returncode:
+    probe_command = [
+        "docker", "run", "--rm", IMAGE, "sh", "-ec",
+        "openssl version; "
+        "openssl list -kem-algorithms | grep -Eq 'MLKEM512|ML-KEM-512'; "
+        "openssl list -signature-algorithms | grep -q 'SLH-DSA-SHAKE-256s'; "
+        "command -v hbs_certgen",
+    ]
+    image = subprocess.run(
+        ["docker", "image", "inspect", IMAGE],
+        capture_output=True,
+    )
+    probe = None
+    if image.returncode == 0:
+        with log.open("a") as stream:
+            stream.write(f"$ {' '.join(probe_command)}\n")
+            probe = subprocess.run(
+                probe_command,
+                text=True,
+                stdout=stream,
+                stderr=subprocess.STDOUT,
+            )
+
+    if image.returncode != 0 or probe is None or probe.returncode != 0:
+        with log.open("a") as stream:
+            stream.write(
+                "Docker image is missing or stale; rebuilding from "
+                f"{dockerfile}.\n"
+            )
         run(
-            ["docker", "build", "-t", IMAGE, "-f", str(dockerfile), str(dockerfile.parent.parent)],
+            [
+                "docker", "build", "-t", IMAGE, "-f", str(dockerfile),
+                str(dockerfile.parent.parent),
+            ],
             log=log,
         )
-    run(
-        [
-            "docker", "run", "--rm", IMAGE, "sh", "-ec",
-            "openssl version; "
-            "openssl list -kem-algorithms | grep -Eq 'MLKEM512|ML-KEM-512'; "
-            "openssl list -signature-algorithms | grep -q 'SLH-DSA-SHAKE-256s'; "
-            "command -v hbs_certgen",
-        ],
-        log=log,
-    )
+
+    run(probe_command, log=log)
 
 
 def _rsa_bits(key_type: str) -> int | None:

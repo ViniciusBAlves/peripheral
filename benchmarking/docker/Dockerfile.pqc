@@ -60,16 +60,21 @@ RUN openssl list -providers | grep -q oqsprovider \
     && openssl list -signature-algorithms | grep -q 'SLH-DSA-SHAKE-256s'
 
 ARG WOLFSSL_REV=dd6da70d395a0cb26446326f329678fe3bfb212c
-RUN git clone https://github.com/wolfSSL/wolfssl.git /tmp/wolfssl \
+RUN git init /tmp/wolfssl \
     && cd /tmp/wolfssl \
-    && git checkout "${WOLFSSL_REV}" \
+    && git remote add origin https://github.com/wolfSSL/wolfssl.git \
+    && git fetch --depth 1 origin "${WOLFSSL_REV}" \
+    && git checkout --detach FETCH_HEAD \
     && perl -0pi -e 's/# SLH-DSA/if (WOLFSSL_XMSS)\n    list(APPEND WOLFSSL_DEFINITIONS "-DWOLFSSL_HAVE_XMSS")\n    set_wolfssl_definitions("WOLFSSL_HAVE_XMSS" RESULT)\nendif()\n\n# SLH-DSA/' CMakeLists.txt \
     && cmake -S . -B build -GNinja \
         -DCMAKE_BUILD_TYPE=Release \
         -DCMAKE_INSTALL_PREFIX=/usr/local \
+        -DCMAKE_C_FLAGS="-Wno-error=maybe-uninitialized" \
         -DWOLFSSL_TLS13=yes \
         -DWOLFSSL_ECC=yes \
         -DWOLFSSL_TLS_NO_MLKEM_STANDALONE=no \
+        -DWOLFSSL_MLDSA=yes \
+        -DWOLFSSL_SLHDSA=yes \
         -DWOLFSSL_LMS=yes \
         -DWOLFSSL_XMSS=yes \
         -DWOLFSSL_CERTGEN=yes \
