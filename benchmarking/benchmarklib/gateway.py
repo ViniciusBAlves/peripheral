@@ -67,6 +67,9 @@ class PiGateway:
         self.deploy_file(
             bridge_source.parent / "server_crypto_metrics.c",
             f"{self.workdir}/bin/server_crypto_metrics.c",
+            log,
+        )
+        self.deploy_file(
             wolfssl_server_source,
             f"{self.workdir}/bin/wolfssl_tls_server.c",
             log,
