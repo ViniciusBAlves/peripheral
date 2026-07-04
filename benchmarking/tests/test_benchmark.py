@@ -23,8 +23,10 @@ from run_benchmarks import (
     parse_args,
     resolve_pi_workdir,
     resolve_serial_device,
+    run_job,
     summarize,
     timeout_for_case,
+    wait_for_result,
 )
 
 
@@ -130,6 +132,103 @@ class BenchmarkTests(unittest.TestCase):
             }
             classified = classify_gateway_start_failure(log, final)
         self.assertEqual(classified["stage"], "ble_l2cap_ready_timeout")
+
+    def test_wait_for_result_fails_fast_on_fatal_server_log(self) -> None:
+        class QuietSerial:
+            def readline(self) -> bytes:
+                return b""
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            result = wait_for_result(
+                QuietSerial(),
+                Path(tmpdir) / "board.log",
+                timeout=30.0,
+                fatal_detector=lambda: "OpenSSL Error[0]: tlsv1 alert unknown ca",
+            )
+
+        self.assertEqual(result["status"], "fail")
+        self.assertEqual(result["stage"], "server_certificate_trust")
+        self.assertEqual(result["error"], "fatal_server_log")
+        self.assertEqual(result["fatal"], "1")
+        self.assertIn("unknown ca", result["fatal_message"])
+
+    def test_server_certificate_trust_failure_does_not_retry(self) -> None:
+        class QuietSerial:
+            name = "fake-serial"
+
+            def reset_input_buffer(self) -> None:
+                pass
+
+            def readline(self) -> bytes:
+                return b""
+
+        class FakeGateway(PiGateway):
+            def __init__(self) -> None:
+                super().__init__("pi", "/remote")
+                self.starts = 0
+                self.workdir = "/remote"
+
+            def start_session(self, **kwargs):  # type: ignore[no-untyped-def]
+                self.starts += 1
+
+            def stop_session(self, log, *, reset_adapter=False):  # type: ignore[no-untyped-def]
+                pass
+
+            def collect_session_logs(self, case_id, broker_log, gateway_log, log):  # type: ignore[no-untyped-def]
+                broker_log.write_text("tlsv1 alert unknown ca\n")
+                gateway_log.write_text("")
+
+            def remote_file_contains(self, path, patterns):  # type: ignore[no-untyped-def]
+                return "tlsv1 alert unknown ca"
+
+        case = {
+            "case_id": "ecdhe_p_256__ecdsa_p_256",
+            "kex_group": "ECDHE-P-256",
+            "kex_nist_level": "1",
+            "kex_public_key_bytes": "65",
+            "kex_ciphertext_bytes": "65",
+            "kex_shared_secret_bytes": "32",
+            "cert_sig_alg": "ECDSA-P-256",
+            "sig_nist_level": "1",
+            "sig_public_key_bytes": "65",
+            "sig_private_key_bytes": "32",
+            "sig_signature_bytes": "64",
+            "certificate_verify_alg": "ECDSA-P-256",
+        }
+        args = type("Args", (), {
+            "attempt_timeout_sec": 30.0,
+            "reconnect_retries": 3,
+            "reconnect_delay_sec": 0.0,
+            "ble_addr": "",
+            "ble_name": "PQC52840",
+            "ble_addr_type": "random",
+            "psm": "0x0080",
+            "mtu": 672,
+            "pi_adapter": "hci0",
+            "disable_pi_wifi": True,
+            "gateway_ready_timeout_sec": 1.0,
+            "board_rearm_timeout_sec": 0.0,
+        })()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            gateway = FakeGateway()
+            row = run_job(
+                build_jobs([{**case, "warmup_iterations": "0", "iterations": "1"}],
+                           seed=1, sessions_per_case=1)[0],
+                case,
+                Path(tmpdir),
+                "/remote/cases/ecdhe_p_256__ecdsa_p_256",
+                "openssl-mosquitto",
+                gateway,
+                QuietSerial(),
+                args,
+                attempt_index=1,
+            )
+
+        self.assertEqual(row["status"], "fail")
+        self.assertEqual(row["reconnect_count"], 0)
+        self.assertEqual(row["message"], "tlsv1 alert unknown ca")
+        self.assertEqual(gateway.starts, 1)
 
     def test_server_backend_policy_routes_hash_based_signatures(self) -> None:
         classic = {"cert_sig_alg": "ECDSA-P-256"}

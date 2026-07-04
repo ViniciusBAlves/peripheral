@@ -44,6 +44,10 @@ RESULTS = ROOT / "results"
 WORK = ROOT / "work"
 DEFAULT_CONFIG = ROOT / "config.json"
 DEFAULT_NCS_VERSION = "v3.3.0"
+FATAL_SERVER_LOG_PATTERNS = (
+    r"unknown ca",
+    r"certificate verify failed",
+)
 
 ATTEMPT_FIELDS = [
     "attempt_index", "schedule_index", "session", "attempt_in_session", "warmup",
@@ -226,10 +230,37 @@ def usage_percent(values: dict[str, str], used_key: str, capacity_key: str) -> s
     return f"{used * 100.0 / capacity:.2f}" if used is not None and capacity else ""
 
 
-def wait_for_result(serial_port, board_log: Path, timeout: float) -> dict[str, str]:
+def wait_for_result(
+    serial_port,
+    board_log: Path,
+    timeout: float,
+    fatal_detector=None,
+) -> dict[str, str]:
     deadline = time.monotonic() + timeout
+    next_fatal_check = time.monotonic()
+
+    def check_fatal_server_log() -> dict[str, str] | None:
+        nonlocal next_fatal_check
+        now = time.monotonic()
+        if fatal_detector is None or now < next_fatal_check:
+            return None
+        fatal_line = fatal_detector()
+        next_fatal_check = now + 1.0
+        if not fatal_line:
+            return None
+        return {
+            "status": "fail",
+            "stage": "server_certificate_trust",
+            "error": "fatal_server_log",
+            "fatal": "1",
+            "fatal_message": fatal_line,
+        }
+
     with board_log.open("a") as stream:
         while time.monotonic() < deadline:
+            fatal_result = check_fatal_server_log()
+            if fatal_result is not None:
+                return fatal_result
             raw = serial_port.readline()
             if not raw:
                 continue
@@ -355,7 +386,15 @@ def run_job(
                 server_backend=server_backend,
                 wolfssl_group=KEMS_BY_NAME[case["kex_group"]].wolfssl_group,
             )
-            final = wait_for_result(serial_port, board_log, attempt_timeout)
+            remote_broker_log = f"{gateway.workdir}/logs/{case['case_id']}.broker.log"
+            final = wait_for_result(
+                serial_port,
+                board_log,
+                attempt_timeout,
+                fatal_detector=lambda: gateway.remote_file_contains(
+                    remote_broker_log, FATAL_SERVER_LOG_PATTERNS
+                ),
+            )
         except Exception as error:
             final = {
                 "status": "fail",
@@ -376,12 +415,15 @@ def run_job(
                     serial_port, board_log, args.board_rearm_timeout_sec
                 )
             except TimeoutError:
-                final = {
-                    "status": "fail",
-                    "stage": "board_rearm",
-                    "error": "timeout",
-                }
+                if final.get("fatal") != "1":
+                    final = {
+                        "status": "fail",
+                        "stage": "board_rearm",
+                        "error": "timeout",
+                    }
         if final.get("status") == "success":
+            break
+        if final.get("fatal") == "1":
             break
         if retry < args.reconnect_retries:
             time.sleep(args.reconnect_delay_sec)
@@ -535,7 +577,9 @@ def run_job(
             final, "l2cap_rx_ring_peak_bytes", "l2cap_rx_ring_capacity_bytes"
         ),
         "error_code": final.get("error", ""),
-        "message": final.get("stage", ""),
+        "message": final.get("fatal_message", final.get("stage", "")),
+        "_fatal": final.get("fatal", ""),
+        "_fatal_message": final.get("fatal_message", ""),
     }
 
 
@@ -1168,10 +1212,16 @@ def main() -> int:
     gateway.start_master(run_dir / "gateway.log")
     atexit.register(gateway.stop_master)
     print(f"[gateway] Preparing Raspberry Pi bridge; log={run_dir / 'gateway.log'}", flush=True)
+    wolfssl_archives = list(
+        (initial_build_dir / "_deps" / "wolfssl_upstream-subbuild").glob(
+            "**/dd6da70d395a0cb26446326f329678fe3bfb212c.tar.gz"
+        )
+    )
     gateway.prepare(
         ROOT / "gateway" / "ble_mqtt_bridge.c",
         ROOT / "gateway" / "wolfssl_tls_server.c",
         run_dir / "gateway.log",
+        wolfssl_archives[0] if wolfssl_archives else None,
     )
     print("[gateway] Raspberry Pi bridge is ready.", flush=True)
     remote_cases = {

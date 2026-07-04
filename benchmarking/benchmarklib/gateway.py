@@ -3,6 +3,8 @@ from __future__ import annotations
 import os
 import shlex
 import subprocess
+import tarfile
+import tempfile
 from pathlib import Path
 
 
@@ -54,6 +56,22 @@ class PiGateway:
             raise subprocess.CalledProcessError(proc.returncode, command)
         return proc
 
+    def remote_file_contains(self, path: str, patterns: tuple[str, ...]) -> str:
+        if not patterns:
+            return ""
+        regex = "|".join(patterns)
+        script = (
+            f"test -f {shlex.quote(path)} && "
+            f"grep -Eim1 -- {shlex.quote(regex)} {shlex.quote(path)}"
+        )
+        command = [*self.ssh_base(), self.host, f"bash -lc {shlex.quote(script)}"]
+        proc = subprocess.run(
+            command, text=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
+        )
+        if proc.returncode == 0:
+            return proc.stdout.strip().splitlines()[0]
+        return ""
+
     def deploy_file(self, source: Path, destination: str, log: Path) -> None:
         ssh_transport = " ".join(shlex.quote(part) for part in self.ssh_base())
         self._local(
@@ -61,8 +79,14 @@ class PiGateway:
             log,
         )
 
-    def prepare(self, bridge_source: Path, wolfssl_server_source: Path, log: Path) -> None:
-        self.command(f"mkdir -p {shlex.quote(self.workdir)}/{{bin,cases,logs}}", log)
+    def prepare(
+        self,
+        bridge_source: Path,
+        wolfssl_server_source: Path,
+        log: Path,
+        wolfssl_source_dir: Path | None = None,
+    ) -> None:
+        self.command(f"mkdir -p {shlex.quote(self.workdir)}/{{bin,cases,logs,deps}}", log)
         self.deploy_file(bridge_source, f"{self.workdir}/bin/ble_mqtt_bridge.c", log)
         self.deploy_file(
             bridge_source.parent / "server_crypto_metrics.c",
@@ -79,6 +103,15 @@ class PiGateway:
             f"{self.workdir}/bin/setup_pi_wolfssl.sh",
             log,
         )
+        if wolfssl_source_dir is not None and wolfssl_source_dir.exists():
+            remote_archive = f"{self.workdir}/deps/wolfssl/wolfssl-clean-source.tar.gz"
+            if wolfssl_source_dir.is_file():
+                self.deploy_file(wolfssl_source_dir, remote_archive, log)
+            else:
+                with tempfile.NamedTemporaryFile(suffix=".tar.gz") as archive:
+                    with tarfile.open(archive.name, "w:gz") as tar:
+                        tar.add(wolfssl_source_dir, arcname="src")
+                    self.deploy_file(Path(archive.name), remote_archive, log)
         self.command(
             f"cd {shlex.quote(self.workdir)} && "
             "gcc -O2 -Wall -Wextra -o bin/ble_mqtt_bridge "
