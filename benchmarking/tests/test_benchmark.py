@@ -10,6 +10,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from benchmarklib.metrics import parse_bench_line
+from benchmarklib.certificates import write_case_configs
 from benchmarklib.gateway import PiGateway
 from benchmarklib.scheduler import build_jobs
 from benchmarklib.server_backends import server_backend_for_case
@@ -257,6 +258,18 @@ class BenchmarkTests(unittest.TestCase):
         self.assertEqual(row["reconnect_count"], 0)
         self.assertEqual(row["message"], "tlsv1 alert unknown ca")
         self.assertEqual(gateway.starts, 1)
+
+    def test_openssl_server_requests_board_client_signature_algorithm(self) -> None:
+        case = {
+            "kex_group": "ECDHE-P-521",
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output = Path(tmpdir)
+            write_case_configs(case, output)
+            openssl_config = (output / "openssl.cnf").read_text()
+
+        self.assertIn("Groups = P-521\n", openssl_config)
+        self.assertIn("ClientSignatureAlgorithms = ECDSA+SHA256\n", openssl_config)
 
     def test_server_backend_policy_routes_hash_based_signatures(self) -> None:
         classic = {"cert_sig_alg": "ECDSA-P-256"}

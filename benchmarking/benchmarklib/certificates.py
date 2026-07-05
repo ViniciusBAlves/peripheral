@@ -346,6 +346,7 @@ def write_case_configs(case: dict[str, str], output: Path) -> None:
         "[ssl_sect]\nsystem_default = system_default_sect\n\n"
         "[system_default_sect]\nMinProtocol = TLSv1.3\n"
         f"Groups = {kem.openssl_group}\n"
+        "ClientSignatureAlgorithms = ECDSA+SHA256\n"
     )
     (output / "mosquitto.conf").write_text(
         "listener 8883\n"
