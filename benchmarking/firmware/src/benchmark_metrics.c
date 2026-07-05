@@ -19,6 +19,11 @@ void benchmark_metrics_stop(void)
     metrics_active = false;
 }
 
+void benchmark_crypto_reschedule(void)
+{
+    k_yield();
+}
+
 void benchmark_hardware_counters_start(void)
 {
 #if defined(NVMC_FEATURE_CACHE_PRESENT)

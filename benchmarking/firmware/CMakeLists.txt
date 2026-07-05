@@ -91,6 +91,40 @@ string(REPLACE
 )
 file(WRITE "${WOLFSSL_MLKEM_C}" "${WOLFSSL_MLKEM_TEXT}")
 
+# Heap-integer RSA-15360 spends several seconds inside modular exponentiation.
+# Add scheduler points between exponent steps so Bluetooth controller threads
+# can service connection events without changing any cryptographic operation.
+if(BENCH_LARGE_RSA)
+    set(WOLFSSL_INTEGER_C "${WOLFSSL_ROOT_DIR}/wolfcrypt/src/integer.c")
+    file(READ "${WOLFSSL_INTEGER_C}" WOLFSSL_INTEGER_TEXT)
+    string(REPLACE
+        "#include <wolfssl/wolfcrypt/libwolfssl_sources.h>"
+        "#include <wolfssl/wolfcrypt/libwolfssl_sources.h>\n#include \"benchmark_metrics.h\""
+        WOLFSSL_INTEGER_TEXT "${WOLFSSL_INTEGER_TEXT}"
+    )
+    string(REPLACE
+        "  for (;;) {\n    /* grab next digit as required */"
+        "  for (;;) {\n    benchmark_crypto_reschedule();\n    /* grab next digit as required */"
+        WOLFSSL_INTEGER_TEXT "${WOLFSSL_INTEGER_TEXT}"
+    )
+    string(REPLACE
+        "  for (x = (1 << (winsize - 1)) + 1; x < (1 << winsize); x++) {\n    if ((err = mp_mul"
+        "  for (x = (1 << (winsize - 1)) + 1; x < (1 << winsize); x++) {\n    benchmark_crypto_reschedule();\n    if ((err = mp_mul"
+        WOLFSSL_INTEGER_TEXT "${WOLFSSL_INTEGER_TEXT}"
+    )
+    string(REPLACE
+        "  for (ix = 0; ix < pa; ix++) {"
+        "  for (ix = 0; ix < pa; ix++) {\n    if ((ix & 31) == 0) benchmark_crypto_reschedule();"
+        WOLFSSL_INTEGER_TEXT "${WOLFSSL_INTEGER_TEXT}"
+    )
+    string(REPLACE
+        "  for (ix = 0; ix < pa && a->dp; ix++) {"
+        "  for (ix = 0; ix < pa && a->dp; ix++) {\n    if ((ix & 31) == 0) benchmark_crypto_reschedule();"
+        WOLFSSL_INTEGER_TEXT "${WOLFSSL_INTEGER_TEXT}"
+    )
+    file(WRITE "${WOLFSSL_INTEGER_C}" "${WOLFSSL_INTEGER_TEXT}")
+endif()
+
 # Instrument the classic half of ECDHE/hybrid key exchange and the client's
 # mTLS CertificateVerify signature in wolfSSL's TLS wrappers.
 set(WOLFSSL_INTERNAL_C "${WOLFSSL_ROOT_DIR}/src/internal.c")

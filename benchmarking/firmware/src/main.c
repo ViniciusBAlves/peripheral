@@ -222,6 +222,7 @@ static void *wolfssl_realloc(void *ptr, size_t size)
 RING_BUF_DECLARE(rx_ringbuf, TLS_RX_RINGBUF_SIZE);
 K_SEM_DEFINE(rx_sem, 0, 1);
 K_SEM_DEFINE(l2cap_connected_sem, 0, 1);
+K_SEM_DEFINE(conn_params_ready_sem, 0, 1);
 
 /* --- WOLFSSL TIME HOOKS --- */
 time_t time_sec(time_t *timer) {
@@ -285,6 +286,8 @@ static struct bt_l2cap_le_chan l2cap_chan;
 static volatile bool l2cap_rx_overflow;
 static volatile bool l2cap_peer_disconnected;
 static volatile bool disconnect_requested;
+static const struct bt_le_conn_param benchmark_conn_params =
+    BT_LE_CONN_PARAM_INIT(12, 24, 0, 3200);
 
 static void bt_connected(struct bt_conn *conn, uint8_t err)
 {
@@ -297,6 +300,10 @@ static void bt_connected(struct bt_conn *conn, uint8_t err)
     }
 
     BENCH_LOG("[BLE] ACL connected: %s\n", addr);
+    int update_err = bt_conn_le_param_update(conn, &benchmark_conn_params);
+    if (update_err != 0 && update_err != -EALREADY) {
+        BENCH_LOG("[BLE] Connection parameter update failed: %d\n", update_err);
+    }
 }
 
 static void bt_disconnected(struct bt_conn *conn, uint8_t reason)
@@ -317,6 +324,9 @@ static void bt_le_param_updated(struct bt_conn *conn, uint16_t interval,
     bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
     BENCH_LOG("[BLE] Params updated for %s: interval=%u latency=%u timeout=%u\n",
            addr, interval, latency, timeout);
+    if (timeout >= 3000) {
+        k_sem_give(&conn_params_ready_sem);
+    }
 }
 
 BT_CONN_CB_DEFINE(conn_callbacks) = {
@@ -920,6 +930,7 @@ int main(void) {
         ring_buf_reset(&rx_ringbuf);
         k_sem_reset(&rx_sem);
         k_sem_reset(&l2cap_connected_sem);
+        k_sem_reset(&conn_params_ready_sem);
         l2cap_peer_disconnected = false;
         l2cap_rx_overflow = false;
         disconnect_requested = false;
@@ -949,6 +960,9 @@ int main(void) {
         /* Stop advertising while connected to save power */
         bt_le_adv_stop();
 
+        if (k_sem_take(&conn_params_ready_sem, K_SECONDS(2)) != 0) {
+            BENCH_LOG("[BLE] Continuing after connection parameter wait timeout.\n");
+        }
         start_secure_mqtt_session(&l2cap_chan.chan);
         
         BENCH_LOG("Session ended. Re-arming for next connection...\n");

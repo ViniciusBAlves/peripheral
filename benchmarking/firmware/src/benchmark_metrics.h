@@ -39,6 +39,7 @@ struct benchmark_metrics {
 
 void benchmark_metrics_reset(void);
 void benchmark_metrics_stop(void);
+void benchmark_crypto_reschedule(void);
 void benchmark_hardware_counters_start(void);
 void benchmark_hardware_counters_stop(void);
 benchmark_timepoint_t benchmark_metric_start(void);

@@ -234,6 +234,14 @@ class PiGateway:
         wolfssl_group: str = "",
     ) -> None:
         self.stop_session(log, reset_adapter=disable_wifi)
+        supervision_timeout_path = (
+            f"/sys/kernel/debug/bluetooth/{adapter}/supervision_timeout"
+        )
+        self.command(
+            "printf '3200\\n' | sudo -n /usr/bin/tee "
+            f"{shlex.quote(supervision_timeout_path)} >/dev/null",
+            log,
+        )
         broker_log = f"{self.workdir}/logs/{case_id}.broker.log"
         gateway_log = f"{self.workdir}/logs/{case_id}.gateway.log"
         address = f"--addr {shlex.quote(ble_addr)}" if ble_addr else ""
