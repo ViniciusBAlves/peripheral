@@ -53,6 +53,8 @@
 #define DEFAULT_DISCOVERY_ATTEMPTS 3
 #define COMMAND_OUTPUT_MAX 8192
 #define BRIDGE_RECV_BUFFER_SIZE 65535
+#define L2CAP_SEND_RETRY_TIMEOUT_MS 10000
+#define L2CAP_SDU_PACING_US 30000
 
 static volatile sig_atomic_t keep_running = 1;
 
@@ -562,6 +564,60 @@ static int send_stream(int fd, const uint8_t *data, size_t length)
     return offset == length ? 0 : -1;
 }
 
+static int send_l2cap_sdu(int fd, const uint8_t *data, size_t length)
+{
+    double deadline = monotonic_ms() + L2CAP_SEND_RETRY_TIMEOUT_MS;
+
+    while (keep_running) {
+        ssize_t written = send(fd, data, length, MSG_NOSIGNAL);
+        if (written == (ssize_t)length) {
+            return 0;
+        }
+        if (written >= 0) {
+            fprintf(stderr,
+                    "[-] Partial L2CAP SDU write: %zd/%zu bytes\n",
+                    written, length);
+            return -1;
+        }
+        if (errno == EINTR) {
+            continue;
+        }
+        if (errno != EAGAIN && errno != EWOULDBLOCK &&
+            errno != ENOBUFS && errno != ENOMEM) {
+            fprintf(stderr, "[-] L2CAP send failed: %s\n", strerror(errno));
+            return -1;
+        }
+        if (monotonic_ms() >= deadline) {
+            fprintf(stderr,
+                    "[-] L2CAP send remained blocked for %d ms: %s\n",
+                    L2CAP_SEND_RETRY_TIMEOUT_MS, strerror(errno));
+            return -1;
+        }
+
+        struct pollfd writable = {.fd = fd, .events = POLLOUT};
+        int poll_result;
+        do {
+            poll_result = poll(&writable, 1, 100);
+        } while (poll_result < 0 && errno == EINTR);
+        if (poll_result < 0) {
+            fprintf(stderr,
+                    "[-] L2CAP POLLOUT wait failed: %s\n", strerror(errno));
+            return -1;
+        }
+        if (poll_result > 0 &&
+            (writable.revents & (POLLERR | POLLHUP | POLLNVAL))) {
+            int socket_error = 0;
+            socklen_t error_length = sizeof(socket_error);
+            (void)getsockopt(fd, SOL_SOCKET, SO_ERROR,
+                             &socket_error, &error_length);
+            fprintf(stderr, "[-] L2CAP socket closed while sending: %s\n",
+                    strerror(socket_error ? socket_error : ECONNRESET));
+            return -1;
+        }
+    }
+    return -1;
+}
+
 static int append_pending(struct sdu_prefix_state *state,
                           const uint8_t *data, size_t length)
 {
@@ -709,14 +765,13 @@ static int relay_loop(int ble_fd, int tcp_fd, size_t mtu)
                 if (chunk > mtu) {
                     chunk = mtu;
                 }
-                ssize_t written = send(ble_fd, buffer + offset, chunk, 0);
-                if (written <= 0) {
+                if (send_l2cap_sdu(ble_fd, buffer + offset, chunk) != 0) {
                     result = -1;
                     break;
                 }
-                offset += (size_t)written;
+                offset += chunk;
                 if (offset < (size_t)length) {
-                    usleep(20000);
+                    usleep(L2CAP_SDU_PACING_US);
                 }
             }
             if (result < 0) {

@@ -14,6 +14,7 @@ class PiGateway:
         self.workdir = workdir
         self.ssh_key = ssh_key
         self.control_path = f"/tmp/peripheral-bench-ssh-{os.getpid()}"
+        self.ble_addr = ""
 
     def ssh_base(self) -> list[str]:
         command = [
@@ -167,15 +168,20 @@ class PiGateway:
         broker_pattern = f"^/usr/sbin/mosquitto -c {self.workdir}/cases/"
         wolfssl_pattern = f"^{self.workdir}/bin/wolfssl_tls_server( |$)"
         reset_command = ""
+        disconnect_command = ""
+        if self.ble_addr:
+            disconnect_command = (
+                "timeout -k 1 5 bluetoothctl disconnect "
+                f"{shlex.quote(self.ble_addr)} >/dev/null 2>&1 || true; "
+                "sleep 0.5; "
+            )
         if reset_adapter:
             reset_command = (
-                "sudo -n /usr/sbin/rfkill block wifi >/dev/null 2>&1 || true; "
-                "sudo -n /usr/bin/nmcli radio wifi off >/dev/null 2>&1 || true; "
-                "sudo -n /usr/sbin/ip link set wlan0 down >/dev/null 2>&1 || true; "
-                "sleep 1; "
-                "sudo -n timeout -k 1 4 /usr/bin/btmgmt power off "
+                "sudo -n /usr/sbin/rfkill block bluetooth "
                 ">/dev/null 2>&1 || true; sleep 1; "
-                "sudo -n timeout -k 1 4 /usr/bin/btmgmt power on "
+                "sudo -n /usr/sbin/rfkill unblock bluetooth "
+                ">/dev/null 2>&1 || true; sleep 2; "
+                "sudo -n timeout -k 1 4 /usr/bin/btmgmt power off "
                 ">/dev/null 2>&1 || true; sleep 1; "
                 "sudo -n timeout -k 1 4 /usr/bin/btmgmt bredr off "
                 ">/dev/null 2>&1 || true; "
@@ -185,9 +191,8 @@ class PiGateway:
                 ">/dev/null 2>&1 || true; "
                 "sudo -n timeout -k 1 4 /usr/bin/btmgmt privacy off "
                 ">/dev/null 2>&1 || true; "
-                "sudo -n /usr/sbin/rfkill unblock wifi >/dev/null 2>&1 || true; "
-                "sudo -n /usr/bin/nmcli radio wifi on >/dev/null 2>&1 || true; "
-                "sudo -n /usr/sbin/ip link set wlan0 up >/dev/null 2>&1 || true; "
+                "sudo -n timeout -k 1 4 /usr/bin/btmgmt power on "
+                ">/dev/null 2>&1 || true; sleep 1; "
             )
         self.command(
             f"if [ -f {self.workdir}/bridge.pid ]; then "
@@ -211,6 +216,7 @@ class PiGateway:
             "  [ -z \"$pids\" ] || kill -KILL $pids 2>/dev/null || true; "
             f"pids=$(pgrep -f {shlex.quote(wolfssl_pattern)} || true); "
             "  [ -z \"$pids\" ] || kill -KILL $pids 2>/dev/null || true; "
+            f"{disconnect_command}"
             f"{reset_command}",
             log,
             check=False,
@@ -234,6 +240,7 @@ class PiGateway:
         wolfssl_group: str = "",
     ) -> None:
         self.stop_session(log, reset_adapter=disable_wifi)
+        self.ble_addr = ble_addr
         supervision_timeout_path = (
             f"/sys/kernel/debug/bluetooth/{adapter}/supervision_timeout"
         )
@@ -250,7 +257,7 @@ class PiGateway:
             f"--adapter {shlex.quote(adapter)} --name {shlex.quote(ble_name)} "
             f"{address} --addr-type {shlex.quote(ble_addr_type)} "
             f"--psm {shlex.quote(psm)} --tcp-host 127.0.0.1 --tcp-port 8883 "
-            f"--mtu {mtu} --scan-timeout 5 --no-acl-prime "
+            f"--mtu {mtu} --scan-timeout 5 "
             f"{'--disable-wifi ' if disable_wifi else ''}"
             f"> {gateway_log} 2>&1 < /dev/null & "
             f"echo $! > {self.workdir}/bridge.pid"

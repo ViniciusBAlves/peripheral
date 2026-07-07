@@ -144,10 +144,70 @@ def kem_security_level(row: dict[str, str]) -> int | None:
     return normalize_security_level(int_or_none(row.get("kex_nist_level")))
 
 
+def signature_security_level(row: dict[str, str]) -> int | None:
+    return normalize_security_level(int_or_none(row.get("sig_nist_level")))
+
+
+def algorithm_label(name: str, level: int | None) -> str:
+    level_text = str(level) if level is not None else "unknown"
+    return f"[{level_text}] - {name}"
+
+
 def handshake_value(row: dict[str, str]) -> float | None:
     return float_or_none(
         row.get("mean_raw_handshake_ms") or row.get("mean_handshake_ms")
     )
+
+
+def mean_metric(row: dict[str, str], *names: str) -> float:
+    for name in names:
+        value = float_or_none(row.get(name))
+        if value is not None:
+            return max(0.0, value)
+    return 0.0
+
+
+def handshake_components(row: dict[str, str]) -> tuple[float, float, float, float]:
+    """Return mutually exclusive components whose sum is raw handshake time."""
+    raw = handshake_value(row) or 0.0
+    kem = mean_metric(row, "mean_kem_client_total_ms")
+    if kem == 0.0:
+        kem = sum(
+            mean_metric(row, name)
+            for name in (
+                "mean_kem_keygen_ms",
+                "mean_kem_decapsulation_ms",
+                "mean_classical_kex_keygen_ms",
+                "mean_classical_kex_shared_secret_ms",
+            )
+        )
+
+    signature = mean_metric(row, "mean_client_signature_total_ms")
+    if signature == 0.0:
+        signature = sum(
+            mean_metric(row, name)
+            for name in (
+                "mean_x509_chain_signature_verify_ms",
+                "mean_tls_certificate_verify_signature_verify_ms",
+                "mean_mtls_signature_generate_ms",
+            )
+        )
+    if signature == 0.0:
+        signature = mean_metric(row, "mean_certificate_signature_verify_ms")
+
+    communication = mean_metric(row, "mean_communication_overhead_ms")
+    measured_total = kem + signature + communication
+
+    # The instrumented intervals should be disjoint. Normalize defensively if
+    # measurements overlap so the visual decomposition still equals raw time.
+    if measured_total > raw and measured_total > 0.0:
+        scale = raw / measured_total
+        kem *= scale
+        signature *= scale
+        communication *= scale
+
+    cpu_active_other = max(0.0, raw - kem - signature - communication)
+    return kem, signature, cpu_active_other, communication
 
 
 def ci95_half_width(row: dict[str, str]) -> float | None:
@@ -203,6 +263,19 @@ def load_from_attempts(run_dir: Path) -> list[dict[str, str]]:
             float(row.get("raw_handshake_ms") or row["tls_handshake_ms"])
             for row in successes
         ]
+
+        def attempt_mean(field: str) -> str:
+            metric_values = [
+                value
+                for attempt in successes
+                if (value := float_or_none(attempt.get(field))) is not None
+            ]
+            return (
+                f"{statistics.mean(metric_values):.3f}"
+                if metric_values
+                else ""
+            )
+
         stddev = statistics.stdev(values) if len(values) > 1 else 0.0
         rows.append(
             {
@@ -214,6 +287,19 @@ def load_from_attempts(run_dir: Path) -> list[dict[str, str]]:
                 "mean_handshake_ms": f"{statistics.mean(values):.3f}",
                 "stddev_raw_handshake_ms": f"{stddev:.3f}",
                 "success_count": str(len(successes)),
+                "mean_kem_client_total_ms": attempt_mean(
+                    "kem_client_total_ms"
+                ),
+                "mean_client_signature_total_ms": attempt_mean(
+                    "client_signature_total_ms"
+                ),
+                "mean_communication_overhead_ms": attempt_mean(
+                    "communication_overhead_ms"
+                ),
+                "mean_client_cpu_ms": attempt_mean("client_cpu_ms"),
+                "mean_client_icache_hit_percent": attempt_mean(
+                    "client_icache_hit_percent"
+                ),
             }
         )
     return rows
@@ -227,8 +313,8 @@ def add_attempt_cpu_peaks(rows: list[dict[str, str]], run_dir: Path) -> None:
         if target is None:
             continue
         with attempts_csv.open(newline="") as fp:
-            attempts = csv.DictReader(fp)
-            values = [
+            attempts = list(csv.DictReader(fp))
+            cpu_values = [
                 value
                 for attempt in attempts
                 if attempt.get("status") == "success"
@@ -239,8 +325,27 @@ def add_attempt_cpu_peaks(rows: list[dict[str, str]], run_dir: Path) -> None:
                     )
                 ) is not None
             ]
-        if values:
-            target["peak_system_cpu_usage_percent"] = f"{max(values):.3f}"
+            cache_values = [
+                value
+                for attempt in attempts
+                if attempt.get("status") == "success"
+                and attempt.get("warmup") != "1"
+                and (
+                    value := float_or_none(
+                        attempt.get("client_icache_hit_percent")
+                    )
+                ) is not None
+            ]
+        if cpu_values:
+            target["peak_system_cpu_usage_percent"] = (
+                f"{max(cpu_values):.3f}"
+            )
+        if cache_values and not float_or_none(
+            target.get("mean_client_icache_hit_percent")
+        ):
+            target["mean_client_icache_hit_percent"] = (
+                f"{statistics.mean(cache_values):.3f}"
+            )
 
 
 def load_rows(run_dir: Path) -> list[dict[str, str]]:
@@ -253,10 +358,152 @@ def load_rows(run_dir: Path) -> list[dict[str, str]]:
     return rows
 
 
+def load_reconnect_count_rows(run_dir: Path) -> list[dict[str, str]]:
+    """Load one row per case with total reconnects across all attempts."""
+    rows_by_case: dict[str, dict[str, str]] = {}
+    input_cases = run_dir / "input_cases.csv"
+    if input_cases.exists():
+        with input_cases.open(newline="") as fp:
+            rows_by_case = {
+                row["case_id"]: dict(row)
+                for row in csv.DictReader(fp)
+                if row.get("case_id")
+            }
+
+    summary_csv = run_dir / "summary.csv"
+    if summary_csv.exists():
+        with summary_csv.open(newline="") as fp:
+            for row in csv.DictReader(fp):
+                case_id = row.get("case_id", "")
+                if not case_id:
+                    continue
+                target = rows_by_case.setdefault(case_id, {})
+                target.update(
+                    {
+                        key: value
+                        for key, value in row.items()
+                        if value != "" or key not in target
+                    }
+                )
+
+    for attempts_csv in sorted((run_dir / "cases").glob("*/attempts.csv")):
+        case_id = attempts_csv.parent.name.split("_", 1)[-1]
+        with attempts_csv.open(newline="") as fp:
+            attempts = list(csv.DictReader(fp))
+        target = rows_by_case.setdefault(case_id, {"case_id": case_id})
+        if attempts:
+            for key in (
+                "kex_group", "kex_nist_level", "cert_sig_alg",
+                "sig_nist_level",
+            ):
+                if not target.get(key):
+                    target[key] = attempts[0].get(key, "")
+        target["reconnect_count_total"] = str(
+            sum(int_or_none(attempt.get("reconnect_count")) or 0 for attempt in attempts)
+        )
+
+    rows: list[dict[str, str]] = []
+    for row in rows_by_case.values():
+        if row.get("kex_group") and row.get("cert_sig_alg"):
+            if int_or_none(row.get("reconnect_count_total")) is None:
+                row["reconnect_count_total"] = "0"
+            rows.append(row)
+    return rows
+
+
 def short_label(row: dict[str, str]) -> str:
     kex = row.get("kex_group", "")
     sig = row.get("cert_sig_alg", "")
-    return f"{kex}\n{sig}"
+    return (
+        f"{algorithm_label(kex, kem_security_level(row))}\n"
+        f"{algorithm_label(sig, signature_security_level(row))}"
+    )
+
+
+def plot_algorithm_metric(
+    rows: list[dict[str, str]],
+    *,
+    algorithm_field: str,
+    level_field: str,
+    metric_field: str,
+    title: str,
+    ylabel: str,
+    color: str,
+    output: Path,
+) -> int:
+    """Plot one averaged bar per algorithm instead of per KEM/signature pair."""
+    values_by_algorithm: dict[str, list[float]] = defaultdict(list)
+    levels_by_algorithm: dict[str, int | None] = {}
+    for row in rows:
+        algorithm = row.get(algorithm_field, "")
+        value = float_or_none(row.get(metric_field))
+        if value is None:
+            components = handshake_components(row)
+            if metric_field == "mean_kem_client_total_ms":
+                value = components[0]
+            elif metric_field == "mean_client_signature_total_ms":
+                value = components[1]
+        if not algorithm or value is None:
+            continue
+        values_by_algorithm[algorithm].append(value)
+        levels_by_algorithm[algorithm] = normalize_security_level(
+            int_or_none(row.get(level_field))
+        )
+
+    if not values_by_algorithm:
+        print(f"warning: no values found for {metric_field}")
+        return 0
+
+    algorithms = sorted(
+        values_by_algorithm,
+        key=lambda name: (
+            -statistics.mean(values_by_algorithm[name]),
+            name.lower(),
+        ),
+    )
+    values = [
+        statistics.mean(values_by_algorithm[name]) for name in algorithms
+    ]
+    labels = [
+        algorithm_label(name, levels_by_algorithm[name])
+        for name in algorithms
+    ]
+    count = len(algorithms)
+    fig_width = max(10, count * 1.15)
+    fig, ax = plt.subplots(
+        figsize=(fig_width, 8.5),
+        constrained_layout=True,
+    )
+    bars = ax.bar(
+        range(count),
+        values,
+        width=1.0,
+        color=color,
+        edgecolor="#1a1a1a",
+        linewidth=0.35,
+    )
+    ax.set_title(title)
+    ax.set_ylabel(ylabel)
+    ax.set_xlabel("Algorithm")
+    ax.set_xticks(range(count))
+    ax.set_xticklabels(labels, rotation=55, ha="right", fontsize=9)
+    ax.set_xlim(-0.5, count - 0.5)
+    ax.margins(x=0)
+    ax.grid(axis="y", linestyle=":", alpha=0.35)
+    for bar, value in zip(bars, values):
+        ax.annotate(
+            f"{value:.2f}",
+            xy=(bar.get_x() + bar.get_width() / 2, value),
+            xytext=(0, 3),
+            textcoords="offset points",
+            ha="center",
+            va="bottom",
+            fontsize=8,
+        )
+    output.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(output, dpi=180)
+    plt.close(fig)
+    return count
 
 
 def plot_group(rows: list[dict[str, str]], title: str, output: Path) -> None:
@@ -272,36 +519,59 @@ def plot_group(rows: list[dict[str, str]], title: str, output: Path) -> None:
     labels = [short_label(row) for row in rows]
     values = [float(row["mean_handshake_ms"]) for row in rows]
     errors = [ci95_half_width(row) or 0.0 for row in rows]
-    colors = plt.cm.inferno(np.linspace(0.15, 0.9, len(values)))
-    bars = ax.bar(
+    components = [handshake_components(row) for row in rows]
+    component_labels = (
+        "Client KEM",
+        "Client Signature",
+        "Active CPU",
+        "Communication Overhead",
+    )
+    component_colors = ("#2a9d8f", "#e9c46a", "#457b9d", "#e76f51")
+    bottoms = np.zeros(len(values))
+    top_bars = None
+    for component_index, (component_label, color) in enumerate(
+        zip(component_labels, component_colors)
+    ):
+        heights = [parts[component_index] for parts in components]
+        top_bars = ax.bar(
+            range(len(values)),
+            heights,
+            width=1.0,
+            bottom=bottoms,
+            label=component_label,
+            color=color,
+            edgecolor="#1a1a1a",
+            linewidth=0.25,
+        )
+        bottoms += np.asarray(heights)
+
+    ax.errorbar(
         range(len(values)),
         values,
-        width=1.0,
-        color=colors,
-        edgecolor="#1a1a1a",
-        linewidth=0.25,
         yerr=errors,
-        error_kw={
-            "ecolor": "#111111",
-            "elinewidth": 0.8,
-            "capsize": 2.0,
-            "capthick": 0.8,
-        },
+        fmt="none",
+        ecolor="#111111",
+        elinewidth=0.8,
+        capsize=2.0,
+        capthick=0.8,
+        zorder=5,
     )
 
     ax.set_title(title)
-    ax.set_ylabel("TLS handshake mean (ms), with 95% CI")
+    ax.set_ylabel("Raw TLS handshake decomposition (ms), with 95% CI")
     ax.set_xlabel("KEM / certificate signature")
     ax.set_xticks(range(len(labels)))
     ax.set_xticklabels(labels, rotation=72, ha="right", fontsize=label_font)
     ax.set_xlim(-0.5, len(values) - 0.5)
     ax.margins(x=0)
     ax.grid(axis="y", linestyle=":", alpha=0.35)
+    ax.legend(loc="upper right", fontsize=max(8, label_font - 2), ncol=2)
 
-    for bar, value in zip(bars, values):
+    assert top_bars is not None
+    for bar, value in zip(top_bars, values):
         ax.annotate(
             f"{value:.0f}",
-            xy=(bar.get_x() + bar.get_width() / 2, bar.get_height()),
+            xy=(bar.get_x() + bar.get_width() / 2, value),
             xytext=(0, 3),
             textcoords="offset points",
             ha="center",
@@ -328,7 +598,7 @@ def plot_security_levels(
         if level_rows:
             plot_group(
                 level_rows,
-                f"{title_prefix} - NIST level {level} - {run_id}",
+                f"{title_prefix} - {level} - {run_id}",
                 out_dir / f"{filename_prefix}_nist_level_{level}.{extension}",
             )
     return counts
@@ -382,8 +652,21 @@ def plot_heatmap(rows: list[dict[str, str]], output: Path, run_id: str) -> None:
     ax.set_ylabel("Certificate signature algorithm")
     ax.set_xticks(range(len(kems)))
     ax.set_yticks(range(len(sigs)))
-    ax.set_xticklabels(kems, rotation=55, ha="right", fontsize=7)
-    ax.set_yticklabels(sigs, fontsize=7)
+    kem_levels = {
+        row.get("kex_group", ""): kem_security_level(row) for row in rows
+    }
+    sig_levels = {
+        row.get("cert_sig_alg", ""): signature_security_level(row)
+        for row in rows
+    }
+    ax.set_xticklabels(
+        [algorithm_label(kem, kem_levels.get(kem)) for kem in kems],
+        rotation=55, ha="right", fontsize=7,
+    )
+    ax.set_yticklabels(
+        [algorithm_label(sig, sig_levels.get(sig)) for sig in sigs],
+        fontsize=7,
+    )
     median = np.nanmedian(matrix)
     for row_idx in range(len(sigs)):
         for col_idx in range(len(kems)):
@@ -452,8 +735,21 @@ def plot_percent_heatmap(
     ax.set_ylabel("Certificate signature algorithm")
     ax.set_xticks(range(len(kems)))
     ax.set_yticks(range(len(sigs)))
-    ax.set_xticklabels(kems, rotation=55, ha="right", fontsize=7)
-    ax.set_yticklabels(sigs, fontsize=7)
+    kem_levels = {
+        row.get("kex_group", ""): kem_security_level(row) for row in rows
+    }
+    sig_levels = {
+        row.get("cert_sig_alg", ""): signature_security_level(row)
+        for row in rows
+    }
+    ax.set_xticklabels(
+        [algorithm_label(kem, kem_levels.get(kem)) for kem in kems],
+        rotation=55, ha="right", fontsize=7,
+    )
+    ax.set_yticklabels(
+        [algorithm_label(sig, sig_levels.get(sig)) for sig in sigs],
+        fontsize=7,
+    )
     for row_idx in range(len(sigs)):
         for col_idx in range(len(kems)):
             value = matrix[row_idx, col_idx]
@@ -469,6 +765,24 @@ def plot_percent_heatmap(
     fig.savefig(output, dpi=180)
     plt.close(fig)
     return len(values_by_pair)
+
+
+def plot_reconnect_count_heatmap(
+    rows: list[dict[str, str]],
+    output: Path,
+    run_id: str,
+) -> int:
+    return plot_percent_heatmap(
+        rows,
+        "reconnect_count_total",
+        f"Reconnects per case - {run_id}",
+        output,
+        value_suffix="",
+        value_decimals=0,
+        colorbar_label="Reconnects",
+        vmin=0,
+        vmax=None,
+    )
 
 
 def parse_args() -> argparse.Namespace:
@@ -563,6 +877,27 @@ def main() -> int:
                     f"{category}_nist_level_{level}={counts.get(level, 0)}"
                 )
 
+    kem_bar_count = plot_algorithm_metric(
+        plot_rows,
+        algorithm_field="kex_group",
+        level_field="kex_nist_level",
+        metric_field="mean_kem_client_total_ms",
+        title=f"Client KEM execution time - {run_dir.name}",
+        ylabel="Mean client KEM time (ms)",
+        color="#2a9d8f",
+        output=out_dir / f"kem_execution_time.{extension}",
+    )
+    signature_bar_count = plot_algorithm_metric(
+        plot_rows,
+        algorithm_field="cert_sig_alg",
+        level_field="sig_nist_level",
+        metric_field="mean_client_signature_total_ms",
+        title=f"Client digital-signature execution time - {run_dir.name}",
+        ylabel="Mean client signature time (ms)",
+        color="#e9c46a",
+        output=out_dir / f"signature_execution_time.{extension}",
+    )
+
     if args.heatmap:
         plot_heatmap(
             rows,
@@ -597,6 +932,14 @@ def main() -> int:
                 out_dir / f"{filename_prefix}.{extension}",
             )
             print(f"{metric}_heatmap_cells={plotted}")
+        cache_cells = plot_percent_heatmap(
+            rows,
+            "mean_client_icache_hit_percent",
+            f"Client instruction-cache hit rate - {run_dir.name}",
+            out_dir / f"heatmap_client_icache_hit_percent.{extension}",
+            colorbar_label="Mean instruction-cache hit rate (%)",
+        )
+        print(f"mean_client_icache_hit_percent_heatmap_cells={cache_cells}")
         heap_bytes_cells = plot_percent_heatmap(
             rows,
             "max_client_heap_peak_bytes",
@@ -609,10 +952,19 @@ def main() -> int:
             vmax=None,
         )
         print(f"max_client_heap_peak_bytes_heatmap_cells={heap_bytes_cells}")
-        print("heatmaps=6")
+        reconnect_rows = load_reconnect_count_rows(run_dir)
+        reconnect_cells = plot_reconnect_count_heatmap(
+            reconnect_rows,
+            out_dir / f"heatmap_reconnects.{extension}",
+            run_dir.name,
+        )
+        print(f"reconnect_count_heatmap_cells={reconnect_cells}")
+        print("heatmaps=8")
 
     print(f"rows={len(rows)}")
     print(f"bar_chart_rows={len(plot_rows)}")
+    print(f"kem_algorithm_bars={kem_bar_count}")
+    print(f"signature_algorithm_bars={signature_bar_count}")
     print(f"format={extension}")
     for category, category_rows in categories.items():
         print(f"{category}={len(category_rows)}")

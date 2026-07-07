@@ -7,6 +7,7 @@
 #include <zephyr/debug/thread_analyzer.h>
 #include <zephyr/sys/reboot.h>
 #include <time.h>
+#include <string.h>
 #include <wolfssl/ssl.h>
 #include <wolfssl/wolfcrypt/memory.h>
 #include "benchmark_metrics.h"
@@ -35,7 +36,7 @@
 #define BENCH_OUT(...) printk(__VA_ARGS__)
 
 #define L2CAP_SDU_MTU 672
-#define TLS_RX_RINGBUF_SIZE 16384
+#define TLS_RX_RINGBUF_SIZE 8192
 
 /*
  * Keep wolfSSL's short-lived PQC allocations out of picolibc's process-wide
@@ -280,12 +281,14 @@ static void update_led(bool on)
  * the rest of the TLS record and the board only sees WANT_READ until timeout.
  */
 NET_BUF_POOL_DEFINE(l2cap_tx_pool, 5, BT_L2CAP_BUF_SIZE(L2CAP_SDU_MTU), 8, NULL);
-NET_BUF_POOL_DEFINE(l2cap_rx_pool, 3, BT_L2CAP_BUF_SIZE(L2CAP_SDU_MTU), 8, NULL);
+NET_BUF_POOL_DEFINE(l2cap_rx_pool, 8, BT_L2CAP_BUF_SIZE(L2CAP_SDU_MTU), 8, NULL);
 
 static struct bt_l2cap_le_chan l2cap_chan;
 static volatile bool l2cap_rx_overflow;
 static volatile bool l2cap_peer_disconnected;
+static volatile bool acl_peer_disconnected = true;
 static volatile bool disconnect_requested;
+static struct bt_conn *active_conn;
 static const struct bt_le_conn_param benchmark_conn_params =
     BT_LE_CONN_PARAM_INIT(12, 24, 0, 3200);
 
@@ -299,6 +302,11 @@ static void bt_connected(struct bt_conn *conn, uint8_t err)
         return;
     }
 
+    if (active_conn != NULL) {
+        bt_conn_unref(active_conn);
+    }
+    active_conn = bt_conn_ref(conn);
+    acl_peer_disconnected = false;
     BENCH_LOG("[BLE] ACL connected: %s\n", addr);
     int update_err = bt_conn_le_param_update(conn, &benchmark_conn_params);
     if (update_err != 0 && update_err != -EALREADY) {
@@ -312,7 +320,12 @@ static void bt_disconnected(struct bt_conn *conn, uint8_t reason)
 
     bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
     BENCH_LOG("[BLE] ACL disconnected: %s reason=0x%02x\n", addr, reason);
+    acl_peer_disconnected = true;
     l2cap_peer_disconnected = true;
+    if (active_conn == conn) {
+        bt_conn_unref(active_conn);
+        active_conn = NULL;
+    }
     k_sem_give(&rx_sem);
 }
 
@@ -967,42 +980,46 @@ int main(void) {
         
         BENCH_LOG("Session ended. Re-arming for next connection...\n");
 
-#if BENCH_REBOOT_AFTER_SESSION
         /*
-         * The nRF52840/BlueZ path is much more reliable when each benchmark
-         * starts from the board's boot-time advertising state.  Reboot only
-         * after the result line has been printed and TLS cleanup has run, so
-         * measurements are preserved while the next discovery avoids a stale
-         * controller/channel state.
+         * Close the ACL before any reboot. Resetting the nRF controller while
+         * BlueZ still owns an LE CoC can leave stale credits behind for the
+         * next large TLS flight.
          */
-        BENCH_OUT("[BENCH_RECOVERY] reason=session_complete action=reboot\n");
-        k_msleep(100);
-        sys_reboot(SYS_REBOOT_COLD);
-#endif
-        
-        /* 1. Only request disconnect if the peer hasn't already dropped us */
-        if (l2cap_chan.chan.conn && !l2cap_peer_disconnected) {
+        struct bt_conn *conn_to_disconnect =
+            active_conn != NULL ? bt_conn_ref(active_conn) : NULL;
+        if (conn_to_disconnect != NULL && !acl_peer_disconnected) {
             int disconnect_err = bt_conn_disconnect(
-                l2cap_chan.chan.conn, BT_HCI_ERR_REMOTE_USER_TERM_CONN);
+                conn_to_disconnect, BT_HCI_ERR_REMOTE_USER_TERM_CONN);
             BENCH_LOG("ACL disconnect requested: %d\n", disconnect_err);
+        }
+        if (conn_to_disconnect != NULL) {
+            bt_conn_unref(conn_to_disconnect);
         }
 
         /* Never let a missed controller callback poison every later block. */
         int64_t disconnect_deadline = k_uptime_get() + 5000;
-        while (!l2cap_peer_disconnected &&
+        while (!acl_peer_disconnected &&
                k_uptime_get() < disconnect_deadline) {
             k_sleep(K_MSEC(100));
         }
-        if (!l2cap_peer_disconnected) {
+
+#if BENCH_REBOOT_AFTER_SESSION
+        BENCH_OUT("[BENCH_RECOVERY] reason=session_complete action=reboot\n");
+        k_msleep(100);
+        sys_reboot(SYS_REBOOT_COLD);
+#endif
+
+        if (!acl_peer_disconnected) {
             BENCH_OUT("[BENCH_RECOVERY] reason=disconnect_timeout action=reboot\n");
             k_sleep(K_MSEC(50));
             sys_reboot(SYS_REBOOT_COLD);
         }
 
-        /* 3. Erase the ghost pointer so Zephyr frees the Bluetooth context */
-        l2cap_chan.chan.conn = NULL;
+        memset(&l2cap_chan, 0, sizeof(l2cap_chan));
+        l2cap_chan.chan.ops = &l2cap_ops;
+        l2cap_chan.rx.mtu = L2CAP_SDU_MTU;
         
-        /* 4. Brief cooldown before firing up the radio again */
+        /* Brief cooldown before firing up the radio again. */
         k_sleep(K_MSEC(500));
     }
     

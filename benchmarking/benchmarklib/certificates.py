@@ -336,6 +336,11 @@ def generate_hash_based_server_case(
 
 def write_case_configs(case: dict[str, str], output: Path) -> None:
     kem = KEMS_BY_NAME[case["kex_group"]]
+    max_send_fragment = (
+        "MaxSendFragment = 2048\n"
+        if case.get("cert_sig_alg", "").startswith("SLH-DSA-SHAKE-")
+        else ""
+    )
     (output / "openssl.cnf").write_text(
         "openssl_conf = openssl_init\n\n"
         "[openssl_init]\nproviders = provider_sect\nssl_conf = ssl_sect\n\n"
@@ -346,6 +351,7 @@ def write_case_configs(case: dict[str, str], output: Path) -> None:
         "[ssl_sect]\nsystem_default = system_default_sect\n\n"
         "[system_default_sect]\nMinProtocol = TLSv1.3\n"
         f"Groups = {kem.openssl_group}\n"
+        f"{max_send_fragment}"
         "ClientSignatureAlgorithms = ECDSA+SHA256\n"
     )
     (output / "mosquitto.conf").write_text(

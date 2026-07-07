@@ -22,6 +22,7 @@ from run_benchmarks import (
     load_config,
     normalize_ble_addr,
     parse_args,
+    needs_large_rsa_firmware,
     resolve_pi_workdir,
     resolve_serial_device,
     read_checkpoint,
@@ -270,17 +271,33 @@ class BenchmarkTests(unittest.TestCase):
 
         self.assertIn("Groups = P-521\n", openssl_config)
         self.assertIn("ClientSignatureAlgorithms = ECDSA+SHA256\n", openssl_config)
+        self.assertNotIn("MaxSendFragment", openssl_config)
+
+    def test_slh_openssl_server_uses_smaller_tls_records(self) -> None:
+        case = {
+            "kex_group": "ECDHE-P-521",
+            "cert_sig_alg": "SLH-DSA-SHAKE-256s",
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output = Path(tmpdir)
+            write_case_configs(case, output)
+            openssl_config = (output / "openssl.cnf").read_text()
+
+        self.assertIn("Groups = P-521\n", openssl_config)
+        self.assertIn("MaxSendFragment = 2048\n", openssl_config)
 
     def test_server_backend_policy_routes_hash_based_signatures(self) -> None:
         classic = {"cert_sig_alg": "ECDSA-P-256"}
         lms = {"cert_sig_alg": "LMS-HSS-L2-H10-W4"}
         xmss = {"cert_sig_alg": "XMSS-SHA2_20_256"}
+        slh = {"cert_sig_alg": "SLH-DSA-SHAKE-256s"}
 
         self.assertEqual(
             server_backend_for_case(classic, "auto"), "openssl-mosquitto"
         )
         self.assertEqual(server_backend_for_case(lms, "auto"), "wolfssl")
         self.assertEqual(server_backend_for_case(xmss, "auto"), "wolfssl")
+        self.assertEqual(server_backend_for_case(slh, "auto"), "openssl-mosquitto")
         self.assertEqual(server_backend_for_case(classic, "wolfssl"), "wolfssl")
         self.assertEqual(
             server_backend_for_case(classic, "openssl-mosquitto"),
@@ -288,6 +305,15 @@ class BenchmarkTests(unittest.TestCase):
         )
         self.assertIsNone(server_backend_for_case(lms, "openssl-mosquitto"))
         self.assertIsNone(server_backend_for_case(xmss, "openssl-mosquitto"))
+        self.assertEqual(
+            server_backend_for_case(slh, "openssl-mosquitto"),
+            "openssl-mosquitto",
+        )
+
+    def test_rsa_7680_uses_large_rsa_firmware(self) -> None:
+        self.assertFalse(needs_large_rsa_firmware({"cert_sig_alg": "RSA-PSS-3072"}))
+        self.assertTrue(needs_large_rsa_firmware({"cert_sig_alg": "RSA-PSS-7680"}))
+        self.assertTrue(needs_large_rsa_firmware({"cert_sig_alg": "RSA-PSS-15360"}))
 
     def test_structured_metric_parser(self) -> None:
         parsed = parse_bench_line(

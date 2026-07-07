@@ -259,7 +259,8 @@ def case_metadata(case: dict[str, str]) -> dict[str, str]:
 
 
 def needs_large_rsa_firmware(case: dict[str, str]) -> bool:
-    return case["cert_sig_alg"] == "RSA-PSS-15360"
+    match = re.fullmatch(r"RSA-PSS-(\d+)", case["cert_sig_alg"])
+    return bool(match and int(match.group(1)) >= 7680)
 
 
 def parse_gateway_metrics(path: Path) -> dict[str, str]:
@@ -489,7 +490,7 @@ def run_job(
             }
         finally:
             gateway.stop_session(
-                case_dir / "gateway-control.log", reset_adapter=True
+                case_dir / "gateway-control.log", reset_adapter=False
             )
             gateway.collect_session_logs(
                 case["case_id"], broker_log, gateway_log,
@@ -1422,6 +1423,7 @@ def main() -> int:
         serial_port = serial.Serial(
             args.serial_device, args.serial_baud, timeout=0.25
         )
+        serial_port.reset_input_buffer()
         try:
             print(
                 f"[board] Waiting for BENCH_READY on {args.serial_device}...",
@@ -1461,6 +1463,7 @@ def main() -> int:
                     serial_port = serial.Serial(
                         args.serial_device, args.serial_baud, timeout=0.25
                     )
+                    serial_port.reset_input_buffer()
                     wait_for_board_ready(
                         serial_port, run_dir / "board.log",
                         args.board_ready_timeout_sec,
