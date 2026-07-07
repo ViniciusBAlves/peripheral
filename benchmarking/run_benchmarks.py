@@ -259,8 +259,11 @@ def case_metadata(case: dict[str, str]) -> dict[str, str]:
 
 
 def needs_large_rsa_firmware(case: dict[str, str]) -> bool:
-    match = re.fullmatch(r"RSA-PSS-(\d+)", case["cert_sig_alg"])
-    return bool(match and int(match.group(1)) >= 7680)
+    return False
+
+
+def is_rsa_pss_case(case: dict[str, str]) -> bool:
+    return bool(re.fullmatch(r"RSA-PSS-\d+", case["cert_sig_alg"]))
 
 
 def parse_gateway_metrics(path: Path) -> dict[str, str]:
@@ -1041,15 +1044,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default="auto",
         help="server TLS backend selection",
     )
-    parser.add_argument(
-        "--reflash-known-unsupported-rsa",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help=(
-            "attempt RSA-PSS-15360 cases using a separately built firmware "
-            "with heap integer math (enabled by default)"
-        ),
-    )
     args = parser.parse_args(argv)
     if bool(args.cases) == bool(args.resume):
         parser.error("provide exactly one of --cases or --resume")
@@ -1093,9 +1087,6 @@ def main() -> int:
             saved_config = json.loads(saved_config_path.read_text())
             args.mlkem_backend = saved_config["mlkem_backend"]
             args.server_backend = saved_config["server_backend"]
-            args.reflash_known_unsupported_rsa = saved_config[
-                "reflash_known_unsupported_rsa"
-            ]
         checkpoint = read_checkpoint(run_dir)
         last_completed_execution_order = int(
             checkpoint.get("last_completed_execution_order", 0)
@@ -1130,7 +1121,6 @@ def main() -> int:
             "sessions_per_case": args.sessions_per_case,
             "mlkem_backend": args.mlkem_backend,
             "server_backend": args.server_backend,
-            "reflash_known_unsupported_rsa": args.reflash_known_unsupported_rsa,
         }, indent=2) + "\n")
         shutil.copy2(args.cases, run_dir / "input_cases.csv")
         manifest = [
@@ -1175,17 +1165,6 @@ def main() -> int:
             "updated_at": datetime.now().astimezone().isoformat(),
         }, indent=2) + "\n")
         last_completed_execution_order = 0
-    has_large_rsa = any(needs_large_rsa_firmware(case) for case in cases)
-    if (
-        args.reflash_known_unsupported_rsa
-        and has_large_rsa
-        and (args.skip_build or args.skip_flash)
-    ):
-        raise ValueError(
-            "selected RSA-PSS-15360 cases require the default large-RSA "
-            "firmware fallback; do not use --skip-build or --skip-flash, or "
-            "disable execution with --no-reflash-known-unsupported-rsa"
-        )
     print(
         f"[selection] cases={len(cases)}"
         + (f" limit={args.limit}" if args.limit is not None else ""),
@@ -1211,12 +1190,7 @@ def main() -> int:
         summaries = [
             {
                 "case_id": case["case_id"], "mlkem_backend": args.mlkem_backend,
-                "rsa_profile": (
-                    "integer-heap-16384"
-                    if args.reflash_known_unsupported_rsa
-                    and needs_large_rsa_firmware(case)
-                    else "fast-math"
-                ),
+                "rsa_profile": "fast-math",
                 **case_metadata(case),
                 "status": "dry_run", "success_count": 0, "fail_count": 0,
                 "timeout_count": 0, "unsupported_count": 0,
@@ -1246,13 +1220,6 @@ def main() -> int:
     server_backends: dict[str, str] = {}
     signature_templates: dict[str, Path] = {}
     for case in cases:
-        retry_large_rsa = (
-            args.reflash_known_unsupported_rsa
-            and needs_large_rsa_firmware(case)
-        )
-        if case["expected_support"] == "known_unsupported" and not retry_large_rsa:
-            unsupported[case["case_id"]] = case["notes"] or "known unsupported case"
-            continue
         server_backend = server_backend_for_case(case, args.server_backend)
         if server_backend is None:
             unsupported[case["case_id"]] = unsupported_backend_reason(
@@ -1282,33 +1249,16 @@ def main() -> int:
 
     if not supported:
         raise RuntimeError("none of the selected cases passed certificate preparation")
-    normal_cases = [
-        case for case in supported if not needs_large_rsa_firmware(case)
-    ]
-    large_rsa_cases = [
-        case for case in supported if needs_large_rsa_firmware(case)
-    ]
     generated_root = WORK / "generated" / run_id
     normal_generated_dir = generated_root / "fast-math"
-    large_rsa_generated_dir = generated_root / "integer-heap-16384"
-    if normal_cases:
-        generate_universal_header(
-            client_dir,
-            [
-                (case["case_id"], case_dirs[case["case_id"]] / "generated")
-                for case in normal_cases
-            ],
-            normal_generated_dir / "benchmark_credentials.h",
-        )
-    if large_rsa_cases:
-        generate_universal_header(
-            client_dir,
-            [
-                (case["case_id"], case_dirs[case["case_id"]] / "generated")
-                for case in large_rsa_cases
-            ],
-            large_rsa_generated_dir / "benchmark_credentials.h",
-        )
+    generate_universal_header(
+        client_dir,
+        [
+            (case["case_id"], case_dirs[case["case_id"]] / "generated")
+            for case in supported
+        ],
+        normal_generated_dir / "benchmark_credentials.h",
+    )
     build_dir = WORK / "firmware-build" / run_id
     pqm4_dir = None
     if args.mlkem_backend.startswith("pqm4-"):
@@ -1317,7 +1267,7 @@ def main() -> int:
         ensure_pqm4(pqm4_dir, run_dir / "build.log")
     normal_build_ready = (build_dir / "zephyr/zephyr.hex").exists()
     if (
-        normal_cases
+        supported
         and not args.skip_build
         and not (resuming and normal_build_ready)
     ):
@@ -1331,45 +1281,14 @@ def main() -> int:
             large_rsa=False,
         )
         print("[firmware] Build completed.", flush=True)
-    large_rsa_build_dir = WORK / "firmware-build" / f"{run_id}-large-rsa"
-    large_rsa_build_ready = (
-        large_rsa_build_dir / "zephyr/zephyr.hex"
-    ).exists()
-    if (
-        args.reflash_known_unsupported_rsa
-        and large_rsa_cases
-        and not args.skip_build
-        and not (resuming and large_rsa_build_ready)
-    ):
-        print(
-            f"[firmware] Building RSA-16384 image; log={run_dir / 'build-large-rsa.log'}",
-            flush=True,
-        )
-        build_firmware(
-            firmware_dir=ROOT / "firmware", build_dir=large_rsa_build_dir,
-            generated_dir=large_rsa_generated_dir,
-            log=run_dir / "build-large-rsa.log",
-            nrfutil=args.nrfutil, ncs_version=args.ncs_version,
-            ncs_chdir=args.ncs_chdir, board=args.board,
-            mlkem_backend=args.mlkem_backend, pqm4_dir=pqm4_dir,
-            large_rsa=True,
-        )
-        print("[firmware] RSA-16384 build completed.", flush=True)
-    initial_large_rsa = (
-        args.reflash_known_unsupported_rsa
-        and needs_large_rsa_firmware(case_by_id[scheduled_jobs[0][1].case_id])
-        and scheduled_jobs[0][1].case_id not in unsupported
-    )
-    initial_build_dir = large_rsa_build_dir if initial_large_rsa else build_dir
     if not args.skip_flash:
         print(
-            f"[firmware] Flashing nRF52840 profile="
-            f"{'integer-heap-16384' if initial_large_rsa else 'fast-math'}; "
+            f"[firmware] Flashing nRF52840 profile=fast-math; "
             f"log={run_dir / 'flash.log'}",
             flush=True,
         )
         flash_firmware(
-            build_dir=initial_build_dir, log=run_dir / "flash.log",
+            build_dir=build_dir, log=run_dir / "flash.log",
             nrfutil=args.nrfutil, ncs_version=args.ncs_version,
             ncs_chdir=args.ncs_chdir,
         )
@@ -1385,7 +1304,7 @@ def main() -> int:
     atexit.register(gateway.stop_master)
     print(f"[gateway] Preparing Raspberry Pi bridge; log={run_dir / 'gateway.log'}", flush=True)
     wolfssl_archives = list(
-        (initial_build_dir / "_deps" / "wolfssl_upstream-subbuild").glob(
+        (build_dir / "_deps" / "wolfssl_upstream-subbuild").glob(
             "**/dd6da70d395a0cb26446326f329678fe3bfb212c.tar.gz"
         )
     )
@@ -1418,7 +1337,6 @@ def main() -> int:
 
     interrupted = False
     serial_port = None
-    active_large_rsa = initial_large_rsa
     try:
         serial_port = serial.Serial(
             args.serial_device, args.serial_baud, timeout=0.25
@@ -1435,40 +1353,6 @@ def main() -> int:
             print("[board] Firmware is ready.", flush=True)
             for execution_order, job in scheduled_jobs:
                 case = case_by_id[job.case_id]
-                desired_large_rsa = (
-                    args.reflash_known_unsupported_rsa
-                    and needs_large_rsa_firmware(case)
-                    and job.case_id not in unsupported
-                )
-                if desired_large_rsa != active_large_rsa:
-                    profile = (
-                        "integer-heap-16384" if desired_large_rsa else "fast-math"
-                    )
-                    print(
-                        f"[firmware] Schedule profile changed; reflashing {profile}...",
-                        flush=True,
-                    )
-                    gateway.stop_session(run_dir / "gateway.log")
-                    serial_port.close()
-                    flash_firmware(
-                        build_dir=(
-                            large_rsa_build_dir if desired_large_rsa else build_dir
-                        ),
-                        log=run_dir / f"flash-{profile}.log",
-                        nrfutil=args.nrfutil,
-                        ncs_version=args.ncs_version,
-                        ncs_chdir=args.ncs_chdir,
-                    )
-                    time.sleep(1.0)
-                    serial_port = serial.Serial(
-                        args.serial_device, args.serial_baud, timeout=0.25
-                    )
-                    serial_port.reset_input_buffer()
-                    wait_for_board_ready(
-                        serial_port, run_dir / "board.log",
-                        args.board_ready_timeout_sec,
-                    )
-                    active_large_rsa = desired_large_rsa
                 timeout = timeout_for_case(case, args.attempt_timeout_sec)
                 print(
                     f"[{execution_order}/{len(jobs)}] {job.case_id} "
@@ -1497,9 +1381,7 @@ def main() -> int:
                         len(attempts[job.case_id]) + 1,
                     )
                 row["mlkem_backend"] = args.mlkem_backend
-                row["rsa_profile"] = (
-                    "integer-heap-16384" if desired_large_rsa else "fast-math"
-                )
+                row["rsa_profile"] = "fast-math"
                 attempts[job.case_id].append(row)
                 write_csv(
                     case_dirs[job.case_id] / "attempts.csv",
@@ -1524,13 +1406,7 @@ def main() -> int:
     summaries = [summarize(case, attempts[case["case_id"]]) for case in cases]
     for row in summaries:
         row["mlkem_backend"] = args.mlkem_backend
-        case = case_by_id[row["case_id"]]
-        row["rsa_profile"] = (
-            "integer-heap-16384"
-            if args.reflash_known_unsupported_rsa
-            and needs_large_rsa_firmware(case)
-            else "fast-math"
-        )
+        row["rsa_profile"] = "fast-math"
     write_csv(run_dir / "summary.csv", SUMMARY_FIELDS, summaries)
     print(f"results={run_dir}")
     return 130 if interrupted else 0

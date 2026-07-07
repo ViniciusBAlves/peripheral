@@ -138,7 +138,6 @@ def build(
     cmake_args = [
         f"-DBENCH_GENERATED_DIR={generated_dir}",
         f"-DBENCH_MLKEM_BACKEND={mlkem_backend}",
-        f"-DBENCH_LARGE_RSA={'ON' if large_rsa else 'OFF'}",
     ]
     if pqm4_dir is not None:
         cmake_args.append(f"-DPQM4_ROOT={pqm4_dir}")

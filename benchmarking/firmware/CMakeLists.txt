@@ -5,7 +5,6 @@ project(peripheral)
 
 set(BENCH_MLKEM_BACKEND "pqm4-m4fstack" CACHE STRING "ML-KEM implementation")
 set_property(CACHE BENCH_MLKEM_BACKEND PROPERTY STRINGS wolfssl pqm4-m4fstack)
-option(BENCH_LARGE_RSA "Use heap integer math for RSA keys above 8192 bits" OFF)
 
 if(NOT DEFINED BENCH_GENERATED_DIR)
     message(FATAL_ERROR "BENCH_GENERATED_DIR must contain benchmark_credentials.h")
@@ -179,23 +178,30 @@ string(REPLACE
 file(WRITE "${WOLFSSL_TLS13_C}" "${WOLFSSL_TLS13_TEXT}")
 
 # This pinned wolfSSL revision sizes two classic RSA ASN/TLS buffers for
-# RSA-4096 when fast math is disabled. Patch only the disposable FetchContent
-# copy used by the large-RSA image; the normal image and NCS stay untouched.
-if(BENCH_LARGE_RSA)
-    set(WOLFSSL_TYPES_H "${WOLFSSL_ROOT_DIR}/wolfssl/wolfcrypt/types.h")
-    file(READ "${WOLFSSL_TYPES_H}" WOLFSSL_TYPES_TEXT)
-    string(REPLACE
-        "MAX_ENCODED_CLASSIC_SIG_SZ = 512,     /* Supports 4096 bit keys */"
-        "MAX_ENCODED_CLASSIC_SIG_SZ = RSA_MAX_SIZE / 8,"
-        WOLFSSL_TYPES_TEXT "${WOLFSSL_TYPES_TEXT}"
-    )
-    string(REPLACE
-        "MAX_RSA_INT_SZ      = (512 + 1 + MAX_LENGTH_SZ), /* RSA raw sz 4096 for bits + tag + len(5) */"
-        "MAX_RSA_INT_SZ      = (RSA_MAX_SIZE / 8 + 1 + MAX_LENGTH_SZ),"
-        WOLFSSL_TYPES_TEXT "${WOLFSSL_TYPES_TEXT}"
-    )
-    file(WRITE "${WOLFSSL_TYPES_H}" "${WOLFSSL_TYPES_TEXT}")
-endif()
+# RSA-4096 by default. Patch only the disposable FetchContent copy so the
+# fast-math image can parse and encode RSA-PSS-15360 material.
+set(WOLFSSL_TYPES_H "${WOLFSSL_ROOT_DIR}/wolfssl/wolfcrypt/types.h")
+file(READ "${WOLFSSL_TYPES_H}" WOLFSSL_TYPES_TEXT)
+string(REPLACE
+    "MAX_ENCODED_CLASSIC_SIG_SZ = 512,     /* Supports 4096 bit keys */"
+    "MAX_ENCODED_CLASSIC_SIG_SZ = RSA_MAX_SIZE / 8,"
+    WOLFSSL_TYPES_TEXT "${WOLFSSL_TYPES_TEXT}"
+)
+string(REPLACE
+    "MAX_RSA_INT_SZ      = (512 + 1 + MAX_LENGTH_SZ), /* RSA raw sz 4096 for bits + tag + len(5) */"
+    "MAX_RSA_INT_SZ      = (RSA_MAX_SIZE / 8 + 1 + MAX_LENGTH_SZ),"
+    WOLFSSL_TYPES_TEXT "${WOLFSSL_TYPES_TEXT}"
+)
+file(WRITE "${WOLFSSL_TYPES_H}" "${WOLFSSL_TYPES_TEXT}")
+
+set(WOLFSSL_INTERNAL_H "${WOLFSSL_ROOT_DIR}/wolfssl/internal.h")
+file(READ "${WOLFSSL_INTERNAL_H}" WOLFSSL_INTERNAL_TEXT)
+string(REPLACE
+    "#define ENCRYPT_BASE_BITS  8192"
+    "#define ENCRYPT_BASE_BITS  (FP_MAX_BITS / 2)"
+    WOLFSSL_INTERNAL_TEXT "${WOLFSSL_INTERNAL_TEXT}"
+)
+file(WRITE "${WOLFSSL_INTERNAL_H}" "${WOLFSSL_INTERNAL_TEXT}")
 
 # 1. Bind EVERYTHING directly to the 'app' target
 target_sources(app PRIVATE src/main.c src/benchmark_metrics.c
@@ -220,7 +226,7 @@ target_sources(app PRIVATE src/main.c src/benchmark_metrics.c
     ${WOLFSSL_ROOT_DIR}/wolfcrypt/src/aes.c
     ${WOLFSSL_ROOT_DIR}/wolfcrypt/src/ecc.c
     # Keep ECC on wolfSSL's Cortex-M SP backend. TFM remains available below
-    # with FP_MAX_BITS=16384 for the intentionally oversized RSA cases.
+    # with FP_MAX_BITS=32768 for the intentionally oversized RSA cases.
     ${WOLFSSL_ROOT_DIR}/wolfcrypt/src/sp_cortexm.c
     ${WOLFSSL_ROOT_DIR}/wolfcrypt/src/curve25519.c
     ${WOLFSSL_ROOT_DIR}/wolfcrypt/src/rsa.c
@@ -268,21 +274,14 @@ target_include_directories(app PRIVATE
 # CRITICAL FIX: Target-specific definitions and includes (NOT Global)
 target_compile_definitions(app PRIVATE
     WOLFSSL_USER_SETTINGS
-    FP_MAX_BITS=16384
+    FP_MAX_BITS=32768
     BENCHMARK_CLOSE_AFTER_TLS=0
 )
 target_compile_options(app PRIVATE -include ${CMAKE_CURRENT_SOURCE_DIR}/user_settings.h)
 
-if(BENCH_LARGE_RSA)
-    target_compile_definitions(app PRIVATE
-        BENCH_LARGE_RSA
-        BENCH_RSA_PROFILE_NAME="integer-heap-16384"
-    )
-else()
-    target_compile_definitions(app PRIVATE
-        BENCH_RSA_PROFILE_NAME="fast-math"
-    )
-endif()
+target_compile_definitions(app PRIVATE
+    BENCH_RSA_PROFILE_NAME="fast-math"
+)
 
 if(BENCH_MLKEM_BACKEND STREQUAL "pqm4-m4fstack")
     if(NOT DEFINED PQM4_ROOT OR

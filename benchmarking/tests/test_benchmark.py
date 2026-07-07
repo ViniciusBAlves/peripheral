@@ -49,15 +49,21 @@ class BenchmarkTests(unittest.TestCase):
         self.assertEqual(sum(job.warmup for job in jobs), 2)
 
     def test_known_unsupported_cases_are_grouped_at_schedule_end(self) -> None:
-        cases = build_cases(2, 1, False)
-        normal = next(
-            case for case in cases
-            if case["expected_support"] != "known_unsupported"
-        )
+        normal = {
+            "case_id": "normal",
+            "warmup_iterations": "1",
+            "iterations": "2",
+            "expected_support": "required",
+        }
         unsupported = [
-            case for case in cases
-            if case["expected_support"] == "known_unsupported"
-        ][:2]
+            {
+                "case_id": f"unsupported_{index}",
+                "warmup_iterations": "1",
+                "iterations": "2",
+                "expected_support": "known_unsupported",
+            }
+            for index in range(2)
+        ]
         jobs = build_jobs(
             [normal, *unsupported], seed=123, sessions_per_case=2
         )
@@ -106,15 +112,13 @@ class BenchmarkTests(unittest.TestCase):
         self.assertEqual(args.ble_addr, normalize_ble_addr(config["ble-addr"]))
         self.assertEqual(args.mlkem_backend, "pqm4-m4fstack")
         self.assertEqual(args.server_backend, "auto")
-        self.assertTrue(args.reflash_known_unsupported_rsa)
 
         overridden = parse_args([
             "--cases", "cases.csv", "--serial-device", "/dev/ttyUSB9",
-            "--server-backend", "wolfssl", "--no-reflash-known-unsupported-rsa",
+            "--server-backend", "wolfssl",
         ])
         self.assertEqual(overridden.serial_device, "/dev/ttyUSB9")
         self.assertEqual(overridden.server_backend, "wolfssl")
-        self.assertFalse(overridden.reflash_known_unsupported_rsa)
 
     def test_resume_cli_does_not_require_cases(self) -> None:
         args = parse_args(["--resume", "run-123"])
@@ -310,10 +314,10 @@ class BenchmarkTests(unittest.TestCase):
             "openssl-mosquitto",
         )
 
-    def test_rsa_7680_uses_large_rsa_firmware(self) -> None:
+    def test_rsa_pss_uses_fast_math_firmware(self) -> None:
         self.assertFalse(needs_large_rsa_firmware({"cert_sig_alg": "RSA-PSS-3072"}))
-        self.assertTrue(needs_large_rsa_firmware({"cert_sig_alg": "RSA-PSS-7680"}))
-        self.assertTrue(needs_large_rsa_firmware({"cert_sig_alg": "RSA-PSS-15360"}))
+        self.assertFalse(needs_large_rsa_firmware({"cert_sig_alg": "RSA-PSS-7680"}))
+        self.assertFalse(needs_large_rsa_firmware({"cert_sig_alg": "RSA-PSS-15360"}))
 
     def test_structured_metric_parser(self) -> None:
         parsed = parse_bench_line(

@@ -290,7 +290,7 @@ static volatile bool acl_peer_disconnected = true;
 static volatile bool disconnect_requested;
 static struct bt_conn *active_conn;
 static const struct bt_le_conn_param benchmark_conn_params =
-    BT_LE_CONN_PARAM_INIT(12, 24, 0, 3200);
+    BT_LE_CONN_PARAM_INIT(9, 12, 0, 3200);
 
 static void bt_connected(struct bt_conn *conn, uint8_t err)
 {
