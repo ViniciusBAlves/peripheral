@@ -28,6 +28,9 @@ from generate_cases import FIELDS as INPUT_FIELDS
 ROOT = Path(__file__).resolve().parent
 RESULTS = ROOT / "results"
 WORK = ROOT / "work"
+WOLFSSL_COMPAT_CFLAGS = (
+    "-DFP_MAX_BITS=32768 -DRSA_MAX_SIZE=16384 -DWC_MAX_RSA_BITS=16384"
+)
 
 ATTEMPT_FIELDS = [
     "attempt_index", "component", "owner", "cert_sig_alg", "sig_family",
@@ -37,7 +40,8 @@ ATTEMPT_FIELDS = [
     "server_intermediate_crt_bytes", "server_leaf_crt_bytes",
     "server_chain_crt_bytes", "server_key_bytes",
     "client_ca_crt_bytes", "client_cert_crt_bytes", "client_key_bytes",
-    "output_total_bytes", "error_code", "message",
+    "client_csr_der_bytes", "client_csr_pem_bytes", "output_total_bytes",
+    "error_code", "message",
 ]
 
 SUMMARY_FIELDS = [
@@ -48,6 +52,7 @@ SUMMARY_FIELDS = [
     "max_rss_kb", "mean_output_total_bytes",
     "server_chain_crt_bytes", "server_key_bytes",
     "client_cert_crt_bytes", "client_key_bytes",
+    "client_csr_der_bytes", "client_csr_pem_bytes",
 ]
 
 MEASURE_EXEC_C = r"""
@@ -279,10 +284,10 @@ static int write_file(const char* path, const unsigned char* data, int len)
     return 0;
 }
 
-static int write_pem_cert(const char* path, const unsigned char* der, int derSz)
+static int write_pem_csr(const char* path, const unsigned char* der, int derSz)
 {
     unsigned char pem[DER_CAP * 2];
-    int pemSz = wc_DerToPem(der, derSz, pem, sizeof(pem), CERT_TYPE);
+    int pemSz = wc_DerToPem(der, derSz, pem, sizeof(pem), CERTREQ_TYPE);
     if (pemSz <= 0)
         return pemSz;
     return write_file(path, pem, pemSz);
@@ -305,17 +310,6 @@ static void set_fixed_validity(Cert* cert)
     cert->afterDateSz = sizeof(CERT_NOT_AFTER) - 1;
 }
 
-static void set_ca_name(Cert* cert)
-{
-    XSTRNCPY(cert->subject.country, "US", CTC_NAME_SIZE);
-    XSTRNCPY(cert->subject.state, "OR", CTC_NAME_SIZE);
-    XSTRNCPY(cert->subject.locality, "Portland", CTC_NAME_SIZE);
-    XSTRNCPY(cert->subject.org, "Peripheral Benchmark", CTC_NAME_SIZE);
-    XSTRNCPY(cert->subject.unit, "TLS Client CA", CTC_NAME_SIZE);
-    XSTRNCPY(cert->subject.commonName, "Peripheral_Benchmark_Client_CA",
-        CTC_NAME_SIZE);
-}
-
 static void set_client_name(Cert* cert)
 {
     XSTRNCPY(cert->subject.country, "US", CTC_NAME_SIZE);
@@ -326,58 +320,41 @@ static void set_client_name(Cert* cert)
     XSTRNCPY(cert->subject.commonName, "nrf52840-benchmark", CTC_NAME_SIZE);
 }
 
-static int make_ca(ecc_key* caKey, WC_RNG* rng, unsigned char* caDer)
+static int make_client_request(ecc_key* clientKey, WC_RNG* rng,
+    unsigned char* csrDer)
 {
-    Cert ca;
-    int caSz;
+    Cert request;
+    int bodySz;
 
-    if (wc_InitCert(&ca) != 0)
+    if (wc_InitCert(&request) != 0)
         return -1;
-    set_ca_name(&ca);
-    set_fixed_validity(&ca);
-    ca.sigType = CTC_SHA256wECDSA;
-    ca.isCA = 1;
-    ca.selfSigned = 1;
-    ca.daysValid = 3650;
-    if (wc_SetKeyUsage(&ca, "keyCertSign,cRLSign") != 0)
+    set_client_name(&request);
+    set_fixed_validity(&request);
+    request.sigType = CTC_SHA256wECDSA;
+    bodySz = wc_MakeCertReq_ex(&request, csrDer, DER_CAP, ECC_TYPE, clientKey);
+    if (bodySz <= 0)
         return -1;
-    if (wc_MakeCert_ex(&ca, caDer, DER_CAP, ECC_TYPE, caKey, rng) <= 0)
-        return -1;
-    caSz = wc_SignCert_ex(ca.bodySz, CTC_SHA256wECDSA, caDer, DER_CAP,
-        ECC_TYPE, caKey, rng);
-    return caSz;
+    return wc_SignCert_ex(bodySz, CTC_SHA256wECDSA, csrDer, DER_CAP,
+        ECC_TYPE, clientKey, rng);
 }
 
-static int make_client(ecc_key* clientKey, WC_RNG* rng,
-    unsigned char* clientDer)
+static int verify_client_request(const unsigned char* csrDer, int csrSz)
 {
-    Cert client;
-    int clientSz;
+    DecodedCert decoded;
+    int ret;
 
-    if (wc_InitCert(&client) != 0)
-        return -1;
-    set_client_name(&client);
-    set_fixed_validity(&client);
-    client.sigType = CTC_SHA256wECDSA;
-    client.selfSigned = 1;
-    client.isCA = 1;
-    client.daysValid = 3650;
-    if (wc_SetKeyUsage(&client, "keyCertSign,cRLSign") != 0)
-        return -1;
-    if (wc_MakeCert_ex(&client, clientDer, DER_CAP, ECC_TYPE, clientKey, rng)
-            <= 0)
-        return -1;
-    clientSz = wc_SignCert_ex(client.bodySz, CTC_SHA256wECDSA, clientDer,
-        DER_CAP, ECC_TYPE, clientKey, rng);
-    return clientSz;
+    wc_InitDecodedCert(&decoded, csrDer, (word32)csrSz, NULL);
+    ret = wc_ParseCert(&decoded, CERTREQ_TYPE, VERIFY, NULL);
+    wc_FreeDecodedCert(&decoded);
+    return ret;
 }
 
 int main(int argc, char** argv)
 {
     char path[1024];
-    unsigned char clientDer[DER_CAP];
+    unsigned char clientCsrDer[DER_CAP];
     unsigned char clientKeyDer[KEY_CAP];
-    int clientSz;
+    int clientCsrSz;
     int clientKeySz;
     int ret = 1;
     const char* outdir;
@@ -398,24 +375,20 @@ int main(int argc, char** argv)
     if (wc_ecc_make_key(&rng, 32, &clientKey) != 0)
         goto cleanup_client;
 
-    clientSz = make_ca(&clientKey, &rng, clientDer);
-    if (clientSz <= 0)
+    clientCsrSz = make_client_request(&clientKey, &rng, clientCsrDer);
+    if (clientCsrSz <= 0)
+        goto cleanup_client;
+    if (verify_client_request(clientCsrDer, clientCsrSz) != 0)
         goto cleanup_client;
     clientKeySz = wc_EccKeyToDer(&clientKey, clientKeyDer, KEY_CAP);
     if (clientKeySz <= 0)
         goto cleanup_client;
 
-    snprintf(path, sizeof(path), "%s/client_ca.der", outdir);
-    if (write_file(path, clientDer, clientSz) != 0)
+    snprintf(path, sizeof(path), "%s/client.csr.der", outdir);
+    if (write_file(path, clientCsrDer, clientCsrSz) != 0)
         goto cleanup_client;
-    snprintf(path, sizeof(path), "%s/client_ca.crt", outdir);
-    if (write_pem_cert(path, clientDer, clientSz) != 0)
-        goto cleanup_client;
-    snprintf(path, sizeof(path), "%s/client_cert.der", outdir);
-    if (write_file(path, clientDer, clientSz) != 0)
-        goto cleanup_client;
-    snprintf(path, sizeof(path), "%s/client.crt", outdir);
-    if (write_pem_cert(path, clientDer, clientSz) != 0)
+    snprintf(path, sizeof(path), "%s/client.csr", outdir);
+    if (write_pem_csr(path, clientCsrDer, clientCsrSz) != 0)
         goto cleanup_client;
     snprintf(path, sizeof(path), "%s/client_key.der", outdir);
     if (write_file(path, clientKeyDer, clientKeySz) != 0)
@@ -443,14 +416,14 @@ cat > /tmp/wolfssl_client_identity.c <<'CLIENT_IDENTITY_C'
 {WOLFSSL_CLIENT_IDENTITY_C}
 CLIENT_IDENTITY_C
 cc -O2 -Wall -Wextra -o /tmp/wolfssl_client_identity \\
-  /tmp/wolfssl_client_identity.c $(pkg-config --cflags --libs wolfssl)
+  /tmp/wolfssl_client_identity.c {WOLFSSL_COMPAT_CFLAGS} \\
+  $(pkg-config --cflags --libs wolfssl)
 """
 
 
 def client_identity_script() -> str:
     return """
 /tmp/wolfssl_client_identity /out
-openssl verify -purpose sslclient -CAfile /out/client_ca.crt /out/client.crt
 """
 
 
@@ -526,6 +499,8 @@ def attempt_row(
         "client_ca_crt_bytes": file_size(output / "client_ca.crt"),
         "client_cert_crt_bytes": file_size(output / "client.crt"),
         "client_key_bytes": file_size(output / "client.key"),
+        "client_csr_der_bytes": file_size(output / "client.csr.der"),
+        "client_csr_pem_bytes": file_size(output / "client.csr"),
         "output_total_bytes": total_size(output),
         "error_code": metrics.get("status", ""),
         "message": message,
@@ -589,6 +564,12 @@ def summarize(rows: list[dict[str, object]]) -> list[dict[str, object]]:
                 success[0]["client_cert_crt_bytes"] if success else ""
             ),
             "client_key_bytes": success[0]["client_key_bytes"] if success else "",
+            "client_csr_der_bytes": (
+                success[0]["client_csr_der_bytes"] if success else ""
+            ),
+            "client_csr_pem_bytes": (
+                success[0]["client_csr_pem_bytes"] if success else ""
+            ),
         })
     return summaries
 
@@ -658,7 +639,7 @@ def main(argv: list[str] | None = None) -> int:
                 case=client_case,
                 signature=signature,
                 builder="wolfssl",
-                generation_scope="client_key_and_self_signed_trust_anchor",
+                generation_scope="client_key_and_certificate_request",
                 output=output,
                 status="success" if rc == 0 else "fail",
                 metrics=metrics,

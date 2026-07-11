@@ -26,11 +26,9 @@ LMS/HSS and XMSS also sign the server certificate chain while keeping an ECDSA
 TLS leaf key. OpenSSL/Mosquitto cannot load those chains for TLS, so the runner
 uses wolfSSL for those cases when `--server-backend auto` is selected.
 
-RSA-PSS-15360 cases are emitted as `known_unsupported` by default because the
-normal wolfSSL `USE_FAST_MATH` profile caps TLS RSA keys at 8192 bits. They are
-not silently substituted with RSA-PSS-7680. The runner handles them by default
-with a separate RSA-16384 firmware profile that disables `USE_FAST_MATH`, as
-described below.
+RSA-PSS-3072, RSA-PSS-7680, and RSA-PSS-15360 all run in the normal wolfSSL
+`USE_FAST_MATH` firmware profile. RSA-PSS-15360 is not silently substituted
+with RSA-PSS-7680.
 
 ## Connection Configuration
 
@@ -115,7 +113,7 @@ Two complete sessions are created per case by default. Every warmup or measured
 attempt for normally supported cases is a separate block shuffled by the run
 seed. Cases marked `known_unsupported` are moved to the end of the schedule.
 Their case order is seeded, but every attempt belonging to one such case stays
-contiguous so the large-RSA firmware profile is flashed only once.
+contiguous.
 
 Use `--limit N` to execute only the first `N` cases after seeded shuffling:
 
@@ -219,39 +217,10 @@ Bluetooth controller, and waits for a fresh `BENCH_READY` marker. The firmware
 also bounds its disconnect wait and reboots itself only if the controller
 teardown callback is lost. This recovery does not rebuild or reflash the board.
 
-The firmware keeps TFM at `FP_MAX_BITS=16384` for RSA-15360 compatibility, but
-routes P-256/P-384/P-521 through wolfSSL's Cortex-M SP-ECC backend. Without
-that split, every ECC operation inherits the oversized TFM representation and
-P-256 handshakes become tens of seconds slower.
-
-### RSA-15360 reflash profile
-
-RSA-PSS-15360 cases automatically use the separate large-RSA firmware profile.
-This is equivalent to passing `--reflash-known-unsupported-rsa` and is enabled
-by default:
-
-```bash
-python benchmarking/run_benchmarks.py \
-  --cases benchmarking/cases/<cases>.csv \
-  --seed 123
-```
-
-The runner creates independent CA bundles and firmware images for:
-
-- `fast-math`: the normal image using `USE_FAST_MATH`;
-- `integer-heap-16384`: disables fast math, enables
-  `USE_INTEGER_HEAP_MATH`, and raises `RSA_MAX_SIZE`,
-  `WC_MAX_RSA_BITS`, and the pinned wolfSSL ASN/TLS buffers to 16384 bits.
-
-The runner executes the normal shuffled schedule first. It then flashes the
-large-RSA image once and runs every RSA-PSS-15360 case at the end, with all
-attempts of each case contiguous. The profile is recorded in `attempts.csv`,
-`summary.csv`, and the serial readiness marker.
-
-This fallback cannot be combined with `--skip-build` or `--skip-flash` when
-large-RSA cases are selected. Pass `--no-reflash-known-unsupported-rsa` to
-retain the old behavior of recording those cases as unsupported without
-executing them.
+The firmware keeps `FP_MAX_BITS=32768` and patches wolfSSL's disposable
+FetchContent copy so the single `fast-math` image can parse and encode
+RSA-PSS-15360 material. P-256/P-384/P-521 continue to route through wolfSSL's
+Cortex-M SP-ECC backend so ECC does not inherit oversized TFM arithmetic.
 
 ### Default pqm4 ML-KEM backend
 

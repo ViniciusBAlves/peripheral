@@ -96,6 +96,7 @@ RUN git init /tmp/wolfssl \
 
 COPY tools/hbs_certgen.c /tmp/hbs_certgen.c
 RUN cc -O2 -Wall -Wextra -DWOLFSSL_HAVE_XMSS \
+        -DFP_MAX_BITS=32768 -DRSA_MAX_SIZE=16384 -DWC_MAX_RSA_BITS=16384 \
         -o /usr/local/bin/hbs_certgen /tmp/hbs_certgen.c \
         $(pkg-config --cflags --libs wolfssl) \
     && rm -f /tmp/hbs_certgen.c

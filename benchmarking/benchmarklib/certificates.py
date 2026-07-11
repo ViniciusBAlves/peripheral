@@ -12,7 +12,7 @@ from .algorithms import KEMS_BY_NAME, SIGNATURES_BY_NAME, Signature, slug
 from .server_backends import HASH_BASED_SIGNATURES
 
 
-IMAGE = "peripheral-pqc-openssl:3.5"
+IMAGE = "peripheral-pqc-openssl:3.6"
 ROOT = Path(__file__).resolve().parents[1]
 CERT_CACHE = ROOT / "work" / "certificate-cache" / "v3"
 LEGACY_CERT_CACHES = (ROOT / "work" / "certificate-cache" / "v1",)
