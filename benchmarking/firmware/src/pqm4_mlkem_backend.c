@@ -81,6 +81,7 @@ static const struct pqm4_level *level_from_key(const MlKemKey *key)
 static int make_key(MlKemKey *key)
 {
     const struct pqm4_level *level = level_from_key(key);
+    benchmark_timepoint_t metric_start;
     uint8_t *pk = NULL;
     uint8_t *sk = NULL;
     int ret = CRYPTOCB_UNAVAILABLE;
@@ -88,15 +89,14 @@ static int make_key(MlKemKey *key)
     if (!level) {
         return ret;
     }
+    metric_start = benchmark_crypto_metric_start(BENCH_CRYPTO_KEM_KEYGEN);
     pk = XMALLOC(level->public_len, key->heap, DYNAMIC_TYPE_TMP_BUFFER);
     sk = XMALLOC(level->private_len, key->heap, DYNAMIC_TYPE_TMP_BUFFER);
     if (!pk || !sk) {
         ret = MEMORY_E;
         goto out;
     }
-    benchmark_timepoint_t metric_start = benchmark_metric_start();
     ret = level->keypair(pk, sk);
-    benchmark_metric_stop(BENCH_CRYPTO_KEM_KEYGEN, metric_start);
     if (ret == 0) {
         ret = wc_MlKemKey_DecodePrivateKey(key, sk, level->private_len);
     }
@@ -109,6 +109,7 @@ out:
         XMEMSET(sk, 0, level->private_len);
         XFREE(sk, key->heap, DYNAMIC_TYPE_TMP_BUFFER);
     }
+    benchmark_metric_stop(BENCH_CRYPTO_KEM_KEYGEN, metric_start);
     return ret;
 }
 
@@ -116,6 +117,7 @@ static int encapsulate(MlKemKey *key, uint8_t *ct, word32 ct_len,
                        uint8_t *ss, word32 ss_len)
 {
     const struct pqm4_level *level = level_from_key(key);
+    benchmark_timepoint_t metric_start;
     uint8_t *pk;
     int ret;
 
@@ -126,18 +128,22 @@ static int encapsulate(MlKemKey *key, uint8_t *ct, word32 ct_len,
         ss_len != WC_ML_KEM_SS_SZ) {
         return BUFFER_E;
     }
+    metric_start = benchmark_crypto_metric_start(BENCH_CRYPTO_KEM_ENCAPSULATE);
     pk = XMALLOC(level->public_len, key->heap, DYNAMIC_TYPE_TMP_BUFFER);
     if (!pk) {
-        return MEMORY_E;
+        ret = MEMORY_E;
+        goto out;
     }
     ret = wc_MlKemKey_EncodePublicKey(key, pk, level->public_len);
     if (ret == 0) {
-        benchmark_timepoint_t metric_start = benchmark_metric_start();
         ret = level->encapsulate(ct, ss, pk);
-        benchmark_metric_stop(BENCH_CRYPTO_KEM_ENCAPSULATE, metric_start);
     }
-    XMEMSET(pk, 0, level->public_len);
-    XFREE(pk, key->heap, DYNAMIC_TYPE_TMP_BUFFER);
+out:
+    if (pk) {
+        XMEMSET(pk, 0, level->public_len);
+        XFREE(pk, key->heap, DYNAMIC_TYPE_TMP_BUFFER);
+    }
+    benchmark_metric_stop(BENCH_CRYPTO_KEM_ENCAPSULATE, metric_start);
     return ret;
 }
 
@@ -145,6 +151,7 @@ static int decapsulate(MlKemKey *key, const uint8_t *ct, word32 ct_len,
                        uint8_t *ss, word32 ss_len)
 {
     const struct pqm4_level *level = level_from_key(key);
+    benchmark_timepoint_t metric_start;
     uint8_t *sk;
     int ret;
 
@@ -155,18 +162,22 @@ static int decapsulate(MlKemKey *key, const uint8_t *ct, word32 ct_len,
         ss_len != WC_ML_KEM_SS_SZ) {
         return BUFFER_E;
     }
+    metric_start = benchmark_crypto_metric_start(BENCH_CRYPTO_KEM_DECAPSULATE);
     sk = XMALLOC(level->private_len, key->heap, DYNAMIC_TYPE_TMP_BUFFER);
     if (!sk) {
-        return MEMORY_E;
+        ret = MEMORY_E;
+        goto out;
     }
     ret = wc_MlKemKey_EncodePrivateKey(key, sk, level->private_len);
     if (ret == 0) {
-        benchmark_timepoint_t metric_start = benchmark_metric_start();
         ret = level->decapsulate(ss, ct, sk);
-        benchmark_metric_stop(BENCH_CRYPTO_KEM_DECAPSULATE, metric_start);
     }
-    XMEMSET(sk, 0, level->private_len);
-    XFREE(sk, key->heap, DYNAMIC_TYPE_TMP_BUFFER);
+out:
+    if (sk) {
+        XMEMSET(sk, 0, level->private_len);
+        XFREE(sk, key->heap, DYNAMIC_TYPE_TMP_BUFFER);
+    }
+    benchmark_metric_stop(BENCH_CRYPTO_KEM_DECAPSULATE, metric_start);
     return ret;
 }
 

@@ -1,7 +1,9 @@
 {
-  "message": "rename this to config.json and insert your configs here",
   "serial-device": "/dev/ttyACM0",
   "pi-host": "user@ip",
   "ssh-key": "~/.ssh/[INSERT_SSH_KEY]",
-  "ble-addr": "00:00:00:00:00:00"
+  "ble-addr": "00:00:00:00:00:00",
+  "power-profiler-serial-device": "/dev/ttyACM0",
+  "power-profiler-vdd-mv": 3000,
+  "power-profiler-output-samples-per-second": 100
 }

@@ -28,7 +28,7 @@ DEFAULT_RESULTS_ROOT = PROJECT_ROOT / "benchmarking" / "results"
 
 PURE_PQC_KEM_PREFIXES = ("MLKEM",)
 HYBRID_KEM_PREFIXES = ("SecP", "X25519MLKEM")
-PQC_SIG_PREFIXES = ("ML-DSA", "SLH-DSA")
+PQC_SIG_PREFIXES = ("ML-DSA", "SLH-DSA", "LMS", "XMSS")
 SECURITY_LEVELS = (1, 3, 5)
 HANDSHAKE_HEATMAP_MAX_MS = 6000
 HEATMAP_CMAP = LinearSegmentedColormap.from_list(
@@ -681,7 +681,7 @@ def plot_heatmap(rows: list[dict[str, str]], output: Path, run_id: str) -> None:
                 ax.text(
                     col_idx, row_idx, annotation,
                     ha="center", va="center", fontsize=12,
-                    color="white" if value <= median else "black",
+                    color="black",
                 )
     colorbar = fig.colorbar(image, ax=ax, extend="max")
     colorbar.set_label("TLS handshake mean (ms); cells show mean ± 95% CI")
@@ -758,7 +758,7 @@ def plot_percent_heatmap(
                     col_idx, row_idx,
                     f"{value:.{value_decimals}f}{value_suffix}",
                     ha="center", va="center", fontsize=12,
-                    color="white" if image.norm(value) < 0.6 else "black",
+                    color="black",
                 )
     colorbar = fig.colorbar(image, ax=ax)
     colorbar.set_label(colorbar_label)

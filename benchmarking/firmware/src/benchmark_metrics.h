@@ -43,6 +43,8 @@ void benchmark_crypto_reschedule(void);
 void benchmark_hardware_counters_start(void);
 void benchmark_hardware_counters_stop(void);
 benchmark_timepoint_t benchmark_metric_start(void);
+benchmark_timepoint_t benchmark_crypto_metric_start(
+    enum benchmark_crypto_operation operation);
 void benchmark_metric_stop(enum benchmark_crypto_operation operation,
                            benchmark_timepoint_t start);
 void benchmark_communication_stop(benchmark_timepoint_t start);

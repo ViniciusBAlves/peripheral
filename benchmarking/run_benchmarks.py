@@ -28,8 +28,13 @@ from benchmarklib.certificates import (
 from benchmarklib.firmware import build as build_firmware
 from benchmarklib.firmware import ensure_pqm4
 from benchmarklib.firmware import flash as flash_firmware
+from benchmarklib.firmware import reset as reset_firmware
 from benchmarklib.gateway import PiGateway
 from benchmarklib.metrics import aggregate, number, parse_bench_line
+from benchmarklib.power_profiler import (
+    PowerProfilerCapture,
+    PowerProfilerSession,
+)
 from benchmarklib.scheduler import SessionJob, build_jobs
 from benchmarklib.server_backends import (
     SERVER_BACKEND_CHOICES,
@@ -44,6 +49,17 @@ RESULTS = ROOT / "results"
 WORK = ROOT / "work"
 DEFAULT_CONFIG = ROOT / "config.json"
 DEFAULT_NCS_VERSION = "v3.3.0"
+POWER_WINDOWS = (
+    "client_kem", "client_signature", "handshake", "total_execution",
+)
+POWER_METRICS = (
+    "duration_ms", "charge_uc", "energy_uj", "avg_current_ua",
+    "peak_current_ua",
+)
+POWER_ATTEMPT_FIELDS = [
+    f"{window}_{metric}"
+    for window in POWER_WINDOWS for metric in POWER_METRICS
+]
 FATAL_SERVER_LOG_PATTERNS = (
     r"unknown ca",
     r"certificate verify failed",
@@ -83,6 +99,10 @@ ATTEMPT_FIELDS = [
     "thread_stack_peak_percent",
     "l2cap_rx_ring_peak_bytes", "l2cap_rx_ring_capacity_bytes",
     "l2cap_rx_ring_peak_percent",
+    *POWER_ATTEMPT_FIELDS,
+    "power_status", "power_profiler_sample_count",
+    "power_profiler_window_count", "power_profiler_vdd_mv",
+    "power_profiler_output_samples_per_second",
     "error_code", "message",
 ]
 
@@ -126,6 +146,12 @@ SUMMARY_FIELDS = [
     "max_thread_stack_peak_percent",
     "max_l2cap_rx_ring_peak_bytes", "l2cap_rx_ring_capacity_bytes",
     "max_l2cap_rx_ring_peak_percent",
+    *[
+        f"mean_{window}_{metric}"
+        for window in POWER_WINDOWS
+        for metric in ("duration_ms", "charge_uc", "energy_uj", "avg_current_ua")
+    ],
+    *[f"max_{window}_peak_current_ua" for window in POWER_WINDOWS],
 ]
 
 
@@ -457,11 +483,26 @@ def run_job(
     final: dict[str, str] = {}
     reconnect_count = 0
     attempt_timeout = timeout_for_case(case, args.attempt_timeout_sec)
-    for retry in range(args.reconnect_retries + 1):
-        reconnect_count = retry
-        serial_port.reset_input_buffer()
-        try:
-            gateway.start_session(
+    power_capture = None
+    power_values: dict[str, object] = {}
+    if getattr(args, "power_profiler", False):
+        power_session = getattr(args, "power_profiler_session", None)
+        power_capture = (
+            power_session.capture()
+            if power_session is not None
+            else PowerProfilerCapture(
+                args.power_profiler_serial_device,
+                args.power_profiler_vdd_mv,
+                args.power_profiler_output_samples_per_second,
+            )
+        )
+        power_capture.start()
+    try:
+        for retry in range(args.reconnect_retries + 1):
+            reconnect_count = retry
+            serial_port.reset_input_buffer()
+            try:
+                gateway.start_session(
                 case_id=case["case_id"],
                 remote_case_dir=remote_case,
                 ble_addr=args.ble_addr,
@@ -475,48 +516,53 @@ def run_job(
                 log=case_dir / "gateway-control.log",
                 server_backend=server_backend,
                 wolfssl_group=KEMS_BY_NAME[case["kex_group"]].wolfssl_group,
-            )
-            remote_broker_log = f"{gateway.workdir}/logs/{case['case_id']}.broker.log"
-            final = wait_for_result(
+                )
+                remote_broker_log = f"{gateway.workdir}/logs/{case['case_id']}.broker.log"
+                final = wait_for_result(
                 serial_port,
                 board_log,
                 attempt_timeout,
                 fatal_detector=lambda: gateway.remote_file_contains(
                     remote_broker_log, FATAL_SERVER_LOG_PATTERNS
                 ),
-            )
-        except Exception as error:
-            final = {
-                "status": "fail",
-                "stage": "gateway_start",
-                "error": type(error).__name__,
-            }
-        finally:
-            gateway.stop_session(
-                case_dir / "gateway-control.log", reset_adapter=False
-            )
-            gateway.collect_session_logs(
-                case["case_id"], broker_log, gateway_log,
-                case_dir / "gateway-control.log",
-            )
-            final = classify_gateway_start_failure(gateway_log, final)
-            try:
-                wait_for_board_ready(
-                    serial_port, board_log, args.board_rearm_timeout_sec
                 )
-            except TimeoutError:
-                if final.get("fatal") != "1":
-                    final = {
-                        "status": "fail",
-                        "stage": "board_rearm",
-                        "error": "timeout",
-                    }
-        if final.get("status") == "success":
-            break
-        if final.get("fatal") == "1":
-            break
-        if retry < args.reconnect_retries:
-            time.sleep(args.reconnect_delay_sec)
+            except Exception as error:
+                final = {
+                    "status": "fail",
+                    "stage": "gateway_start",
+                    "error": type(error).__name__,
+                }
+            finally:
+                gateway.stop_session(
+                    case_dir / "gateway-control.log", reset_adapter=False
+                )
+                gateway.collect_session_logs(
+                    case["case_id"], broker_log, gateway_log,
+                    case_dir / "gateway-control.log",
+                )
+                final = classify_gateway_start_failure(gateway_log, final)
+                try:
+                    wait_for_board_ready(
+                        serial_port, board_log, args.board_rearm_timeout_sec
+                    )
+                except TimeoutError:
+                    if final.get("fatal") != "1":
+                        final = {
+                            "status": "fail",
+                            "stage": "board_rearm",
+                            "error": "timeout",
+                        }
+            if final.get("status") == "success":
+                break
+            if final.get("fatal") == "1":
+                break
+            if retry < args.reconnect_retries:
+                time.sleep(args.reconnect_delay_sec)
+    finally:
+        if power_capture is not None:
+            power_values = power_capture.stop(
+                case_dir / f"power_trace_{attempt_index:03d}.csv.gz"
+            )
 
     gateway_values = parse_gateway_metrics(gateway_log)
     server_values = parse_server_metrics(broker_log)
@@ -666,6 +712,7 @@ def run_job(
         "l2cap_rx_ring_peak_percent": usage_percent(
             final, "l2cap_rx_ring_peak_bytes", "l2cap_rx_ring_capacity_bytes"
         ),
+        **power_values,
         "error_code": final.get("error", ""),
         "message": final.get("fatal_message", final.get("stage", "")),
         "_fatal": final.get("fatal", ""),
@@ -738,6 +785,28 @@ def summarize(case: dict[str, str], attempts: list[dict[str, object]]) -> dict[s
         status = "fail"
     mean_raw = float(stats["mean"]) if stats["mean"] else None
     mean_full = sum(full) / len(full) if full else None
+    power_summary: dict[str, str] = {}
+    power_success = [
+        row for row in success if row.get("power_status") == "success"
+    ]
+    for window in POWER_WINDOWS:
+        for metric in ("duration_ms", "charge_uc", "energy_uj", "avg_current_ua"):
+            field = f"{window}_{metric}"
+            values = [
+                float(row[field]) for row in power_success
+                if row.get(field, "") != ""
+            ]
+            power_summary[f"mean_{field}"] = (
+                f"{sum(values) / len(values):.6f}" if values else ""
+            )
+        peak_field = f"{window}_peak_current_ua"
+        peaks = [
+            float(row[peak_field]) for row in power_success
+            if row.get(peak_field, "") != ""
+        ]
+        power_summary[f"max_{peak_field}"] = (
+            f"{max(peaks):.3f}" if peaks else ""
+        )
     return {
         "case_id": case["case_id"],
         **case_metadata(case),
@@ -903,25 +972,40 @@ def summarize(case: dict[str, str], attempts: list[dict[str, object]]) -> dict[s
         "max_l2cap_rx_ring_peak_percent": (
             f"{max(rx_ring_percent):.2f}" if rx_ring_percent else ""
         ),
+        **power_summary,
     }
 
 
-def load_config(path: Path) -> dict[str, str]:
+def load_config(path: Path) -> dict[str, object]:
     if not path.exists():
         raise FileNotFoundError(f"benchmark configuration not found: {path}")
     with path.open() as stream:
         values = json.load(stream)
     if not isinstance(values, dict):
         raise ValueError(f"{path}: top-level JSON value must be an object")
-    expected = {"serial-device", "pi-host", "ssh-key", "ble-addr"}
+    required = {"serial-device", "pi-host", "ssh-key", "ble-addr"}
+    optional = {
+        "power-profiler-serial-device",
+        "power-profiler-vdd-mv",
+        "power-profiler-output-samples-per-second",
+    }
+    expected = required | optional
     unknown = set(values) - expected
     if unknown:
         raise ValueError(
             f"{path}: unknown configuration fields: {', '.join(sorted(unknown))}"
         )
-    for key in expected:
+    for key in required:
         if key not in values or not isinstance(values[key], str):
             raise ValueError(f"{path}: {key!r} must be a string")
+    values.setdefault("power-profiler-serial-device", "/dev/ttyACM0")
+    values.setdefault("power-profiler-vdd-mv", 3000)
+    values.setdefault("power-profiler-output-samples-per-second", 100)
+    if not isinstance(values["power-profiler-serial-device"], str):
+        raise ValueError(f"{path}: 'power-profiler-serial-device' must be a string")
+    for key in ("power-profiler-vdd-mv", "power-profiler-output-samples-per-second"):
+        if not isinstance(values[key], int) or isinstance(values[key], bool):
+            raise ValueError(f"{path}: {key!r} must be an integer")
     return values
 
 
@@ -950,6 +1034,20 @@ def resolve_serial_device(configured: str) -> str:
     if Path(configured).exists() or configured != "/dev/ttyACM0":
         return configured
     candidates = sorted(Path("/dev").glob("tty.usbmodem*"))
+    if candidates:
+        return str(candidates[0])
+    return configured
+
+
+def resolve_power_profiler_device(configured: str, board_device: str) -> str:
+    path = Path(configured)
+    board = Path(board_device)
+    collision = (
+        path.exists() and board.exists() and path.resolve() == board.resolve()
+    )
+    if path.exists() and not collision:
+        return configured
+    candidates = sorted(Path("/dev/serial/by-id").glob("*PPK2*-if01"))
     if candidates:
         return str(candidates[0])
     return configured
@@ -1009,6 +1107,26 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--board-rearm-timeout-sec", type=float, default=30.0)
     parser.add_argument("--serial-device", default=config["serial-device"])
     parser.add_argument("--serial-baud", type=int, default=115200)
+    parser.add_argument(
+        "--power-profiler",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="capture PPK2 current synchronized with benchmark GPIO markers",
+    )
+    parser.add_argument(
+        "--power-profiler-serial-device",
+        default=config["power-profiler-serial-device"],
+    )
+    parser.add_argument(
+        "--power-profiler-vdd-mv", type=int,
+        default=config["power-profiler-vdd-mv"],
+        help="measured DUT voltage used for energy calculation only",
+    )
+    parser.add_argument(
+        "--power-profiler-output-samples-per-second", type=int,
+        default=config["power-profiler-output-samples-per-second"],
+        help="downsampled trace rate; native integration remains at 100 kS/s",
+    )
     parser.add_argument("--pi-host", default=config["pi-host"])
     parser.add_argument(
         "--pi-workdir",
@@ -1049,6 +1167,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("provide exactly one of --cases or --resume")
     args.ssh_key = os.path.expandvars(os.path.expanduser(args.ssh_key))
     args.serial_device = resolve_serial_device(args.serial_device)
+    args.power_profiler_serial_device = os.path.expanduser(
+        args.power_profiler_serial_device
+    )
+    args.power_profiler_serial_device = resolve_power_profiler_device(
+        args.power_profiler_serial_device, args.serial_device
+    )
     args.ble_addr = normalize_ble_addr(args.ble_addr)
     return args
 
@@ -1071,6 +1195,19 @@ def main() -> int:
         raise ValueError("sessions and reconnect retries must be non-negative")
     if args.limit is not None and args.limit < 1:
         raise ValueError("--limit must be at least 1")
+    if args.power_profiler_vdd_mv <= 0:
+        raise ValueError("--power-profiler-vdd-mv must be positive")
+    if not 1 <= args.power_profiler_output_samples_per_second <= 100_000:
+        raise ValueError(
+            "--power-profiler-output-samples-per-second must be between 1 and 100000"
+        )
+    power_profiler_session = None
+    if args.power_profiler:
+        board_device = Path(args.serial_device)
+        power_device = Path(args.power_profiler_serial_device)
+        if board_device.exists() and power_device.exists():
+            if board_device.resolve() == power_device.resolve():
+                raise ValueError("board and PPK2 serial devices must be different")
     resuming = args.resume is not None
     if resuming:
         if args.limit is not None or args.only_case or args.run_id:
@@ -1087,6 +1224,17 @@ def main() -> int:
             saved_config = json.loads(saved_config_path.read_text())
             args.mlkem_backend = saved_config["mlkem_backend"]
             args.server_backend = saved_config["server_backend"]
+            args.power_profiler = saved_config.get("power_profiler", False)
+            args.power_profiler_serial_device = saved_config.get(
+                "power_profiler_serial_device", args.power_profiler_serial_device
+            )
+            args.power_profiler_vdd_mv = saved_config.get(
+                "power_profiler_vdd_mv", args.power_profiler_vdd_mv
+            )
+            args.power_profiler_output_samples_per_second = saved_config.get(
+                "power_profiler_output_samples_per_second",
+                args.power_profiler_output_samples_per_second,
+            )
         checkpoint = read_checkpoint(run_dir)
         last_completed_execution_order = int(
             checkpoint.get("last_completed_execution_order", 0)
@@ -1121,6 +1269,11 @@ def main() -> int:
             "sessions_per_case": args.sessions_per_case,
             "mlkem_backend": args.mlkem_backend,
             "server_backend": args.server_backend,
+            "power_profiler": args.power_profiler,
+            "power_profiler_serial_device": args.power_profiler_serial_device,
+            "power_profiler_vdd_mv": args.power_profiler_vdd_mv,
+            "power_profiler_output_samples_per_second":
+                args.power_profiler_output_samples_per_second,
         }, indent=2) + "\n")
         shutil.copy2(args.cases, run_dir / "input_cases.csv")
         manifest = [
@@ -1279,6 +1432,7 @@ def main() -> int:
             ncs_chdir=args.ncs_chdir, board=args.board,
             mlkem_backend=args.mlkem_backend, pqm4_dir=pqm4_dir,
             large_rsa=False,
+            power_markers=args.power_profiler,
         )
         print("[firmware] Build completed.", flush=True)
     if not args.skip_flash:
@@ -1293,6 +1447,52 @@ def main() -> int:
             ncs_chdir=args.ncs_chdir,
         )
         print("[firmware] Flash completed.", flush=True)
+
+    if args.power_profiler:
+        print(
+            "\n[power] Prepare the PPK2 in Ampere Meter mode:\n"
+            "  1. Disconnect the nRF52840DK USB cable.\n"
+            "  2. Remove the P22 jumper and insert PPK2 IN/OUT in series.\n"
+            "  3. Connect DK GND/VDD to PPK2 logic GND/VCC.\n"
+            "  4. Connect A0/P0.03->D7, A1/P0.04->D6, "
+            "A2/P0.28->D5, A3/P0.29->D4.\n"
+            "  5. Reconnect DK USB and close the nRF Connect Power Profiler app.",
+            flush=True,
+        )
+        input("[power] Press Enter when the wiring is ready...")
+        print("[power] Opening the persistent PPK2 Ampere Meter session...", flush=True)
+        power_profiler_session = PowerProfilerSession(
+            args.power_profiler_serial_device,
+            args.power_profiler_vdd_mv,
+            args.power_profiler_output_samples_per_second,
+        )
+        power_profiler_session.open()
+        atexit.register(power_profiler_session.close)
+        args.power_profiler_session = power_profiler_session
+        idle_mean_ua, idle_peak_ua = power_profiler_session.probe_current()
+        print(
+            f"[power] DUT path enabled: mean={idle_mean_ua:.2f} uA "
+            f"peak={idle_peak_ua:.2f} uA; no source voltage was configured.",
+            flush=True,
+        )
+        if idle_peak_ua < 100.0:
+            raise RuntimeError(
+                "PPK2 sees only leakage current after enabling DUT power "
+                f"(mean={idle_mean_ua:.2f} uA, peak={idle_peak_ua:.2f} uA). "
+                "The nRF52840 is not powered through P22. Connect PPK2 VIN to "
+                "the P22 supply side and PPK2 VOUT to the upper VDD_nRF pin."
+            )
+        print("[power] Resetting the powered nRF52840 target...", flush=True)
+        try:
+            reset_firmware(log=run_dir / "power-reset.log", nrfutil=args.nrfutil)
+        except Exception as error:
+            raise RuntimeError(
+                "The PPK2 reports current, but nrfutil cannot access the "
+                "nRF52840 over SWD. The target VDD rail is absent or below a "
+                "usable level; the measured current is likely back-power. "
+                "Verify approximately 3 V between VDD_nRF and GND, PPK2 VIN "
+                "on the P22 supply side, and PPK2 VOUT on the upper VDD_nRF pin."
+            ) from error
 
     gateway = PiGateway(args.pi_host, args.pi_workdir, args.ssh_key)
     print(
@@ -1402,6 +1602,8 @@ def main() -> int:
               flush=True)
     finally:
         gateway.stop_session(run_dir / "gateway.log")
+        if power_profiler_session is not None:
+            power_profiler_session.close()
 
     summaries = [summarize(case, attempts[case["case_id"]]) for case in cases]
     for row in summaries:

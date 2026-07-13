@@ -37,10 +37,13 @@ Before running a hardware benchmark, configure the four connection values in
 
 ```json
 {
-  "serial-device": "/dev/ttyACM0",
+  "serial-device": "/dev/serial/by-id/usb-SEGGER_J-Link_001050227466-if00",
   "pi-host": "user@ip",
   "ssh-key": "~/.ssh/[INSERT_SSH_KEY]",
-  "ble-addr": "00:00:00:00:00:00"
+  "ble-addr": "00:00:00:00:00:00",
+  "power-profiler-serial-device": "/dev/ttyACM0",
+  "power-profiler-vdd-mv": 3000,
+  "power-profiler-output-samples-per-second": 100
 }
 ```
 
@@ -59,10 +62,9 @@ python benchmarking/run_benchmarks.py \
   --seed 123
 ```
 
-The corresponding CLI options (`--serial-device`, `--pi-host`, `--ssh-key`,
-and `--ble-addr`) remain available as one-run overrides and take precedence
-over JSON values. The runner validates that all four JSON fields exist and
-rejects unknown fields, which helps catch misspelled configuration names.
+The corresponding CLI options remain available as one-run overrides and take
+precedence over JSON values. The four connection fields are required; the
+power-profiler fields are optional and receive the defaults shown above.
 
 ## Raspberry Pi
 
@@ -178,6 +180,32 @@ The runner generates every certificate first, builds and flashes one universal
 firmware image, then executes the saved schedule. Use `--skip-build
 --skip-flash` only when the already flashed image was built from the same
 universal credential bundle.
+
+## PPK2 Energy Measurement
+
+Power capture is disabled by default. Install `ppk2-api==0.9.2`, close the nRF
+Connect Power Profiler application, and add `--power-profiler` to the normal
+benchmark command. The runner builds GPIO markers into the firmware and pauses
+after flashing so the PPK2 can be inserted at P22 safely:
+
+```bash
+python benchmarking/run_benchmarks.py \
+  --cases benchmarking/cases/<cases>.csv \
+  --seed 123 \
+  --power-profiler
+```
+
+Connect A0/P0.03 to PPK2 D7 (total execution), A1/P0.04 to D6 (TLS
+handshake), A2/P0.28 to D5 (client KEM), and A3/P0.29 to D4 (client
+signature). Connect DK GND/VDD to the PPK2 logic GND/VCC pins. The configured
+100 samples/s controls only the compressed `power_trace_*.csv.gz` output;
+energy and charge are integrated from the native 100 kS/s stream.
+
+The PPK2 voltage is used only to convert charge to energy. The runner never
+sets a source voltage. In Ampere Meter mode it enables the PPK2 DUT output
+switch after the wiring prompt so current can flow through the open P22 path,
+and keeps that path enabled across attempts. Use `--no-power-profiler` to
+explicitly keep the normal benchmark path.
 
 ### Save and resume
 
