@@ -33,53 +33,6 @@ def _open_ppk(device: str):
     return ppk
 
 
-def enable_ampere_meter_path(device: str) -> None:
-    """Close the PPK2 DUT switch without configuring a source voltage."""
-    ppk = _open_ppk(device)
-    try:
-        # A previous interrupted capture can leave binary samples queued.
-        ppk.stop_measuring()
-        time.sleep(0.1)
-        ppk.ser.reset_input_buffer()
-        ppk.use_ampere_meter()
-        time.sleep(0.1)
-        ppk.toggle_DUT_power("ON")
-        time.sleep(0.1)
-    finally:
-        ppk.ser.close()
-
-
-def probe_ampere_meter_current(device: str, vdd_mv: int) -> tuple[float, float]:
-    """Return mean and peak absolute current without changing source voltage."""
-    ppk = _open_ppk(device)
-    samples: list[float] = []
-    try:
-        ppk.stop_measuring()
-        time.sleep(0.1)
-        ppk.ser.reset_input_buffer()
-        if not ppk.get_modifiers():
-            raise RuntimeError("could not read PPK2 calibration data")
-        ppk.use_ampere_meter()
-        ppk.toggle_DUT_power("ON")
-        ppk.current_vdd = vdd_mv
-        ppk.start_measuring()
-        deadline = time.monotonic() + 0.5
-        while time.monotonic() < deadline:
-            raw = ppk.get_data()
-            if raw:
-                current, _ = ppk.get_samples(raw)
-                samples.extend(current)
-            else:
-                time.sleep(0.002)
-    finally:
-        ppk.stop_measuring()
-        ppk.ser.close()
-    if not samples:
-        raise RuntimeError("PPK2 returned no current samples")
-    absolute = [abs(value) for value in samples]
-    return statistics.fmean(absolute), max(absolute)
-
-
 @dataclass
 class _Window:
     start: int
@@ -103,7 +56,7 @@ def _combine_windows(windows: list[_Window]) -> _Window:
 
 
 class PowerProfilerSession:
-    """Keep the PPK2 CDC and DUT power path alive for the complete run."""
+    """Keep the PPK2 source and measurement CDC alive for the complete run."""
 
     def __init__(self, device: str, vdd_mv: int, output_samples_per_second: int):
         self.device = device
@@ -113,15 +66,27 @@ class PowerProfilerSession:
 
     def open(self) -> None:
         self.ppk = _open_ppk(self.device)
-        self.ppk.stop_measuring()
-        time.sleep(0.1)
-        self.ppk.ser.reset_input_buffer()
-        if not self.ppk.get_modifiers():
-            raise RuntimeError(f"could not read PPK2 calibration data from {self.device}")
-        self.ppk.use_ampere_meter()
-        self.ppk.current_vdd = self.vdd_mv
-        self.ppk.toggle_DUT_power("ON")
-        time.sleep(0.2)
+        try:
+            self.ppk.stop_measuring()
+            time.sleep(0.1)
+            self.ppk.ser.reset_input_buffer()
+            if not self.ppk.get_modifiers():
+                raise RuntimeError(
+                    f"could not read PPK2 calibration data from {self.device}"
+                )
+            self.ppk.use_source_meter()
+            self.ppk.set_source_voltage(self.vdd_mv)
+            self.ppk.toggle_DUT_power("OFF")
+            time.sleep(0.1)
+            self.ppk.toggle_DUT_power("ON")
+            time.sleep(0.5)
+        except BaseException:
+            try:
+                self.ppk.toggle_DUT_power("OFF")
+            finally:
+                self.ppk.ser.close()
+                self.ppk = None
+            raise
 
     def probe_current(self) -> tuple[float, float]:
         if self.ppk is None:
@@ -151,14 +116,27 @@ class PowerProfilerSession:
             self.device, self.vdd_mv, self.output_rate, ppk=self.ppk
         )
 
+    def power_cycle(self, off_seconds: float = 0.25,
+                    boot_seconds: float = 1.0) -> None:
+        if self.ppk is None:
+            raise RuntimeError("PPK2 session is not open")
+        self.ppk.stop_measuring()
+        self.ppk.toggle_DUT_power("OFF")
+        time.sleep(off_seconds)
+        self.ppk.toggle_DUT_power("ON")
+        time.sleep(boot_seconds)
+
     def close(self) -> None:
         if self.ppk is None:
             return
         try:
             self.ppk.stop_measuring()
         finally:
-            self.ppk.ser.close()
-            self.ppk = None
+            try:
+                self.ppk.toggle_DUT_power("OFF")
+            finally:
+                self.ppk.ser.close()
+                self.ppk = None
 
 
 class PowerProfilerCapture:
@@ -197,9 +175,9 @@ class PowerProfilerCapture:
                 raise RuntimeError(
                     f"could not read PPK2 calibration data from {self.device}"
                 )
-            self._ppk.use_ampere_meter()
+            self._ppk.use_source_meter()
+            self._ppk.set_source_voltage(self.vdd_mv)
             self._ppk.toggle_DUT_power("ON")
-            self._ppk.current_vdd = self.vdd_mv
         self._ppk.start_measuring()
         self._thread = threading.Thread(target=self._capture_loop, daemon=True)
         self._thread.start()
@@ -265,7 +243,10 @@ class PowerProfilerCapture:
                     self._error = error
             finally:
                 if self._owns_ppk:
-                    self._ppk.ser.close()
+                    try:
+                        self._ppk.toggle_DUT_power("OFF")
+                    finally:
+                        self._ppk.ser.close()
         if self._owns_ppk:
             self._ppk = None
         self._write_trace(trace_path)

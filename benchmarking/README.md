@@ -6,16 +6,20 @@ the build products, generated certificates, or source files in the parent
 
 ## Architecture
 
-The nRF52840 runs wolfSSL and sends TLS records over a BLE LE Credit-Based
+The nRF5340 application core runs wolfSSL and sends TLS records over a BLE LE Credit-Based
 L2CAP channel on PSM `0x0080`. A Raspberry Pi bridges that channel to a local
 TLS server on `127.0.0.1:8883`. By default, normal cases use a Mosquitto TCP
 listener backed by OpenSSL 3.5+ and its available post-quantum providers, while
 LMS/HSS and XMSS cases use a small wolfSSL TLS server with a minimal MQTT
 CONNACK responder.
 
+The Bluetooth controller runs on the nRF5340 network core using Zephyr's
+`hci_ipc` child image. The runner therefore builds and flashes the application
+and network cores together with sysbuild.
+
 The firmware contains every supported TLS key-exchange group and a trust bundle
 for the server CAs in the selected run. The server offers one group and one
-certificate per case. The nRF52840 uses one fixed ECDSA client identity for
+certificate per case. The nRF5340 uses one fixed ECDSA client identity for
 mutual TLS, so the benchmark signature algorithm describes the server side.
 
 SLH-DSA signs the server certificate chain. Its TLS `CertificateVerify` leaf
@@ -37,20 +41,17 @@ Before running a hardware benchmark, configure the four connection values in
 
 ```json
 {
-  "serial-device": "/dev/serial/by-id/usb-SEGGER_J-Link_001050227466-if00",
+  "serial-device": "/dev/serial/by-id/usb-SEGGER_J-Link_001050032722-if02",
   "pi-host": "user@ip",
   "ssh-key": "~/.ssh/[INSERT_SSH_KEY]",
-  "ble-addr": "00:00:00:00:00:00",
-  "power-profiler-serial-device": "/dev/ttyACM0",
-  "power-profiler-vdd-mv": 3000,
-  "power-profiler-output-samples-per-second": 100
+  "ble-addr": "00:00:00:00:00:00"
 }
 ```
 
-- `serial-device`: nRF52840DK serial port used for `BENCH_*` telemetry.
+- `serial-device`: nRF5340DK application-core VCOM used for `BENCH_*` telemetry.
 - `pi-host`: Raspberry Pi SSH destination in `user@host` form.
 - `ssh-key`: private SSH key; `~` and environment variables are expanded.
-- `ble-addr`: BLE address advertised by the nRF52840DK.
+- `ble-addr`: BLE address advertised by the nRF5340DK.
 
 `run_benchmarks.py` loads this file automatically. A different file can be
 selected with `--config`:
@@ -63,8 +64,7 @@ python benchmarking/run_benchmarks.py \
 ```
 
 The corresponding CLI options remain available as one-run overrides and take
-precedence over JSON values. The four connection fields are required; the
-power-profiler fields are optional and receive the defaults shown above.
+precedence over JSON values. The four connection fields are required.
 
 ## Raspberry Pi
 
@@ -183,29 +183,10 @@ universal credential bundle.
 
 ## PPK2 Energy Measurement
 
-Power capture is disabled by default. Install `ppk2-api==0.9.2`, close the nRF
-Connect Power Profiler application, and add `--power-profiler` to the normal
-benchmark command. The runner builds GPIO markers into the firmware and pauses
-after flashing so the PPK2 can be inserted at P22 safely:
-
-```bash
-python benchmarking/run_benchmarks.py \
-  --cases benchmarking/cases/<cases>.csv \
-  --seed 123 \
-  --power-profiler
-```
-
-Connect A0/P0.03 to PPK2 D7 (total execution), A1/P0.04 to D6 (TLS
-handshake), A2/P0.28 to D5 (client KEM), and A3/P0.29 to D4 (client
-signature). Connect DK GND/VDD to the PPK2 logic GND/VCC pins. The configured
-100 samples/s controls only the compressed `power_trace_*.csv.gz` output;
-energy and charge are integrated from the native 100 kS/s stream.
-
-The PPK2 voltage is used only to convert charge to energy. The runner never
-sets a source voltage. In Ampere Meter mode it enables the PPK2 DUT output
-switch after the wiring prompt so current can flow through the open P22 path,
-and keeps that path enabled across attempts. Use `--no-power-profiler` to
-explicitly keep the normal benchmark path.
+Power-profiler integration is disabled in the nRF5340DK port. Passing
+`--power-profiler` is rejected before build or hardware access. The historical
+energy columns remain in the CSV schema so existing result-processing scripts
+continue to read old runs.
 
 ### Save and resume
 
@@ -252,7 +233,8 @@ Cortex-M SP-ECC backend so ECC does not inherit oversized TFM arithmetic.
 
 ### Default pqm4 ML-KEM backend
 
-The nRF52840 uses pqm4's Cortex-M4F ML-KEM implementation by default, including
+The nRF5340 application core uses pqm4's Cortex-M4F ML-KEM implementation by
+default, including
 the ML-KEM component of hybrid groups. Use `--mlkem-backend wolfssl` only when
 an explicit wolfSSL baseline is required:
 
@@ -273,8 +255,8 @@ encapsulation and decapsulation to pqm4. The selected backend is saved in
 signatures and verification remain handled by wolfSSL.
 
 The `m4fstack` implementation is intentionally used instead of `m4fspeed`.
-Both use Cortex-M4F assembly, while `m4fstack` leaves more stack headroom for
-the TLS call chain on the 256 KiB nRF52840.
+Its instructions are compatible with the nRF5340 Cortex-M33/FPU, while its
+smaller stack demand leaves more headroom for the TLS call chain.
 
 ## Measurements
 
@@ -326,7 +308,7 @@ The firmware also records the following per-attempt values:
 - `tls_certificate_verify_signature_verify_ms` measures processing and
   cryptographic verification of the server TLS 1.3 `CertificateVerify`.
 - `mtls_signature_generate_ms` measures the signature primitive used by the
-  nRF52840 to produce its client-authentication `CertificateVerify`.
+  nRF5340 to produce its client-authentication `CertificateVerify`.
   `client_signature_total_ms` is the sum of X.509 verification, server
   `CertificateVerify` verification, and client mTLS signing.
 - `server_kem_encapsulation_ms` and `server_certificate_verify_sign_ms` are
@@ -339,12 +321,11 @@ The firmware also records the following per-attempt values:
 - `l2cap_tx_retries`, `l2cap_tx_wait_ms`, and `l2cap_rx_overflows` expose
   transport pressure caused by exhausted TX buffers, radio backpressure, and
   insufficient RX ring-buffer capacity.
-- `client_icache_hits` and `client_icache_misses` come directly from the
-  nRF52840 NVMC instruction-cache profiling registers over the
-  `wolfSSL_connect()` interval. The runner derives requests and hit/miss
-  percentages from those hardware counters.
-- `client_memory_access_counters_supported` is `0` on the nRF52840. Its
-  Cortex-M4 has no PMU event counters for globally retired data-memory reads
+- `client_icache_hits` and `client_icache_misses` are populated only when the
+  selected Nordic SoC exposes NVMC instruction-cache profiling registers; the
+  runner derives requests and hit/miss percentages from those counters.
+- `client_memory_access_counters_supported` is `0` on this nRF5340 build. Its
+  Cortex-M33 configuration has no enabled PMU event counters for globally retired data-memory reads
   and writes. The DWT `LSUCNT` register counts extra load/store-unit cycles,
   saturates at eight bits, and is therefore deliberately not mislabeled as
   read/write operations. Use the exact L2CAP byte counters above when the

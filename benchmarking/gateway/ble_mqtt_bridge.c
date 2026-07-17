@@ -55,6 +55,9 @@
 #define BRIDGE_RECV_BUFFER_SIZE 65535
 #define L2CAP_SEND_RETRY_TIMEOUT_MS 10000
 #define L2CAP_SDU_PACING_US 30000
+#define CONTROL_HEADER_SIZE 8
+#define CONTROL_FLAG_START 0x01
+#define CONTROL_FLAG_END 0x02
 
 static volatile sig_atomic_t keep_running = 1;
 
@@ -97,7 +100,72 @@ struct sdu_prefix_state {
     size_t expected_sdu_len;
 };
 
+struct control_state {
+    uint16_t message_id;
+    bool active;
+    uint8_t *pending;
+    size_t pending_len;
+    size_t pending_cap;
+};
+
 static int send_stream(int fd, const uint8_t *data, size_t length);
+
+static int handle_control_frame(struct control_state *state,
+                                const uint8_t *data, size_t length)
+{
+    size_t base = 0;
+
+    if (length >= CONTROL_HEADER_SIZE && memcmp(data, "BCTL1", 5) == 0) {
+        base = 0;
+    } else if (length >= CONTROL_HEADER_SIZE + 2 &&
+               memcmp(data + 2, "BCTL1", 5) == 0) {
+        base = 2;
+    } else {
+        return 0;
+    }
+
+    uint8_t flags = data[base + 5];
+    uint16_t message_id = (uint16_t)data[base + 6] |
+                          ((uint16_t)data[base + 7] << 8);
+    const uint8_t *payload = data + base + CONTROL_HEADER_SIZE;
+    size_t payload_len = length - base - CONTROL_HEADER_SIZE;
+
+    if (flags & CONTROL_FLAG_START) {
+        state->message_id = message_id;
+        state->active = true;
+        state->pending_len = 0;
+    }
+    if (!state->active || state->message_id != message_id) {
+        fprintf(stderr, "[-] Invalid BCTL1 fragment sequence\n");
+        return -1;
+    }
+    if (state->pending_len + payload_len > state->pending_cap) {
+        size_t capacity = state->pending_cap ? state->pending_cap : 1024;
+        while (capacity < state->pending_len + payload_len) {
+            capacity *= 2;
+        }
+        uint8_t *pending = realloc(state->pending, capacity);
+        if (!pending) {
+            return -1;
+        }
+        state->pending = pending;
+        state->pending_cap = capacity;
+    }
+    memcpy(state->pending + state->pending_len, payload, payload_len);
+    state->pending_len += payload_len;
+
+    if (flags & CONTROL_FLAG_END) {
+        fwrite(state->pending, 1, state->pending_len, stdout);
+        if (state->pending_len == 0 ||
+            state->pending[state->pending_len - 1] != '\n') {
+            fputc('\n', stdout);
+        }
+        fflush(stdout);
+        state->active = false;
+        state->pending_len = 0;
+    }
+    return 1;
+}
 
 static void handle_signal(int sig)
 {
@@ -676,9 +744,14 @@ static int drain_prefixed_sdu(struct sdu_prefix_state *state, int tcp_fd)
     return 0;
 }
 
-static int forward_ble_payload(struct sdu_prefix_state *state, int tcp_fd,
+static int forward_ble_payload(struct sdu_prefix_state *state,
+                               struct control_state *control, int tcp_fd,
                                const uint8_t *data, size_t length)
 {
+    int control_result = handle_control_frame(control, data, length);
+    if (control_result != 0) {
+        return control_result < 0 ? -1 : 0;
+    }
     if (state->first_packet) {
         printf("[Bridge] First BLE receive: %zu bytes, prefix=", length);
         size_t preview = length < 12 ? length : 12;
@@ -711,6 +784,51 @@ static int forward_ble_payload(struct sdu_prefix_state *state, int tcp_fd,
     return drain_prefixed_sdu(state, tcp_fd);
 }
 
+static int control_protocol_self_test(void)
+{
+    struct sdu_prefix_state stream = {.first_packet = true};
+    struct control_state control = {0};
+    uint8_t first[64] = {'B', 'C', 'T', 'L', '1', CONTROL_FLAG_START, 1, 0};
+    uint8_t second[64] = {'B', 'C', 'T', 'L', '1', CONTROL_FLAG_END, 1, 0};
+    const char first_payload[] = "[BENCH_RESULT] status=";
+    const char second_payload[] = "success\n";
+    const uint8_t tls_record[] = {0x16, 0x03, 0x03, 0x00, 0x01, 0xaa};
+    uint8_t received[sizeof(tls_record)] = {0};
+    int sockets[2];
+
+    memcpy(first + CONTROL_HEADER_SIZE, first_payload,
+           sizeof(first_payload) - 1);
+    memcpy(second + CONTROL_HEADER_SIZE, second_payload,
+           sizeof(second_payload) - 1);
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) != 0) {
+        return 1;
+    }
+    if (forward_ble_payload(
+            &stream, &control, sockets[0], first,
+            CONTROL_HEADER_SIZE + sizeof(first_payload) - 1) != 0 ||
+        forward_ble_payload(
+            &stream, &control, sockets[0], second,
+            CONTROL_HEADER_SIZE + sizeof(second_payload) - 1) != 0) {
+        close(sockets[0]);
+        close(sockets[1]);
+        return 1;
+    }
+    if (forward_ble_payload(&stream, &control, sockets[0], tls_record,
+                            sizeof(tls_record)) != 0 ||
+        recv(sockets[1], received, sizeof(received), 0) != sizeof(received) ||
+        memcmp(received, tls_record, sizeof(tls_record)) != 0) {
+        close(sockets[0]);
+        close(sockets[1]);
+        free(control.pending);
+        return 1;
+    }
+    close(sockets[0]);
+    close(sockets[1]);
+    free(control.pending);
+    printf("[BCTL_SELFTEST] PASS\n");
+    return 0;
+}
+
 static int relay_loop(int ble_fd, int tcp_fd, size_t mtu)
 {
     uint8_t *buffer = malloc(BRIDGE_RECV_BUFFER_SIZE);
@@ -726,6 +844,7 @@ static int relay_loop(int ble_fd, int tcp_fd, size_t mtu)
         .pending_cap = 0,
         .expected_sdu_len = 0,
     };
+    struct control_state control_state = {0};
     printf("[Bridge] BLE L2CAP <-> TCP active. BLE write chunk=%zu read buffer=%u\n",
            mtu, BRIDGE_RECV_BUFFER_SIZE);
 
@@ -748,7 +867,7 @@ static int relay_loop(int ble_fd, int tcp_fd, size_t mtu)
         if (descriptors[0].revents & (POLLIN | POLLHUP | POLLERR)) {
             ssize_t length = recv(ble_fd, buffer, BRIDGE_RECV_BUFFER_SIZE, 0);
             if (length <= 0 ||
-                forward_ble_payload(&ble_rx_state, tcp_fd, buffer,
+                forward_ble_payload(&ble_rx_state, &control_state, tcp_fd, buffer,
                                     (size_t)length) != 0) {
                 break;
             }
@@ -781,6 +900,7 @@ static int relay_loop(int ble_fd, int tcp_fd, size_t mtu)
     }
 
     free(ble_rx_state.pending);
+    free(control_state.pending);
     free(buffer);
     return keep_running ? -1 : 0;
 }
@@ -791,6 +911,10 @@ int main(int argc, char **argv)
     setvbuf(stderr, NULL, _IOLBF, 0);
     signal(SIGINT, handle_signal);
     signal(SIGTERM, handle_signal);
+
+    if (argc == 2 && strcmp(argv[1], "--self-test-control") == 0) {
+        return control_protocol_self_test();
+    }
 
     struct config cfg;
     if (parse_args(argc, argv, &cfg) != 0) {

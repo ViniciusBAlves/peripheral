@@ -7,6 +7,7 @@
 #include <zephyr/debug/thread_analyzer.h>
 #include <zephyr/sys/reboot.h>
 #include <time.h>
+#include <stdarg.h>
 #include <string.h>
 #include <wolfssl/ssl.h>
 #include <wolfssl/wolfcrypt/memory.h>
@@ -34,7 +35,13 @@
 #else
 #define BENCH_LOG(...) do { } while (0)
 #endif
-#define BENCH_OUT(...) printk(__VA_ARGS__)
+
+static void benchmark_output(const char *format, ...);
+#define BENCH_OUT(...) benchmark_output(__VA_ARGS__)
+#define BENCH_RESULT_OUT(...) do { \
+    benchmark_power_markers_reset(); \
+    BENCH_OUT(__VA_ARGS__); \
+} while (0)
 
 #define L2CAP_SDU_MTU 672
 #define TLS_RX_RINGBUF_SIZE 8192
@@ -225,6 +232,7 @@ RING_BUF_DECLARE(rx_ringbuf, TLS_RX_RINGBUF_SIZE);
 K_SEM_DEFINE(rx_sem, 0, 1);
 K_SEM_DEFINE(l2cap_connected_sem, 0, 1);
 K_SEM_DEFINE(conn_params_ready_sem, 0, 1);
+K_SEM_DEFINE(l2cap_tx_complete_sem, 0, 1);
 
 /* --- WOLFSSL TIME HOOKS --- */
 time_t time_sec(time_t *timer) {
@@ -377,6 +385,7 @@ static void l2cap_connected(struct bt_l2cap_chan *chan) {
     l2cap_peer_disconnected = false;
     l2cap_rx_overflow = false;
     disconnect_requested = false;
+    k_sem_reset(&l2cap_tx_complete_sem);
     l2cap_connected_ms = k_uptime_get();
 
     BENCH_LOG("[L2CAP] Channel connected. RX MTU=%u TX MTU=%u\n",
@@ -388,18 +397,26 @@ static void l2cap_disconnected(struct bt_l2cap_chan *chan) {
     BENCH_LOG("[L2CAP] Disconnected.\n");
     l2cap_peer_disconnected = true;
     k_sem_give(&rx_sem); /* Wake up any waiting read operations to fail gracefully */
+    k_sem_give(&l2cap_tx_complete_sem);
+}
+
+static void l2cap_sent(struct bt_l2cap_chan *chan)
+{
+    ARG_UNUSED(chan);
+    k_sem_give(&l2cap_tx_complete_sem);
 }
 
 static struct bt_l2cap_chan_ops l2cap_ops = {
     .alloc_buf = l2cap_alloc_buf,
     .connected = l2cap_connected,
     .recv = l2cap_recv,
+    .sent = l2cap_sent,
     .disconnected = l2cap_disconnected,
 };
 
 static const struct bt_data ad_l2cap_ok[] = {
     BT_DATA_BYTES(BT_DATA_FLAGS, (BT_LE_AD_GENERAL | BT_LE_AD_NO_BREDR)),
-    BT_DATA_BYTES(BT_DATA_NAME_COMPLETE, 'P', 'Q', 'C', '5', '2', '8', '4', '0')
+    BT_DATA_BYTES(BT_DATA_NAME_COMPLETE, 'P', 'Q', 'C', '5', '3', '4', '0')
 };
 
 static const struct bt_data ad_l2cap_error[] = {
@@ -512,11 +529,14 @@ int l2cap_wolfssl_send(WOLFSSL* ssl, char* buf, int sz, void* ctx) {
             net_buf_reserve(tx_buf, BT_L2CAP_SDU_CHAN_SEND_RESERVE);
             net_buf_add_mem(tx_buf, buf + sent, chunk);
 
-            /* 3. Send. Zephyr ALWAYS destroys tx_buf here, success or fail. */
+            /* Ownership moves to Zephyr only after a successful send. */
             err = bt_l2cap_chan_send(chan, tx_buf);
-            
+
+            if (err < 0) {
+                net_buf_unref(tx_buf);
+            }
             if (err == -EAGAIN || err == -ENOMEM) {
-                /* The radio is full. We lost tx_buf. Sleep and rebuild it. */
+                /* The radio is full. Sleep and rebuild the released buffer. */
                 benchmark_l2cap_tx_retry();
                 wait_start = benchmark_metric_start();
                 k_sleep(K_MSEC(10));
@@ -533,6 +553,93 @@ int l2cap_wolfssl_send(WOLFSSL* ssl, char* buf, int sz, void* ctx) {
     }
     SEND_RETURN(sent);
 #undef SEND_RETURN
+}
+
+#ifdef BENCH_BLE_TELEMETRY
+#define BENCH_CONTROL_BUFFER_SIZE 1536
+#define BENCH_CONTROL_HEADER_SIZE 8
+#define BENCH_CONTROL_FLAG_START BIT(0)
+#define BENCH_CONTROL_FLAG_END BIT(1)
+
+static uint16_t benchmark_control_message_id;
+
+static int benchmark_control_send(const char *message, size_t length)
+{
+    struct bt_l2cap_chan *chan = &l2cap_chan.chan;
+    struct bt_l2cap_le_chan *le_chan;
+    uint16_t mtu;
+    uint16_t message_id = ++benchmark_control_message_id;
+    size_t offset = 0;
+
+    if (chan->conn == NULL || l2cap_peer_disconnected) {
+        return -ENOTCONN;
+    }
+    le_chan = CONTAINER_OF(chan, struct bt_l2cap_le_chan, chan);
+    mtu = MIN(le_chan->tx.mtu, L2CAP_SDU_MTU);
+    if (mtu <= BENCH_CONTROL_HEADER_SIZE) {
+        return -EMSGSIZE;
+    }
+    k_sem_reset(&l2cap_tx_complete_sem);
+
+    do {
+        size_t chunk = MIN(length - offset,
+                           (size_t)mtu - BENCH_CONTROL_HEADER_SIZE);
+        struct net_buf *tx_buf = net_buf_alloc(&l2cap_tx_pool, K_MSEC(100));
+        uint8_t flags = 0;
+        int err;
+
+        if (tx_buf == NULL) {
+            return -ENOMEM;
+        }
+        if (offset == 0) {
+            flags |= BENCH_CONTROL_FLAG_START;
+        }
+        if (offset + chunk == length) {
+            flags |= BENCH_CONTROL_FLAG_END;
+        }
+        net_buf_reserve(tx_buf, BT_L2CAP_SDU_CHAN_SEND_RESERVE);
+        net_buf_add_mem(tx_buf, "BCTL1", 5);
+        net_buf_add_u8(tx_buf, flags);
+        net_buf_add_le16(tx_buf, message_id);
+        net_buf_add_mem(tx_buf, message + offset, chunk);
+        err = bt_l2cap_chan_send(chan, tx_buf);
+        if (err < 0) {
+            net_buf_unref(tx_buf);
+            return err;
+        }
+        if (k_sem_take(&l2cap_tx_complete_sem, K_SECONDS(5)) != 0 ||
+            chan->conn == NULL || l2cap_peer_disconnected) {
+            return -ETIMEDOUT;
+        }
+        offset += chunk;
+    } while (offset < length);
+
+    return 0;
+}
+#endif
+
+static void benchmark_output(const char *format, ...)
+{
+#ifdef BENCH_BLE_TELEMETRY
+    static char output[BENCH_CONTROL_BUFFER_SIZE];
+    va_list args;
+    int length;
+
+    va_start(args, format);
+    length = vsnprintk(output, sizeof(output), format, args);
+    va_end(args);
+    if (length < 0) {
+        return;
+    }
+    length = MIN(length, (int)sizeof(output) - 1);
+    (void)benchmark_control_send(output, (size_t)length);
+#else
+    va_list args;
+
+    va_start(args, format);
+    vprintk(format, args);
+    va_end(args);
+#endif
 }
 
 /* FIX 5: Safely wait for data without locking up wolfSSL */
@@ -643,14 +750,14 @@ void start_secure_mqtt_session(struct bt_l2cap_chan *chan)
     benchmark_power_total_set(true);
     ctx = wolfSSL_CTX_new(wolfTLSv1_3_client_method());
     if (!ctx) {
-        BENCH_OUT("[BENCH_RESULT] status=fail stage=tls_setup error=ctx_new\n");
+        BENCH_RESULT_OUT("[BENCH_RESULT] status=fail stage=tls_setup error=ctx_new\n");
         benchmark_power_markers_reset();
         return;
     }
 #ifdef BENCH_USE_PQM4_MLKEM
     ret = wolfSSL_CTX_SetDevId(ctx, pqm4_mlkem_backend_dev_id());
     if (ret != WOLFSSL_SUCCESS) {
-        BENCH_OUT("[BENCH_RESULT] status=fail stage=pqm4_device error=%d\n", ret);
+        BENCH_RESULT_OUT("[BENCH_RESULT] status=fail stage=pqm4_device error=%d\n", ret);
         wolfSSL_CTX_free(ctx);
         benchmark_power_markers_reset();
         return;
@@ -666,7 +773,7 @@ void start_secure_mqtt_session(struct bt_l2cap_chan *chan)
             ctx, benchmark_ca_bundle[i].data, benchmark_ca_bundle[i].length,
             WOLFSSL_FILETYPE_ASN1);
         if (ret != WOLFSSL_SUCCESS) {
-            BENCH_OUT("[BENCH_RESULT] status=fail stage=ca_load error=%d ca_index=%u\n",
+            BENCH_RESULT_OUT("[BENCH_RESULT] status=fail stage=ca_load error=%d ca_index=%u\n",
                       ret, (unsigned int)i);
             wolfSSL_CTX_free(ctx);
             benchmark_power_markers_reset();
@@ -687,7 +794,7 @@ void start_secure_mqtt_session(struct bt_l2cap_chan *chan)
     };
     ret = wolfSSL_CTX_set_groups(ctx, groups, ARRAY_SIZE(groups));
     if (ret != WOLFSSL_SUCCESS) {
-        BENCH_OUT("[BENCH_RESULT] status=fail stage=group_setup error=%d\n", ret);
+        BENCH_RESULT_OUT("[BENCH_RESULT] status=fail stage=group_setup error=%d\n", ret);
         wolfSSL_CTX_free(ctx);
         benchmark_power_markers_reset();
         return;
@@ -697,7 +804,7 @@ void start_secure_mqtt_session(struct bt_l2cap_chan *chan)
         ctx, benchmark_client_cert, sizeof(benchmark_client_cert),
         WOLFSSL_FILETYPE_ASN1);
     if (ret != WOLFSSL_SUCCESS) {
-        BENCH_OUT("[BENCH_RESULT] status=fail stage=client_cert error=%d\n", ret);
+        BENCH_RESULT_OUT("[BENCH_RESULT] status=fail stage=client_cert error=%d\n", ret);
         wolfSSL_CTX_free(ctx);
         benchmark_power_markers_reset();
         return;
@@ -706,7 +813,7 @@ void start_secure_mqtt_session(struct bt_l2cap_chan *chan)
         ctx, benchmark_client_key, sizeof(benchmark_client_key),
         WOLFSSL_FILETYPE_ASN1);
     if (ret != WOLFSSL_SUCCESS) {
-        BENCH_OUT("[BENCH_RESULT] status=fail stage=client_key error=%d\n", ret);
+        BENCH_RESULT_OUT("[BENCH_RESULT] status=fail stage=client_key error=%d\n", ret);
         wolfSSL_CTX_free(ctx);
         benchmark_power_markers_reset();
         return;
@@ -716,7 +823,7 @@ void start_secure_mqtt_session(struct bt_l2cap_chan *chan)
     wolfSSL_CTX_SetIORecv(ctx, l2cap_wolfssl_recv);
     ssl = wolfSSL_new(ctx);
     if (!ssl) {
-        BENCH_OUT("[BENCH_RESULT] status=fail stage=tls_setup error=ssl_new\n");
+        BENCH_RESULT_OUT("[BENCH_RESULT] status=fail stage=tls_setup error=ssl_new\n");
         wolfSSL_CTX_free(ctx);
         benchmark_power_markers_reset();
         return;
@@ -753,7 +860,7 @@ void start_secure_mqtt_session(struct bt_l2cap_chan *chan)
             benchmark_hardware_counters_stop();
             tls_handshake_active = false;
             benchmark_power_handshake_set(false);
-            BENCH_OUT(
+            BENCH_RESULT_OUT(
                 "[BENCH_RESULT] status=fail stage=tls_handshake error=%d "
                 "tls_setup_ms=%lld client_cpu_cycles=%llu "
                 "client_cpu_us=%llu client_cycle_hz=%u\n",
@@ -783,7 +890,7 @@ void start_secure_mqtt_session(struct bt_l2cap_chan *chan)
     int64_t mqtt_start_ms = k_uptime_get();
     ret = wolfSSL_write(ssl, mqtt_connect, sizeof(mqtt_connect));
     if (ret != sizeof(mqtt_connect)) {
-        BENCH_OUT("[BENCH_RESULT] status=fail stage=mqtt_write error=%d\n",
+        BENCH_RESULT_OUT("[BENCH_RESULT] status=fail stage=mqtt_write error=%d\n",
                   wolfSSL_get_error(ssl, ret));
         goto cleanup;
     }
@@ -803,7 +910,7 @@ void start_secure_mqtt_session(struct bt_l2cap_chan *chan)
             struct benchmark_stack_snapshot stacks =
                 benchmark_stack_snapshot_get();
             benchmark_power_total_set(false);
-            BENCH_OUT(
+            BENCH_RESULT_OUT(
                 "[BENCH_RESULT] status=success tls_setup_ms=%lld "
                 "raw_handshake_ms=%lld mqtt_connect_ms=%lld full_connect_ms=%lld "
                 "end_to_end_ms=%lld client_cpu_cycles=%llu client_cpu_us=%llu "
@@ -866,13 +973,13 @@ void start_secure_mqtt_session(struct bt_l2cap_chan *chan)
         if (bytes_read < 0) {
             int error = wolfSSL_get_error(ssl, bytes_read);
             if (error != WOLFSSL_ERROR_WANT_READ && error != WOLFSSL_ERROR_WANT_WRITE) {
-                BENCH_OUT("[BENCH_RESULT] status=fail stage=mqtt_read error=%d\n", error);
+                BENCH_RESULT_OUT("[BENCH_RESULT] status=fail stage=mqtt_read error=%d\n", error);
                 goto cleanup;
             }
         }
         k_sleep(K_MSEC(1));
     }
-    BENCH_OUT("[BENCH_RESULT] status=timeout stage=mqtt_connack error=timeout\n");
+    BENCH_RESULT_OUT("[BENCH_RESULT] status=timeout stage=mqtt_connack error=timeout\n");
 
 cleanup:
     benchmark_metrics_stop();
@@ -923,10 +1030,13 @@ int main(void) {
 
     bt_conn_auth_cb_register(NULL);
 
-    if (bt_enable(NULL)) {
-        BENCH_LOG("Bluetooth init failed\n");
+    BENCH_OUT("[BENCH_BOOT] stage=bt_enable_start\n");
+    int bt_err = bt_enable(NULL);
+    if (bt_err) {
+        BENCH_OUT("[BENCH_FATAL] stage=bt_enable error=%d\n", bt_err);
         return 0;
     }
+    BENCH_OUT("[BENCH_BOOT] stage=bt_enable_done\n");
 
     wolfSSL_SetAllocators(wolfssl_malloc, wolfssl_free, wolfssl_realloc);
     wolfSSL_Init();
@@ -994,6 +1104,11 @@ int main(void) {
         if (k_sem_take(&conn_params_ready_sem, K_SECONDS(2)) != 0) {
             BENCH_LOG("[BLE] Continuing after connection parameter wait timeout.\n");
         }
+        BENCH_OUT("[BENCH_READY] psm=0x%04x mtu=%u ca_count=%u "
+                  "mlkem_backend=%s rsa_profile=%s transport=l2cap\n",
+                  l2cap_server.psm, L2CAP_SDU_MTU,
+                  (unsigned int)BENCHMARK_CA_COUNT,
+                  BENCH_MLKEM_BACKEND_NAME, BENCH_RSA_PROFILE_NAME);
         start_secure_mqtt_session(&l2cap_chan.chan);
         
         BENCH_LOG("Session ended. Re-arming for next connection...\n");

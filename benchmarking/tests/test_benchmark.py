@@ -4,13 +4,14 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import Mock, patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from benchmarklib.metrics import parse_bench_line
-from benchmarklib.power_profiler import PowerProfilerCapture
+from benchmarklib.power_profiler import PowerProfilerCapture, PowerProfilerSession
 from benchmarklib.certificates import write_case_configs
 from benchmarklib.gateway import PiGateway
 from benchmarklib.scheduler import build_jobs
@@ -32,6 +33,7 @@ from run_benchmarks import (
     summarize,
     timeout_for_case,
     wait_for_result,
+    wait_for_ble_result,
     write_checkpoint,
 )
 
@@ -151,6 +153,48 @@ class BenchmarkTests(unittest.TestCase):
         self.assertEqual(values["total_execution_duration_ms"], "0.020")
         self.assertEqual(values["total_execution_charge_uc"], "0.002000")
         self.assertEqual(values["total_execution_energy_uj"], "0.006000")
+
+    def test_ppk2_session_uses_source_mode_and_turns_power_off(self) -> None:
+        ppk = Mock()
+        ppk.ser = Mock()
+        ppk.get_modifiers.return_value = {"calibrated": True}
+        with patch("benchmarklib.power_profiler._open_ppk", return_value=ppk):
+            session = PowerProfilerSession("/dev/ppk2", 3000, 100)
+            session.open()
+            session.power_cycle(off_seconds=0, boot_seconds=0)
+            session.close()
+
+        ppk.use_source_meter.assert_called_once_with()
+        ppk.set_source_voltage.assert_called_once_with(3000)
+        self.assertEqual(
+            [call.args[0] for call in ppk.toggle_DUT_power.call_args_list],
+            ["OFF", "ON", "OFF", "ON", "OFF"],
+        )
+
+    def test_ppk2_open_failure_leaves_source_off(self) -> None:
+        ppk = Mock()
+        ppk.ser = Mock()
+        ppk.get_modifiers.return_value = {}
+        with patch("benchmarklib.power_profiler._open_ppk", return_value=ppk):
+            session = PowerProfilerSession("/dev/ppk2", 3000, 100)
+            with self.assertRaises(RuntimeError):
+                session.open()
+
+        ppk.toggle_DUT_power.assert_called_once_with("OFF")
+        ppk.ser.close.assert_called_once_with()
+        self.assertIsNone(session.ppk)
+
+    def test_ble_result_is_parsed_without_serial(self) -> None:
+        gateway = Mock()
+        gateway.remote_benchmark_result.return_value = (
+            "[BENCH_RESULT] status=success raw_handshake_ms=123"
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            result = wait_for_ble_result(
+                gateway, "case", Path(tmpdir) / "board.log", timeout=1.0
+            )
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["raw_handshake_ms"], "123")
 
     def test_power_windows_sum_all_crypto_pulses(self) -> None:
         capture = PowerProfilerCapture("/dev/null", 3000, 100)
@@ -508,12 +552,18 @@ class BenchmarkTests(unittest.TestCase):
                 disable_wifi=True,
                 ready_timeout=1,
                 log=Path(tmp) / "gateway.log",
+                control_telemetry=True,
             )
         launch = next(command for command in gateway.commands if "--name PQC52840" in command)
         self.assertNotIn("--forget-cache", launch)
         self.assertNotIn("--addr ", launch)
         self.assertIn("--disable-wifi", launch)
         self.assertIn("--name PQC52840", launch)
+        readiness = next(
+            command for command in gateway.commands
+            if "gateway_tcp_connect_ms" in command
+        )
+        self.assertIn("BENCH_READY", readiness)
 
     def test_gateway_command_creates_log_parent(self) -> None:
         class TrueGateway(PiGateway):

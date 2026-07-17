@@ -135,14 +135,22 @@ def build(
     pqm4_dir: Path | None,
     large_rsa: bool = False,
     power_markers: bool = False,
+    ble_telemetry: bool = False,
 ) -> None:
     cmake_args = [
         f"-DBENCH_GENERATED_DIR={generated_dir}",
         f"-DBENCH_MLKEM_BACKEND={mlkem_backend}",
         f"-DBENCH_POWER_MARKERS={'ON' if power_markers else 'OFF'}",
+        f"-DBENCH_BLE_TELEMETRY={'ON' if ble_telemetry else 'OFF'}",
     ]
+    is_nrf5340 = board.startswith("nrf5340dk/")
     if pqm4_dir is not None:
         cmake_args.append(f"-DPQM4_ROOT={pqm4_dir}")
+    build_env = toolchain_environment(nrfutil)
+    build_env["BENCH_GENERATED_DIR"] = str(generated_dir)
+    build_env["BENCH_MLKEM_BACKEND"] = mlkem_backend
+    if pqm4_dir is not None:
+        build_env["PQM4_ROOT"] = str(pqm4_dir)
     command, cwd, env = west_command(
         nrfutil=nrfutil,
         ncs_version=ncs_version,
@@ -151,12 +159,16 @@ def build(
             "build",
             "-d", str(build_dir),
             "-p", "always",
-            "--no-sysbuild",
+            "--sysbuild" if is_nrf5340 else "--no-sysbuild",
             "-b", board,
             str(firmware_dir),
             "--", *cmake_args,
         ],
     )
+    if env is None:
+        env = build_env
+    else:
+        env.update(build_env)
     run_logged(command, log, cwd=cwd, env=env)
 
 

@@ -73,6 +73,19 @@ class PiGateway:
             return proc.stdout.strip().splitlines()[0]
         return ""
 
+    def remote_benchmark_result(self, case_id: str) -> str:
+        path = f"{self.workdir}/logs/{case_id}.gateway.log"
+        script = (
+            f"test -f {shlex.quote(path)} && "
+            f"grep '^\\[BENCH_RESULT\\]' {shlex.quote(path)} | tail -n 1"
+        )
+        command = [*self.ssh_base(), self.host, f"bash -lc {shlex.quote(script)}"]
+        proc = subprocess.run(
+            command, text=True, stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+        )
+        return proc.stdout.strip() if proc.returncode == 0 else ""
+
     def deploy_file(self, source: Path, destination: str, log: Path) -> None:
         ssh_transport = " ".join(shlex.quote(part) for part in self.ssh_base())
         self._local(
@@ -238,6 +251,7 @@ class PiGateway:
         log: Path,
         server_backend: str = "openssl-mosquitto",
         wolfssl_group: str = "",
+        control_telemetry: bool = False,
     ) -> None:
         self.stop_session(log, reset_adapter=disable_wifi)
         self.ble_addr = ble_addr
@@ -289,9 +303,14 @@ class PiGateway:
         )
         self.command(script, log)
         checks = max(1, int(ready_timeout * 4))
+        ready_check = (
+            f"grep -q '^\\[BENCH_READY\\].*transport=l2cap' {gateway_log} && "
+            if control_telemetry else ""
+        )
         self.command(
             f"for i in $(seq 1 {checks}); do "
-            f"  grep -q '\\[BENCH_GATEWAY\\] gateway_tcp_connect_ms=' {gateway_log} "
+            f"  {ready_check}"
+            f"grep -q '\\[BENCH_GATEWAY\\] gateway_tcp_connect_ms=' {gateway_log} "
             "    && exit 0; "
             f"  pid=$(cat {self.workdir}/bridge.pid 2>/dev/null || true); "
             "  [ -n \"$pid\" ] && kill -0 \"$pid\" 2>/dev/null || exit 1; "

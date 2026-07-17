@@ -1,0 +1,127 @@
+case_id,enabled,kex_group,kex_family,kex_nist_level,kex_public_key_bytes,kex_ciphertext_bytes,kex_shared_secret_bytes,cert_sig_alg,sig_family,sig_nist_level,sig_public_key_bytes,sig_private_key_bytes,sig_signature_bytes,certificate_verify_alg,iterations,warmup_iterations,expected_support,notes
+secp384r1mlkem1024__ml_dsa_87,1,SecP384r1MLKEM1024,pqc,5,1665,1665,80,ML-DSA-87,pqc,5,2592,4896,4627,ML-DSA-87,1,0,required,
+secp256r1mlkem768__ml_dsa_44,1,SecP256r1MLKEM768,pqc,3,1249,1153,64,ML-DSA-44,pqc,2,1312,2560,2420,ML-DSA-44,1,0,required,
+ecdhe_p_384__rsa_pss_15360,1,ECDHE-P-384,classic,3,97,97,48,RSA-PSS-15360,classic,5,1920,1920,1920,RSA-PSS-15360,1,0,required,
+secp384r1mlkem1024__ecdsa_p_384,1,SecP384r1MLKEM1024,pqc,5,1665,1665,80,ECDSA-P-384,classic,3,97,48,96,ECDSA-P-384,1,0,required,
+x25519mlkem768__slh_dsa_shake_192s,1,X25519MLKEM768,pqc,3,1216,1120,64,SLH-DSA-SHAKE-192s,pqc,3,48,96,16224,ECDSA-P-384,1,0,required,SLH-DSA signs the chain; TLS CertificateVerify uses ECDSA
+secp256r1mlkem768__slh_dsa_shake_192s,1,SecP256r1MLKEM768,pqc,3,1249,1153,64,SLH-DSA-SHAKE-192s,pqc,3,48,96,16224,ECDSA-P-384,1,0,required,SLH-DSA signs the chain; TLS CertificateVerify uses ECDSA
+secp256r1mlkem768__ml_dsa_65,1,SecP256r1MLKEM768,pqc,3,1249,1153,64,ML-DSA-65,pqc,3,1952,4032,3309,ML-DSA-65,1,0,required,
+mlkem512__ecdsa_p_521,1,MLKEM512,pqc,1,800,768,32,ECDSA-P-521,classic,5,133,66,132,ECDSA-P-521,1,0,required,
+mlkem768__ecdsa_p_521,1,MLKEM768,pqc,3,1184,1088,32,ECDSA-P-521,classic,5,133,66,132,ECDSA-P-521,1,0,required,
+mlkem1024__ecdsa_p_521,1,MLKEM1024,pqc,5,1568,1568,32,ECDSA-P-521,classic,5,133,66,132,ECDSA-P-521,1,0,required,
+mlkem512__slh_dsa_shake_128s,1,MLKEM512,pqc,1,800,768,32,SLH-DSA-SHAKE-128s,pqc,1,32,64,7856,ECDSA-P-256,1,0,required,SLH-DSA signs the chain; TLS CertificateVerify uses ECDSA
+mlkem768__ml_dsa_87,1,MLKEM768,pqc,3,1184,1088,32,ML-DSA-87,pqc,5,2592,4896,4627,ML-DSA-87,1,0,required,
+ecdhe_p_384__xmss_sha2_20_256,1,ECDHE-P-384,classic,3,97,97,48,XMSS-SHA2_20_256,pqc,5,68,2573,2820,XMSS-SHA2_20_256,1,0,required,XMSS signs the chain; TLS CertificateVerify uses ECDSA
+mlkem1024__slh_dsa_shake_256s,1,MLKEM1024,pqc,5,1568,1568,32,SLH-DSA-SHAKE-256s,pqc,5,64,128,29792,ECDSA-P-521,1,0,required,SLH-DSA signs the chain; TLS CertificateVerify uses ECDSA
+mlkem768__ml_dsa_65,1,MLKEM768,pqc,3,1184,1088,32,ML-DSA-65,pqc,3,1952,4032,3309,ML-DSA-65,1,0,required,
+mlkem1024__ecdsa_p_256,1,MLKEM1024,pqc,5,1568,1568,32,ECDSA-P-256,classic,1,65,32,64,ECDSA-P-256,1,0,required,
+secp256r1mlkem768__ecdsa_p_521,1,SecP256r1MLKEM768,pqc,3,1249,1153,64,ECDSA-P-521,classic,5,133,66,132,ECDSA-P-521,1,0,required,
+secp256r1mlkem768__lms_hss_l2_h10_w4,1,SecP256r1MLKEM768,pqc,3,1249,1153,64,LMS-HSS-L2-H10-W4,pqc,5,60,64,5076,LMS-HSS-L2-H10-W4,1,0,required,LMS/HSS signs the chain; TLS CertificateVerify uses ECDSA
+mlkem1024__slh_dsa_shake_128s,1,MLKEM1024,pqc,5,1568,1568,32,SLH-DSA-SHAKE-128s,pqc,1,32,64,7856,ECDSA-P-256,1,0,required,SLH-DSA signs the chain; TLS CertificateVerify uses ECDSA
+x25519mlkem768__ml_dsa_44,1,X25519MLKEM768,pqc,3,1216,1120,64,ML-DSA-44,pqc,2,1312,2560,2420,ML-DSA-44,1,0,required,
+mlkem512__rsa_pss_3072,1,MLKEM512,pqc,1,800,768,32,RSA-PSS-3072,classic,1,384,384,384,RSA-PSS-3072,1,0,required,
+ecdhe_p_521__slh_dsa_shake_192s,1,ECDHE-P-521,classic,5,133,133,66,SLH-DSA-SHAKE-192s,pqc,3,48,96,16224,ECDSA-P-384,1,0,required,SLH-DSA signs the chain; TLS CertificateVerify uses ECDSA
+ecdhe_p_521__ecdsa_p_256,1,ECDHE-P-521,classic,5,133,133,66,ECDSA-P-256,classic,1,65,32,64,ECDSA-P-256,1,0,required,
+x25519mlkem768__ml_dsa_87,1,X25519MLKEM768,pqc,3,1216,1120,64,ML-DSA-87,pqc,5,2592,4896,4627,ML-DSA-87,1,0,required,
+ecdhe_p_256__ml_dsa_65,1,ECDHE-P-256,classic,1,65,65,32,ML-DSA-65,pqc,3,1952,4032,3309,ML-DSA-65,1,0,required,
+mlkem1024__rsa_pss_7680,1,MLKEM1024,pqc,5,1568,1568,32,RSA-PSS-7680,classic,3,960,960,960,RSA-PSS-7680,1,0,required,
+ecdhe_p_521__ecdsa_p_521,1,ECDHE-P-521,classic,5,133,133,66,ECDSA-P-521,classic,5,133,66,132,ECDSA-P-521,1,0,required,
+mlkem1024__rsa_pss_15360,1,MLKEM1024,pqc,5,1568,1568,32,RSA-PSS-15360,classic,5,1920,1920,1920,RSA-PSS-15360,1,0,required,
+ecdhe_p_384__ecdsa_p_384,1,ECDHE-P-384,classic,3,97,97,48,ECDSA-P-384,classic,3,97,48,96,ECDSA-P-384,1,0,required,
+ecdhe_p_256__slh_dsa_shake_128s,1,ECDHE-P-256,classic,1,65,65,32,SLH-DSA-SHAKE-128s,pqc,1,32,64,7856,ECDSA-P-256,1,0,required,SLH-DSA signs the chain; TLS CertificateVerify uses ECDSA
+x25519mlkem768__ecdsa_p_521,1,X25519MLKEM768,pqc,3,1216,1120,64,ECDSA-P-521,classic,5,133,66,132,ECDSA-P-521,1,0,required,
+ecdhe_p_256__rsa_pss_3072,1,ECDHE-P-256,classic,1,65,65,32,RSA-PSS-3072,classic,1,384,384,384,RSA-PSS-3072,1,0,required,
+mlkem768__ecdsa_p_256,1,MLKEM768,pqc,3,1184,1088,32,ECDSA-P-256,classic,1,65,32,64,ECDSA-P-256,1,0,required,
+ecdhe_p_384__ecdsa_p_256,1,ECDHE-P-384,classic,3,97,97,48,ECDSA-P-256,classic,1,65,32,64,ECDSA-P-256,1,0,required,
+ecdhe_p_384__ml_dsa_87,1,ECDHE-P-384,classic,3,97,97,48,ML-DSA-87,pqc,5,2592,4896,4627,ML-DSA-87,1,0,required,
+secp256r1mlkem768__slh_dsa_shake_128s,1,SecP256r1MLKEM768,pqc,3,1249,1153,64,SLH-DSA-SHAKE-128s,pqc,1,32,64,7856,ECDSA-P-256,1,0,required,SLH-DSA signs the chain; TLS CertificateVerify uses ECDSA
+ecdhe_p_384__slh_dsa_shake_128s,1,ECDHE-P-384,classic,3,97,97,48,SLH-DSA-SHAKE-128s,pqc,1,32,64,7856,ECDSA-P-256,1,0,required,SLH-DSA signs the chain; TLS CertificateVerify uses ECDSA
+mlkem1024__ml_dsa_87,1,MLKEM1024,pqc,5,1568,1568,32,ML-DSA-87,pqc,5,2592,4896,4627,ML-DSA-87,1,0,required,
+mlkem1024__xmss_sha2_20_256,1,MLKEM1024,pqc,5,1568,1568,32,XMSS-SHA2_20_256,pqc,5,68,2573,2820,XMSS-SHA2_20_256,1,0,required,XMSS signs the chain; TLS CertificateVerify uses ECDSA
+ecdhe_p_256__lms_hss_l2_h10_w4,1,ECDHE-P-256,classic,1,65,65,32,LMS-HSS-L2-H10-W4,pqc,5,60,64,5076,LMS-HSS-L2-H10-W4,1,0,required,LMS/HSS signs the chain; TLS CertificateVerify uses ECDSA
+mlkem768__xmss_sha2_20_256,1,MLKEM768,pqc,3,1184,1088,32,XMSS-SHA2_20_256,pqc,5,68,2573,2820,XMSS-SHA2_20_256,1,0,required,XMSS signs the chain; TLS CertificateVerify uses ECDSA
+mlkem768__rsa_pss_3072,1,MLKEM768,pqc,3,1184,1088,32,RSA-PSS-3072,classic,1,384,384,384,RSA-PSS-3072,1,0,required,
+ecdhe_p_521__ml_dsa_87,1,ECDHE-P-521,classic,5,133,133,66,ML-DSA-87,pqc,5,2592,4896,4627,ML-DSA-87,1,0,required,
+ecdhe_p_384__slh_dsa_shake_192s,1,ECDHE-P-384,classic,3,97,97,48,SLH-DSA-SHAKE-192s,pqc,3,48,96,16224,ECDSA-P-384,1,0,required,SLH-DSA signs the chain; TLS CertificateVerify uses ECDSA
+ecdhe_p_521__ecdsa_p_384,1,ECDHE-P-521,classic,5,133,133,66,ECDSA-P-384,classic,3,97,48,96,ECDSA-P-384,1,0,required,
+mlkem1024__ml_dsa_65,1,MLKEM1024,pqc,5,1568,1568,32,ML-DSA-65,pqc,3,1952,4032,3309,ML-DSA-65,1,0,required,
+ecdhe_p_384__slh_dsa_shake_256s,1,ECDHE-P-384,classic,3,97,97,48,SLH-DSA-SHAKE-256s,pqc,5,64,128,29792,ECDSA-P-521,1,0,required,SLH-DSA signs the chain; TLS CertificateVerify uses ECDSA
+ecdhe_p_521__ml_dsa_65,1,ECDHE-P-521,classic,5,133,133,66,ML-DSA-65,pqc,3,1952,4032,3309,ML-DSA-65,1,0,required,
+mlkem512__ml_dsa_65,1,MLKEM512,pqc,1,800,768,32,ML-DSA-65,pqc,3,1952,4032,3309,ML-DSA-65,1,0,required,
+ecdhe_p_384__ml_dsa_65,1,ECDHE-P-384,classic,3,97,97,48,ML-DSA-65,pqc,3,1952,4032,3309,ML-DSA-65,1,0,required,
+ecdhe_p_256__slh_dsa_shake_192s,1,ECDHE-P-256,classic,1,65,65,32,SLH-DSA-SHAKE-192s,pqc,3,48,96,16224,ECDSA-P-384,1,0,required,SLH-DSA signs the chain; TLS CertificateVerify uses ECDSA
+secp256r1mlkem768__rsa_pss_3072,1,SecP256r1MLKEM768,pqc,3,1249,1153,64,RSA-PSS-3072,classic,1,384,384,384,RSA-PSS-3072,1,0,required,
+x25519mlkem768__rsa_pss_15360,1,X25519MLKEM768,pqc,3,1216,1120,64,RSA-PSS-15360,classic,5,1920,1920,1920,RSA-PSS-15360,1,0,required,
+x25519mlkem768__rsa_pss_3072,1,X25519MLKEM768,pqc,3,1216,1120,64,RSA-PSS-3072,classic,1,384,384,384,RSA-PSS-3072,1,0,required,
+x25519mlkem768__rsa_pss_7680,1,X25519MLKEM768,pqc,3,1216,1120,64,RSA-PSS-7680,classic,3,960,960,960,RSA-PSS-7680,1,0,required,
+secp384r1mlkem1024__slh_dsa_shake_128s,1,SecP384r1MLKEM1024,pqc,5,1665,1665,80,SLH-DSA-SHAKE-128s,pqc,1,32,64,7856,ECDSA-P-256,1,0,required,SLH-DSA signs the chain; TLS CertificateVerify uses ECDSA
+mlkem512__rsa_pss_7680,1,MLKEM512,pqc,1,800,768,32,RSA-PSS-7680,classic,3,960,960,960,RSA-PSS-7680,1,0,required,
+secp256r1mlkem768__rsa_pss_7680,1,SecP256r1MLKEM768,pqc,3,1249,1153,64,RSA-PSS-7680,classic,3,960,960,960,RSA-PSS-7680,1,0,required,
+ecdhe_p_521__xmss_sha2_20_256,1,ECDHE-P-521,classic,5,133,133,66,XMSS-SHA2_20_256,pqc,5,68,2573,2820,XMSS-SHA2_20_256,1,0,required,XMSS signs the chain; TLS CertificateVerify uses ECDSA
+secp256r1mlkem768__slh_dsa_shake_256s,1,SecP256r1MLKEM768,pqc,3,1249,1153,64,SLH-DSA-SHAKE-256s,pqc,5,64,128,29792,ECDSA-P-521,1,0,required,SLH-DSA signs the chain; TLS CertificateVerify uses ECDSA
+mlkem512__lms_hss_l2_h10_w4,1,MLKEM512,pqc,1,800,768,32,LMS-HSS-L2-H10-W4,pqc,5,60,64,5076,LMS-HSS-L2-H10-W4,1,0,required,LMS/HSS signs the chain; TLS CertificateVerify uses ECDSA
+secp256r1mlkem768__ecdsa_p_256,1,SecP256r1MLKEM768,pqc,3,1249,1153,64,ECDSA-P-256,classic,1,65,32,64,ECDSA-P-256,1,0,required,
+ecdhe_p_521__rsa_pss_7680,1,ECDHE-P-521,classic,5,133,133,66,RSA-PSS-7680,classic,3,960,960,960,RSA-PSS-7680,1,0,required,
+mlkem512__rsa_pss_15360,1,MLKEM512,pqc,1,800,768,32,RSA-PSS-15360,classic,5,1920,1920,1920,RSA-PSS-15360,1,0,required,
+mlkem512__slh_dsa_shake_256s,1,MLKEM512,pqc,1,800,768,32,SLH-DSA-SHAKE-256s,pqc,5,64,128,29792,ECDSA-P-521,1,0,required,SLH-DSA signs the chain; TLS CertificateVerify uses ECDSA
+mlkem768__ml_dsa_44,1,MLKEM768,pqc,3,1184,1088,32,ML-DSA-44,pqc,2,1312,2560,2420,ML-DSA-44,1,0,required,
+mlkem1024__lms_hss_l2_h10_w4,1,MLKEM1024,pqc,5,1568,1568,32,LMS-HSS-L2-H10-W4,pqc,5,60,64,5076,LMS-HSS-L2-H10-W4,1,0,required,LMS/HSS signs the chain; TLS CertificateVerify uses ECDSA
+mlkem768__slh_dsa_shake_128s,1,MLKEM768,pqc,3,1184,1088,32,SLH-DSA-SHAKE-128s,pqc,1,32,64,7856,ECDSA-P-256,1,0,required,SLH-DSA signs the chain; TLS CertificateVerify uses ECDSA
+mlkem512__ml_dsa_87,1,MLKEM512,pqc,1,800,768,32,ML-DSA-87,pqc,5,2592,4896,4627,ML-DSA-87,1,0,required,
+ecdhe_p_256__ecdsa_p_384,1,ECDHE-P-256,classic,1,65,65,32,ECDSA-P-384,classic,3,97,48,96,ECDSA-P-384,1,0,required,
+secp256r1mlkem768__ml_dsa_87,1,SecP256r1MLKEM768,pqc,3,1249,1153,64,ML-DSA-87,pqc,5,2592,4896,4627,ML-DSA-87,1,0,required,
+mlkem768__slh_dsa_shake_256s,1,MLKEM768,pqc,3,1184,1088,32,SLH-DSA-SHAKE-256s,pqc,5,64,128,29792,ECDSA-P-521,1,0,required,SLH-DSA signs the chain; TLS CertificateVerify uses ECDSA
+ecdhe_p_384__lms_hss_l2_h10_w4,1,ECDHE-P-384,classic,3,97,97,48,LMS-HSS-L2-H10-W4,pqc,5,60,64,5076,LMS-HSS-L2-H10-W4,1,0,required,LMS/HSS signs the chain; TLS CertificateVerify uses ECDSA
+mlkem1024__slh_dsa_shake_192s,1,MLKEM1024,pqc,5,1568,1568,32,SLH-DSA-SHAKE-192s,pqc,3,48,96,16224,ECDSA-P-384,1,0,required,SLH-DSA signs the chain; TLS CertificateVerify uses ECDSA
+mlkem768__slh_dsa_shake_192s,1,MLKEM768,pqc,3,1184,1088,32,SLH-DSA-SHAKE-192s,pqc,3,48,96,16224,ECDSA-P-384,1,0,required,SLH-DSA signs the chain; TLS CertificateVerify uses ECDSA
+x25519mlkem768__ml_dsa_65,1,X25519MLKEM768,pqc,3,1216,1120,64,ML-DSA-65,pqc,3,1952,4032,3309,ML-DSA-65,1,0,required,
+ecdhe_p_521__slh_dsa_shake_256s,1,ECDHE-P-521,classic,5,133,133,66,SLH-DSA-SHAKE-256s,pqc,5,64,128,29792,ECDSA-P-521,1,0,required,SLH-DSA signs the chain; TLS CertificateVerify uses ECDSA
+secp384r1mlkem1024__rsa_pss_15360,1,SecP384r1MLKEM1024,pqc,5,1665,1665,80,RSA-PSS-15360,classic,5,1920,1920,1920,RSA-PSS-15360,1,0,required,
+mlkem768__rsa_pss_7680,1,MLKEM768,pqc,3,1184,1088,32,RSA-PSS-7680,classic,3,960,960,960,RSA-PSS-7680,1,0,required,
+ecdhe_p_521__rsa_pss_15360,1,ECDHE-P-521,classic,5,133,133,66,RSA-PSS-15360,classic,5,1920,1920,1920,RSA-PSS-15360,1,0,required,
+mlkem768__rsa_pss_15360,1,MLKEM768,pqc,3,1184,1088,32,RSA-PSS-15360,classic,5,1920,1920,1920,RSA-PSS-15360,1,0,required,
+mlkem1024__rsa_pss_3072,1,MLKEM1024,pqc,5,1568,1568,32,RSA-PSS-3072,classic,1,384,384,384,RSA-PSS-3072,1,0,required,
+secp384r1mlkem1024__slh_dsa_shake_192s,1,SecP384r1MLKEM1024,pqc,5,1665,1665,80,SLH-DSA-SHAKE-192s,pqc,3,48,96,16224,ECDSA-P-384,1,0,required,SLH-DSA signs the chain; TLS CertificateVerify uses ECDSA
+ecdhe_p_521__slh_dsa_shake_128s,1,ECDHE-P-521,classic,5,133,133,66,SLH-DSA-SHAKE-128s,pqc,1,32,64,7856,ECDSA-P-256,1,0,required,SLH-DSA signs the chain; TLS CertificateVerify uses ECDSA
+ecdhe_p_256__ecdsa_p_521,1,ECDHE-P-256,classic,1,65,65,32,ECDSA-P-521,classic,5,133,66,132,ECDSA-P-521,1,0,required,
+ecdhe_p_384__ecdsa_p_521,1,ECDHE-P-384,classic,3,97,97,48,ECDSA-P-521,classic,5,133,66,132,ECDSA-P-521,1,0,required,
+ecdhe_p_384__rsa_pss_7680,1,ECDHE-P-384,classic,3,97,97,48,RSA-PSS-7680,classic,3,960,960,960,RSA-PSS-7680,1,0,required,
+secp256r1mlkem768__ecdsa_p_384,1,SecP256r1MLKEM768,pqc,3,1249,1153,64,ECDSA-P-384,classic,3,97,48,96,ECDSA-P-384,1,0,required,
+secp256r1mlkem768__xmss_sha2_20_256,1,SecP256r1MLKEM768,pqc,3,1249,1153,64,XMSS-SHA2_20_256,pqc,5,68,2573,2820,XMSS-SHA2_20_256,1,0,required,XMSS signs the chain; TLS CertificateVerify uses ECDSA
+ecdhe_p_256__rsa_pss_15360,1,ECDHE-P-256,classic,1,65,65,32,RSA-PSS-15360,classic,5,1920,1920,1920,RSA-PSS-15360,1,0,required,
+secp384r1mlkem1024__ml_dsa_65,1,SecP384r1MLKEM1024,pqc,5,1665,1665,80,ML-DSA-65,pqc,3,1952,4032,3309,ML-DSA-65,1,0,required,
+mlkem768__ecdsa_p_384,1,MLKEM768,pqc,3,1184,1088,32,ECDSA-P-384,classic,3,97,48,96,ECDSA-P-384,1,0,required,
+ecdhe_p_521__lms_hss_l2_h10_w4,1,ECDHE-P-521,classic,5,133,133,66,LMS-HSS-L2-H10-W4,pqc,5,60,64,5076,LMS-HSS-L2-H10-W4,1,0,required,LMS/HSS signs the chain; TLS CertificateVerify uses ECDSA
+x25519mlkem768__ecdsa_p_384,1,X25519MLKEM768,pqc,3,1216,1120,64,ECDSA-P-384,classic,3,97,48,96,ECDSA-P-384,1,0,required,
+ecdhe_p_256__ml_dsa_87,1,ECDHE-P-256,classic,1,65,65,32,ML-DSA-87,pqc,5,2592,4896,4627,ML-DSA-87,1,0,required,
+secp384r1mlkem1024__ecdsa_p_521,1,SecP384r1MLKEM1024,pqc,5,1665,1665,80,ECDSA-P-521,classic,5,133,66,132,ECDSA-P-521,1,0,required,
+mlkem1024__ml_dsa_44,1,MLKEM1024,pqc,5,1568,1568,32,ML-DSA-44,pqc,2,1312,2560,2420,ML-DSA-44,1,0,required,
+secp384r1mlkem1024__slh_dsa_shake_256s,1,SecP384r1MLKEM1024,pqc,5,1665,1665,80,SLH-DSA-SHAKE-256s,pqc,5,64,128,29792,ECDSA-P-521,1,0,required,SLH-DSA signs the chain; TLS CertificateVerify uses ECDSA
+mlkem512__xmss_sha2_20_256,1,MLKEM512,pqc,1,800,768,32,XMSS-SHA2_20_256,pqc,5,68,2573,2820,XMSS-SHA2_20_256,1,0,required,XMSS signs the chain; TLS CertificateVerify uses ECDSA
+ecdhe_p_256__ecdsa_p_256,1,ECDHE-P-256,classic,1,65,65,32,ECDSA-P-256,classic,1,65,32,64,ECDSA-P-256,1,0,required,
+secp384r1mlkem1024__ml_dsa_44,1,SecP384r1MLKEM1024,pqc,5,1665,1665,80,ML-DSA-44,pqc,2,1312,2560,2420,ML-DSA-44,1,0,required,
+ecdhe_p_521__rsa_pss_3072,1,ECDHE-P-521,classic,5,133,133,66,RSA-PSS-3072,classic,1,384,384,384,RSA-PSS-3072,1,0,required,
+secp256r1mlkem768__rsa_pss_15360,1,SecP256r1MLKEM768,pqc,3,1249,1153,64,RSA-PSS-15360,classic,5,1920,1920,1920,RSA-PSS-15360,1,0,required,
+secp384r1mlkem1024__rsa_pss_7680,1,SecP384r1MLKEM1024,pqc,5,1665,1665,80,RSA-PSS-7680,classic,3,960,960,960,RSA-PSS-7680,1,0,required,
+secp384r1mlkem1024__ecdsa_p_256,1,SecP384r1MLKEM1024,pqc,5,1665,1665,80,ECDSA-P-256,classic,1,65,32,64,ECDSA-P-256,1,0,required,
+x25519mlkem768__lms_hss_l2_h10_w4,1,X25519MLKEM768,pqc,3,1216,1120,64,LMS-HSS-L2-H10-W4,pqc,5,60,64,5076,LMS-HSS-L2-H10-W4,1,0,required,LMS/HSS signs the chain; TLS CertificateVerify uses ECDSA
+ecdhe_p_384__rsa_pss_3072,1,ECDHE-P-384,classic,3,97,97,48,RSA-PSS-3072,classic,1,384,384,384,RSA-PSS-3072,1,0,required,
+ecdhe_p_384__ml_dsa_44,1,ECDHE-P-384,classic,3,97,97,48,ML-DSA-44,pqc,2,1312,2560,2420,ML-DSA-44,1,0,required,
+secp384r1mlkem1024__xmss_sha2_20_256,1,SecP384r1MLKEM1024,pqc,5,1665,1665,80,XMSS-SHA2_20_256,pqc,5,68,2573,2820,XMSS-SHA2_20_256,1,0,required,XMSS signs the chain; TLS CertificateVerify uses ECDSA
+x25519mlkem768__slh_dsa_shake_256s,1,X25519MLKEM768,pqc,3,1216,1120,64,SLH-DSA-SHAKE-256s,pqc,5,64,128,29792,ECDSA-P-521,1,0,required,SLH-DSA signs the chain; TLS CertificateVerify uses ECDSA
+mlkem512__ecdsa_p_384,1,MLKEM512,pqc,1,800,768,32,ECDSA-P-384,classic,3,97,48,96,ECDSA-P-384,1,0,required,
+mlkem512__ecdsa_p_256,1,MLKEM512,pqc,1,800,768,32,ECDSA-P-256,classic,1,65,32,64,ECDSA-P-256,1,0,required,
+mlkem1024__ecdsa_p_384,1,MLKEM1024,pqc,5,1568,1568,32,ECDSA-P-384,classic,3,97,48,96,ECDSA-P-384,1,0,required,
+mlkem768__lms_hss_l2_h10_w4,1,MLKEM768,pqc,3,1184,1088,32,LMS-HSS-L2-H10-W4,pqc,5,60,64,5076,LMS-HSS-L2-H10-W4,1,0,required,LMS/HSS signs the chain; TLS CertificateVerify uses ECDSA
+mlkem512__ml_dsa_44,1,MLKEM512,pqc,1,800,768,32,ML-DSA-44,pqc,2,1312,2560,2420,ML-DSA-44,1,0,required,
+ecdhe_p_256__rsa_pss_7680,1,ECDHE-P-256,classic,1,65,65,32,RSA-PSS-7680,classic,3,960,960,960,RSA-PSS-7680,1,0,required,
+x25519mlkem768__xmss_sha2_20_256,1,X25519MLKEM768,pqc,3,1216,1120,64,XMSS-SHA2_20_256,pqc,5,68,2573,2820,XMSS-SHA2_20_256,1,0,required,XMSS signs the chain; TLS CertificateVerify uses ECDSA
+secp384r1mlkem1024__rsa_pss_3072,1,SecP384r1MLKEM1024,pqc,5,1665,1665,80,RSA-PSS-3072,classic,1,384,384,384,RSA-PSS-3072,1,0,required,
+x25519mlkem768__slh_dsa_shake_128s,1,X25519MLKEM768,pqc,3,1216,1120,64,SLH-DSA-SHAKE-128s,pqc,1,32,64,7856,ECDSA-P-256,1,0,required,SLH-DSA signs the chain; TLS CertificateVerify uses ECDSA
+ecdhe_p_256__xmss_sha2_20_256,1,ECDHE-P-256,classic,1,65,65,32,XMSS-SHA2_20_256,pqc,5,68,2573,2820,XMSS-SHA2_20_256,1,0,required,XMSS signs the chain; TLS CertificateVerify uses ECDSA
+secp384r1mlkem1024__lms_hss_l2_h10_w4,1,SecP384r1MLKEM1024,pqc,5,1665,1665,80,LMS-HSS-L2-H10-W4,pqc,5,60,64,5076,LMS-HSS-L2-H10-W4,1,0,required,LMS/HSS signs the chain; TLS CertificateVerify uses ECDSA
+mlkem512__slh_dsa_shake_192s,1,MLKEM512,pqc,1,800,768,32,SLH-DSA-SHAKE-192s,pqc,3,48,96,16224,ECDSA-P-384,1,0,required,SLH-DSA signs the chain; TLS CertificateVerify uses ECDSA
+x25519mlkem768__ecdsa_p_256,1,X25519MLKEM768,pqc,3,1216,1120,64,ECDSA-P-256,classic,1,65,32,64,ECDSA-P-256,1,0,required,
+ecdhe_p_256__slh_dsa_shake_256s,1,ECDHE-P-256,classic,1,65,65,32,SLH-DSA-SHAKE-256s,pqc,5,64,128,29792,ECDSA-P-521,1,0,required,SLH-DSA signs the chain; TLS CertificateVerify uses ECDSA
+ecdhe_p_521__ml_dsa_44,1,ECDHE-P-521,classic,5,133,133,66,ML-DSA-44,pqc,2,1312,2560,2420,ML-DSA-44,1,0,required,
+ecdhe_p_256__ml_dsa_44,1,ECDHE-P-256,classic,1,65,65,32,ML-DSA-44,pqc,2,1312,2560,2420,ML-DSA-44,1,0,required,

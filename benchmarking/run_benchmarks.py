@@ -28,11 +28,9 @@ from benchmarklib.certificates import (
 from benchmarklib.firmware import build as build_firmware
 from benchmarklib.firmware import ensure_pqm4
 from benchmarklib.firmware import flash as flash_firmware
-from benchmarklib.firmware import reset as reset_firmware
 from benchmarklib.gateway import PiGateway
 from benchmarklib.metrics import aggregate, number, parse_bench_line
 from benchmarklib.power_profiler import (
-    PowerProfilerCapture,
     PowerProfilerSession,
 )
 from benchmarklib.scheduler import SessionJob, build_jobs
@@ -391,6 +389,39 @@ def wait_for_result(
     return {"status": "timeout", "stage": "serial_wait", "error": "timeout"}
 
 
+def wait_for_ble_result(
+    gateway: PiGateway,
+    case_id: str,
+    board_log: Path,
+    timeout: float,
+    fatal_detector=None,
+) -> dict[str, str]:
+    deadline = time.monotonic() + timeout
+    next_fatal_check = time.monotonic()
+    while time.monotonic() < deadline:
+        line = gateway.remote_benchmark_result(case_id)
+        if line:
+            with board_log.open("a") as stream:
+                stream.write(line + "\n")
+            parsed = parse_bench_line(line)
+            if parsed and parsed[0] == "RESULT":
+                return parsed[1]
+        now = time.monotonic()
+        if fatal_detector is not None and now >= next_fatal_check:
+            fatal_line = fatal_detector()
+            next_fatal_check = now + 1.0
+            if fatal_line:
+                return {
+                    "status": "fail",
+                    "stage": "server_certificate_trust",
+                    "error": "fatal_server_log",
+                    "fatal": "1",
+                    "fatal_message": fatal_line,
+                }
+        time.sleep(0.25)
+    return {"status": "timeout", "stage": "ble_result_wait", "error": "timeout"}
+
+
 def wait_for_board_ready(serial_port, board_log: Path, timeout: float) -> None:
     deadline = time.monotonic() + timeout
     with board_log.open("a") as stream:
@@ -483,24 +514,23 @@ def run_job(
     final: dict[str, str] = {}
     reconnect_count = 0
     attempt_timeout = timeout_for_case(case, args.attempt_timeout_sec)
-    power_capture = None
     power_values: dict[str, object] = {}
-    if getattr(args, "power_profiler", False):
-        power_session = getattr(args, "power_profiler_session", None)
-        power_capture = (
-            power_session.capture()
-            if power_session is not None
-            else PowerProfilerCapture(
-                args.power_profiler_serial_device,
-                args.power_profiler_vdd_mv,
-                args.power_profiler_output_samples_per_second,
+    power_session = getattr(args, "power_profiler_session", None)
+    for retry in range(args.reconnect_retries + 1):
+        power_capture = None
+        retry_trace = None
+        if getattr(args, "power_profiler", False):
+            if power_session is None:
+                raise RuntimeError("PPK2 source session is not open")
+            power_capture = power_session.capture()
+            power_capture.start()
+            retry_trace = case_dir / (
+                f"power_trace_{attempt_index:03d}_retry_{retry + 1}.csv.gz"
             )
-        )
-        power_capture.start()
-    try:
-        for retry in range(args.reconnect_retries + 1):
+        try:
             reconnect_count = retry
-            serial_port.reset_input_buffer()
+            if serial_port is not None:
+                serial_port.reset_input_buffer()
             try:
                 gateway.start_session(
                 case_id=case["case_id"],
@@ -516,16 +546,22 @@ def run_job(
                 log=case_dir / "gateway-control.log",
                 server_backend=server_backend,
                 wolfssl_group=KEMS_BY_NAME[case["kex_group"]].wolfssl_group,
+                control_telemetry=getattr(args, "power_profiler", False),
                 )
                 remote_broker_log = f"{gateway.workdir}/logs/{case['case_id']}.broker.log"
-                final = wait_for_result(
-                serial_port,
-                board_log,
-                attempt_timeout,
-                fatal_detector=lambda: gateway.remote_file_contains(
+                fatal_detector = lambda: gateway.remote_file_contains(
                     remote_broker_log, FATAL_SERVER_LOG_PATTERNS
-                ),
                 )
+                if getattr(args, "power_profiler", False):
+                    final = wait_for_ble_result(
+                        gateway, case["case_id"], board_log, attempt_timeout,
+                        fatal_detector=fatal_detector,
+                    )
+                else:
+                    final = wait_for_result(
+                        serial_port, board_log, attempt_timeout,
+                        fatal_detector=fatal_detector,
+                    )
             except Exception as error:
                 final = {
                     "status": "fail",
@@ -541,28 +577,32 @@ def run_job(
                     case_dir / "gateway-control.log",
                 )
                 final = classify_gateway_start_failure(gateway_log, final)
-                try:
-                    wait_for_board_ready(
-                        serial_port, board_log, args.board_rearm_timeout_sec
-                    )
-                except TimeoutError:
-                    if final.get("fatal") != "1":
-                        final = {
-                            "status": "fail",
-                            "stage": "board_rearm",
-                            "error": "timeout",
-                        }
-            if final.get("status") == "success":
-                break
-            if final.get("fatal") == "1":
-                break
-            if retry < args.reconnect_retries:
-                time.sleep(args.reconnect_delay_sec)
-    finally:
-        if power_capture is not None:
-            power_values = power_capture.stop(
-                case_dir / f"power_trace_{attempt_index:03d}.csv.gz"
-            )
+                if serial_port is not None:
+                    try:
+                        wait_for_board_ready(
+                            serial_port, board_log, args.board_rearm_timeout_sec
+                        )
+                    except TimeoutError:
+                        if final.get("fatal") != "1":
+                            final = {
+                                "status": "fail",
+                                "stage": "board_rearm",
+                                "error": "timeout",
+                            }
+        finally:
+            if power_capture is not None and retry_trace is not None:
+                power_values = power_capture.stop(retry_trace)
+
+        if final.get("status") == "success" or final.get("fatal") == "1" or \
+                retry >= args.reconnect_retries:
+            if retry_trace is not None and retry_trace.exists():
+                retry_trace.replace(
+                    case_dir / f"power_trace_{attempt_index:03d}.csv.gz"
+                )
+            break
+        if getattr(args, "power_profiler", False):
+            power_session.power_cycle()
+        time.sleep(args.reconnect_delay_sec)
 
     gateway_values = parse_gateway_metrics(gateway_log)
     server_values = parse_server_metrics(broker_log)
@@ -1111,21 +1151,22 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--power-profiler",
         action=argparse.BooleanOptionalAction,
         default=False,
-        help="capture PPK2 current synchronized with benchmark GPIO markers",
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--power-profiler-serial-device",
         default=config["power-profiler-serial-device"],
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--power-profiler-vdd-mv", type=int,
         default=config["power-profiler-vdd-mv"],
-        help="measured DUT voltage used for energy calculation only",
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--power-profiler-output-samples-per-second", type=int,
         default=config["power-profiler-output-samples-per-second"],
-        help="downsampled trace rate; native integration remains at 100 kS/s",
+        help=argparse.SUPPRESS,
     )
     parser.add_argument("--pi-host", default=config["pi-host"])
     parser.add_argument(
@@ -1136,7 +1177,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--ssh-key", default=config["ssh-key"])
     parser.add_argument("--pi-adapter", default="hci0")
     parser.add_argument("--ble-addr", default=config["ble-addr"])
-    parser.add_argument("--ble-name", default="PQC52840")
+    parser.add_argument("--ble-name", default="PQC5340")
     parser.add_argument("--ble-addr-type", choices=("public", "random"), default="random")
     parser.add_argument("--psm", default="0x0080")
     parser.add_argument("--mtu", type=int, default=672)
@@ -1149,12 +1190,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--nrfutil", default=default_nrfutil())
     parser.add_argument("--ncs-version", default=DEFAULT_NCS_VERSION)
     parser.add_argument("--ncs-chdir", default=default_ncs_chdir())
-    parser.add_argument("--board", default="nrf52840dk/nrf52840")
+    parser.add_argument("--board", default="nrf5340dk/nrf5340/cpuapp")
     parser.add_argument(
         "--mlkem-backend",
         choices=("wolfssl", "pqm4-m4fstack"),
         default="pqm4-m4fstack",
-        help="ML-KEM implementation used by the nRF52840 TLS client",
+        help="ML-KEM implementation used by the nRF5340 application core",
     )
     parser.add_argument(
         "--server-backend",
@@ -1163,6 +1204,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="server TLS backend selection",
     )
     args = parser.parse_args(argv)
+    if args.power_profiler:
+        parser.error("--power-profiler is disabled for the nRF5340DK port")
     if bool(args.cases) == bool(args.resume):
         parser.error("provide exactly one of --cases or --resume")
     args.ssh_key = os.path.expandvars(os.path.expanduser(args.ssh_key))
@@ -1195,8 +1238,8 @@ def main() -> int:
         raise ValueError("sessions and reconnect retries must be non-negative")
     if args.limit is not None and args.limit < 1:
         raise ValueError("--limit must be at least 1")
-    if args.power_profiler_vdd_mv <= 0:
-        raise ValueError("--power-profiler-vdd-mv must be positive")
+    if not 800 <= args.power_profiler_vdd_mv <= 5000:
+        raise ValueError("--power-profiler-vdd-mv must be between 800 and 5000")
     if not 1 <= args.power_profiler_output_samples_per_second <= 100_000:
         raise ValueError(
             "--power-profiler-output-samples-per-second must be between 1 and 100000"
@@ -1225,6 +1268,10 @@ def main() -> int:
             args.mlkem_backend = saved_config["mlkem_backend"]
             args.server_backend = saved_config["server_backend"]
             args.power_profiler = saved_config.get("power_profiler", False)
+            if args.power_profiler:
+                raise ValueError(
+                    "power-profiler runs cannot be resumed with the nRF5340DK port"
+                )
             args.power_profiler_serial_device = saved_config.get(
                 "power_profiler_serial_device", args.power_profiler_serial_device
             )
@@ -1270,6 +1317,7 @@ def main() -> int:
             "mlkem_backend": args.mlkem_backend,
             "server_backend": args.server_backend,
             "power_profiler": args.power_profiler,
+            "power_profiler_mode": "source" if args.power_profiler else "disabled",
             "power_profiler_serial_device": args.power_profiler_serial_device,
             "power_profiler_vdd_mv": args.power_profiler_vdd_mv,
             "power_profiler_output_samples_per_second":
@@ -1432,12 +1480,13 @@ def main() -> int:
             ncs_chdir=args.ncs_chdir, board=args.board,
             mlkem_backend=args.mlkem_backend, pqm4_dir=pqm4_dir,
             large_rsa=False,
-            power_markers=args.power_profiler,
+            power_markers=False,
+            ble_telemetry=False,
         )
         print("[firmware] Build completed.", flush=True)
     if not args.skip_flash:
         print(
-            f"[firmware] Flashing nRF52840 profile=fast-math; "
+            f"[firmware] Flashing nRF5340 application and network cores; "
             f"log={run_dir / 'flash.log'}",
             flush=True,
         )
@@ -1450,17 +1499,22 @@ def main() -> int:
 
     if args.power_profiler:
         print(
-            "\n[power] Prepare the PPK2 in Ampere Meter mode:\n"
+            "\n[power] Prepare the PPK2 in Source Mode:\n"
             "  1. Disconnect the nRF52840DK USB cable.\n"
-            "  2. Remove the P22 jumper and insert PPK2 IN/OUT in series.\n"
-            "  3. Connect DK GND/VDD to PPK2 logic GND/VCC.\n"
-            "  4. Connect A0/P0.03->D7, A1/P0.04->D6, "
+            "  2. Remove the P22 jumper.\n"
+            "  3. Connect PPK2 VOUT to the P22 VDD_nRF pin and PPK2 GND to DK GND.\n"
+            "  4. Connect DK VDD/GND to PPK2 logic VCC/GND.\n"
+            "  5. Connect A0/P0.03->D7, A1/P0.04->D6, "
             "A2/P0.28->D5, A3/P0.29->D4.\n"
-            "  5. Reconnect DK USB and close the nRF Connect Power Profiler app.",
+            "  6. Keep the DK USB disconnected and close the Power Profiler app.",
             flush=True,
         )
         input("[power] Press Enter when the wiring is ready...")
-        print("[power] Opening the persistent PPK2 Ampere Meter session...", flush=True)
+        print(
+            f"[power] Enabling persistent PPK2 Source Mode at "
+            f"{args.power_profiler_vdd_mv} mV...",
+            flush=True,
+        )
         power_profiler_session = PowerProfilerSession(
             args.power_profiler_serial_device,
             args.power_profiler_vdd_mv,
@@ -1471,28 +1525,16 @@ def main() -> int:
         args.power_profiler_session = power_profiler_session
         idle_mean_ua, idle_peak_ua = power_profiler_session.probe_current()
         print(
-            f"[power] DUT path enabled: mean={idle_mean_ua:.2f} uA "
-            f"peak={idle_peak_ua:.2f} uA; no source voltage was configured.",
+            f"[power] DUT powered: mean={idle_mean_ua:.2f} uA "
+            f"peak={idle_peak_ua:.2f} uA.",
             flush=True,
         )
         if idle_peak_ua < 100.0:
             raise RuntimeError(
-                "PPK2 sees only leakage current after enabling DUT power "
+                "PPK2 Source Mode sees only leakage current after enabling DUT power "
                 f"(mean={idle_mean_ua:.2f} uA, peak={idle_peak_ua:.2f} uA). "
-                "The nRF52840 is not powered through P22. Connect PPK2 VIN to "
-                "the P22 supply side and PPK2 VOUT to the upper VDD_nRF pin."
+                "Connect PPK2 VOUT to the P22 VDD_nRF pin and share GND."
             )
-        print("[power] Resetting the powered nRF52840 target...", flush=True)
-        try:
-            reset_firmware(log=run_dir / "power-reset.log", nrfutil=args.nrfutil)
-        except Exception as error:
-            raise RuntimeError(
-                "The PPK2 reports current, but nrfutil cannot access the "
-                "nRF52840 over SWD. The target VDD rail is absent or below a "
-                "usable level; the measured current is likely back-power. "
-                "Verify approximately 3 V between VDD_nRF and GND, PPK2 VIN "
-                "on the P22 supply side, and PPK2 VOUT on the upper VDD_nRF pin."
-            ) from error
 
     gateway = PiGateway(args.pi_host, args.pi_workdir, args.ssh_key)
     print(
@@ -1523,26 +1565,27 @@ def main() -> int:
         for case in supported
     }
 
-    try:
-        import serial
-    except ImportError as error:
-        raise RuntimeError("pyserial is required: python -m pip install pyserial") from error
-    if not hasattr(serial, "Serial"):
-        module_path = getattr(serial, "__file__", "unknown")
-        raise RuntimeError(
-            "The imported 'serial' module is not pyserial "
-            f"(loaded from {module_path}). Remove the package named 'serial' "
-            "and install 'pyserial>=3.5'."
-        )
-
     interrupted = False
     serial_port = None
     try:
-        serial_port = serial.Serial(
-            args.serial_device, args.serial_baud, timeout=0.25
-        )
-        serial_port.reset_input_buffer()
-        try:
+        if not args.power_profiler:
+            try:
+                import serial
+            except ImportError as error:
+                raise RuntimeError(
+                    "pyserial is required: python -m pip install pyserial"
+                ) from error
+            if not hasattr(serial, "Serial"):
+                module_path = getattr(serial, "__file__", "unknown")
+                raise RuntimeError(
+                    "The imported 'serial' module is not pyserial "
+                    f"(loaded from {module_path}). Remove the package named "
+                    "'serial' and install 'pyserial>=3.5'."
+                )
+            serial_port = serial.Serial(
+                args.serial_device, args.serial_baud, timeout=0.25
+            )
+            serial_port.reset_input_buffer()
             print(
                 f"[board] Waiting for BENCH_READY on {args.serial_device}...",
                 flush=True,
@@ -1551,6 +1594,10 @@ def main() -> int:
                 serial_port, run_dir / "board.log", args.board_ready_timeout_sec
             )
             print("[board] Firmware is ready.", flush=True)
+        else:
+            print("[board] USB serial disabled; readiness will arrive over BLE L2CAP.",
+                  flush=True)
+        try:
             for execution_order, job in scheduled_jobs:
                 case = case_by_id[job.case_id]
                 timeout = timeout_for_case(case, args.attempt_timeout_sec)

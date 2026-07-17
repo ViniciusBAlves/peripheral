@@ -3,10 +3,20 @@ cmake_minimum_required(VERSION 3.20.0)
 find_package(Zephyr REQUIRED HINTS $ENV{ZEPHYR_BASE})
 project(peripheral)
 
-set(BENCH_MLKEM_BACKEND "pqm4-m4fstack" CACHE STRING "ML-KEM implementation")
+set(BENCH_MLKEM_BACKEND "$ENV{BENCH_MLKEM_BACKEND}" CACHE STRING "ML-KEM implementation")
+if(BENCH_MLKEM_BACKEND STREQUAL "")
+    set(BENCH_MLKEM_BACKEND "pqm4-m4fstack")
+endif()
 option(BENCH_POWER_MARKERS "Enable PPK2 GPIO timing markers" OFF)
+option(BENCH_BLE_TELEMETRY "Send structured benchmark output over BLE L2CAP" OFF)
 set_property(CACHE BENCH_MLKEM_BACKEND PROPERTY STRINGS wolfssl pqm4-m4fstack)
 
+if(NOT DEFINED BENCH_GENERATED_DIR AND DEFINED ENV{BENCH_GENERATED_DIR})
+    set(BENCH_GENERATED_DIR "$ENV{BENCH_GENERATED_DIR}")
+endif()
+if(NOT DEFINED PQM4_ROOT AND DEFINED ENV{PQM4_ROOT})
+    set(PQM4_ROOT "$ENV{PQM4_ROOT}")
+endif()
 if(NOT DEFINED BENCH_GENERATED_DIR)
     message(FATAL_ERROR "BENCH_GENERATED_DIR must contain benchmark_credentials.h")
 endif()
@@ -284,6 +294,9 @@ target_sources(app PRIVATE src/main.c src/benchmark_metrics.c src/power_markers.
 
 if(BENCH_POWER_MARKERS)
     target_compile_definitions(app PRIVATE BENCH_POWER_MARKERS=1)
+endif()
+if(BENCH_BLE_TELEMETRY)
+    target_compile_definitions(app PRIVATE BENCH_BLE_TELEMETRY=1)
 endif()
 
 target_include_directories(app PRIVATE 
