@@ -9,6 +9,7 @@ if(BENCH_MLKEM_BACKEND STREQUAL "")
 endif()
 option(BENCH_POWER_MARKERS "Enable PPK2 GPIO timing markers" OFF)
 option(BENCH_BLE_TELEMETRY "Send structured benchmark output over BLE L2CAP" OFF)
+option(BENCH_CERTIFICATE_GEN "Build the on-device certificate benchmark" OFF)
 set_property(CACHE BENCH_MLKEM_BACKEND PROPERTY STRINGS wolfssl pqm4-m4fstack)
 
 if(NOT DEFINED BENCH_GENERATED_DIR AND DEFINED ENV{BENCH_GENERATED_DIR})
@@ -17,10 +18,11 @@ endif()
 if(NOT DEFINED PQM4_ROOT AND DEFINED ENV{PQM4_ROOT})
     set(PQM4_ROOT "$ENV{PQM4_ROOT}")
 endif()
-if(NOT DEFINED BENCH_GENERATED_DIR)
+if(NOT BENCH_CERTIFICATE_GEN AND NOT DEFINED BENCH_GENERATED_DIR)
     message(FATAL_ERROR "BENCH_GENERATED_DIR must contain benchmark_credentials.h")
 endif()
-if(NOT EXISTS "${BENCH_GENERATED_DIR}/benchmark_credentials.h")
+if(NOT BENCH_CERTIFICATE_GEN AND
+   NOT EXISTS "${BENCH_GENERATED_DIR}/benchmark_credentials.h")
     message(FATAL_ERROR "Missing ${BENCH_GENERATED_DIR}/benchmark_credentials.h")
 endif()
 
@@ -233,7 +235,14 @@ string(REPLACE
 file(WRITE "${WOLFSSL_INTERNAL_H}" "${WOLFSSL_INTERNAL_TEXT}")
 
 # 1. Bind EVERYTHING directly to the 'app' target
-target_sources(app PRIVATE src/main.c src/benchmark_metrics.c src/power_markers.c
+if(BENCH_CERTIFICATE_GEN)
+    target_sources(app PRIVATE
+        src/certgen_main.c src/benchmark_metrics.c src/power_markers.c)
+else()
+    target_sources(app PRIVATE src/main.c src/benchmark_metrics.c src/power_markers.c)
+endif()
+
+target_sources(app PRIVATE
     # --- Post Quantum Math ---
     ${WOLFSSL_ROOT_DIR}/wolfcrypt/src/wc_mlkem.c
     ${WOLFSSL_ROOT_DIR}/wolfcrypt/src/wc_mlkem_poly.c
@@ -298,6 +307,9 @@ endif()
 if(BENCH_BLE_TELEMETRY)
     target_compile_definitions(app PRIVATE BENCH_BLE_TELEMETRY=1)
 endif()
+if(BENCH_CERTIFICATE_GEN)
+    target_compile_definitions(app PRIVATE BENCH_CERTIFICATE_GEN=1)
+endif()
 
 target_include_directories(app PRIVATE 
     ${CMAKE_CURRENT_SOURCE_DIR}
@@ -319,7 +331,7 @@ target_compile_definitions(app PRIVATE
     BENCH_RSA_PROFILE_NAME="fast-math"
 )
 
-if(BENCH_MLKEM_BACKEND STREQUAL "pqm4-m4fstack")
+if(BENCH_MLKEM_BACKEND STREQUAL "pqm4-m4fstack" AND NOT BENCH_CERTIFICATE_GEN)
     if(NOT DEFINED PQM4_ROOT OR
        NOT EXISTS "${PQM4_ROOT}/crypto_kem/ml-kem-512/m4fstack/kem.c")
         message(FATAL_ERROR "PQM4_ROOT must point to a complete pqm4 checkout")

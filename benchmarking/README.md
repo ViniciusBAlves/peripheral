@@ -66,6 +66,41 @@ python benchmarking/run_benchmarks.py \
 The corresponding CLI options remain available as one-run overrides and take
 precedence over JSON values. The four connection fields are required.
 
+## Certificate Generation Benchmark
+
+`run_certificate_benchmarks.py` builds and flashes a dedicated nRF5340
+firmware that generates a self-signed X.509 certificate on the application
+core for every signature algorithm enabled by the input CSV:
+
+```bash
+python benchmarking/run_certificate_benchmarks.py \
+  --cases benchmarking/cases/20260703_220208_benchmark_cases.csv \
+  --iterations 5 \
+  --seed 123
+```
+
+Each attempt reports separate `certificate_keygen_ms`,
+`certificate_make_body_ms`, `certificate_sign_ms`, and
+`certificate_verify_ms` values, plus total time, DER size, CPU cycles, and
+wolfSSL heap usage. The firmware supports ECDSA, RSA-PSS, ML-DSA, SLH-DSA,
+LMS/HSS, and XMSS cases from `benchmarklib/algorithms.py`. Large RSA key
+generation and the small-memory SLH/LMS/XMSS implementations can take many
+minutes. Every attempt has a hard 15-minute ceiling; after a timeout, the
+remaining iterations of that signature are recorded as `cancelled` and the
+runner advances to the next algorithm.
+
+This mode measures a fresh key pair and a self-signed CA certificate whose
+X.509 signature uses the selected algorithm. It does not reproduce the normal
+benchmark's fixed ECDSA P-256 client identity or its complete server chain.
+ML-DSA signing uses randomized FIPS 204 signing and rejection sampling, so its
+signing distribution is expected to be wider than ECDSA. The summary includes
+median, p95, and standard deviation for `certificate_sign_ms`.
+
+Use `--skip-build --skip-flash` to reuse the certificate firmware already on
+the board. The runner resets the DK after opening its VCOM so `BENCH_READY`
+is not lost. The previous Docker/OpenSSL server-chain benchmark remains
+available with `--host-only`.
+
 ## Raspberry Pi
 
 Configure SSH key authentication first. Install the system build and Bluetooth

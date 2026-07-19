@@ -113,6 +113,16 @@
 #define WOLFSSL_XMSS_MAX_HEIGHT 20
 #define HAVE_SNI
 
+#ifdef BENCH_CERTIFICATE_GEN
+#define WOLFSSL_CERT_GEN
+#define WOLFSSL_CERT_EXT
+#define WOLFSSL_KEY_GEN
+/* The dedicated certgen heap can afford wolfSSL's faster full ML-DSA signer. */
+#undef WOLFSSL_DILITHIUM_SIGN_SMALL_MEM
+#undef WOLFSSL_LMS_VERIFY_ONLY
+#undef WOLFSSL_XMSS_VERIFY_ONLY
+#endif
+
 #undef min
 #undef max
 

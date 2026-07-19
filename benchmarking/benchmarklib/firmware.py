@@ -136,18 +136,26 @@ def build(
     large_rsa: bool = False,
     power_markers: bool = False,
     ble_telemetry: bool = False,
+    certificate_gen: bool = False,
 ) -> None:
     cmake_args = [
-        f"-DBENCH_GENERATED_DIR={generated_dir}",
         f"-DBENCH_MLKEM_BACKEND={mlkem_backend}",
         f"-DBENCH_POWER_MARKERS={'ON' if power_markers else 'OFF'}",
         f"-DBENCH_BLE_TELEMETRY={'ON' if ble_telemetry else 'OFF'}",
+        f"-DBENCH_CERTIFICATE_GEN={'ON' if certificate_gen else 'OFF'}",
     ]
+    if not certificate_gen:
+        cmake_args.append(f"-DBENCH_GENERATED_DIR={generated_dir}")
+    else:
+        cmake_args.append(
+            f"-DEXTRA_CONF_FILE={firmware_dir / 'certgen.conf'}"
+        )
     is_nrf5340 = board.startswith("nrf5340dk/")
     if pqm4_dir is not None:
         cmake_args.append(f"-DPQM4_ROOT={pqm4_dir}")
     build_env = toolchain_environment(nrfutil)
-    build_env["BENCH_GENERATED_DIR"] = str(generated_dir)
+    if not certificate_gen:
+        build_env["BENCH_GENERATED_DIR"] = str(generated_dir)
     build_env["BENCH_MLKEM_BACKEND"] = mlkem_backend
     if pqm4_dir is not None:
         build_env["PQM4_ROOT"] = str(pqm4_dir)
@@ -159,7 +167,7 @@ def build(
             "build",
             "-d", str(build_dir),
             "-p", "always",
-            "--sysbuild" if is_nrf5340 else "--no-sysbuild",
+            "--sysbuild" if is_nrf5340 and not certificate_gen else "--no-sysbuild",
             "-b", board,
             str(firmware_dir),
             "--", *cmake_args,
