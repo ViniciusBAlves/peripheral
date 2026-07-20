@@ -10,7 +10,12 @@ endif()
 option(BENCH_POWER_MARKERS "Enable PPK2 GPIO timing markers" OFF)
 option(BENCH_BLE_TELEMETRY "Send structured benchmark output over BLE L2CAP" OFF)
 option(BENCH_CERTIFICATE_GEN "Build the on-device certificate benchmark" OFF)
+option(BENCH_KEM_OPERATIONS "Build the on-device KEM operation benchmark" OFF)
 set_property(CACHE BENCH_MLKEM_BACKEND PROPERTY STRINGS wolfssl pqm4-m4fstack)
+
+if(BENCH_CERTIFICATE_GEN AND BENCH_KEM_OPERATIONS)
+    message(FATAL_ERROR "BENCH_CERTIFICATE_GEN and BENCH_KEM_OPERATIONS are mutually exclusive")
+endif()
 
 if(NOT DEFINED BENCH_GENERATED_DIR AND DEFINED ENV{BENCH_GENERATED_DIR})
     set(BENCH_GENERATED_DIR "$ENV{BENCH_GENERATED_DIR}")
@@ -18,10 +23,11 @@ endif()
 if(NOT DEFINED PQM4_ROOT AND DEFINED ENV{PQM4_ROOT})
     set(PQM4_ROOT "$ENV{PQM4_ROOT}")
 endif()
-if(NOT BENCH_CERTIFICATE_GEN AND NOT DEFINED BENCH_GENERATED_DIR)
+if(NOT BENCH_CERTIFICATE_GEN AND NOT BENCH_KEM_OPERATIONS AND
+   NOT DEFINED BENCH_GENERATED_DIR)
     message(FATAL_ERROR "BENCH_GENERATED_DIR must contain benchmark_credentials.h")
 endif()
-if(NOT BENCH_CERTIFICATE_GEN AND
+if(NOT BENCH_CERTIFICATE_GEN AND NOT BENCH_KEM_OPERATIONS AND
    NOT EXISTS "${BENCH_GENERATED_DIR}/benchmark_credentials.h")
     message(FATAL_ERROR "Missing ${BENCH_GENERATED_DIR}/benchmark_credentials.h")
 endif()
@@ -238,6 +244,9 @@ file(WRITE "${WOLFSSL_INTERNAL_H}" "${WOLFSSL_INTERNAL_TEXT}")
 if(BENCH_CERTIFICATE_GEN)
     target_sources(app PRIVATE
         src/certgen_main.c src/benchmark_metrics.c src/power_markers.c)
+elseif(BENCH_KEM_OPERATIONS)
+    target_sources(app PRIVATE
+        src/kem_bench_main.c src/benchmark_metrics.c src/power_markers.c)
 else()
     target_sources(app PRIVATE src/main.c src/benchmark_metrics.c src/power_markers.c)
 endif()
@@ -309,6 +318,9 @@ if(BENCH_BLE_TELEMETRY)
 endif()
 if(BENCH_CERTIFICATE_GEN)
     target_compile_definitions(app PRIVATE BENCH_CERTIFICATE_GEN=1)
+endif()
+if(BENCH_KEM_OPERATIONS)
+    target_compile_definitions(app PRIVATE BENCH_KEM_OPERATIONS=1)
 endif()
 
 target_include_directories(app PRIVATE 

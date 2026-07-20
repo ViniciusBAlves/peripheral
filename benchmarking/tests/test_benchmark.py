@@ -116,6 +116,7 @@ class BenchmarkTests(unittest.TestCase):
         self.assertEqual(args.ble_addr, normalize_ble_addr(config["ble-addr"]))
         self.assertEqual(args.mlkem_backend, "pqm4-m4fstack")
         self.assertEqual(args.server_backend, "auto")
+        self.assertFalse(args.mtls_mode)
         self.assertFalse(args.power_profiler)
         self.assertEqual(
             args.power_profiler_output_samples_per_second,
@@ -124,10 +125,11 @@ class BenchmarkTests(unittest.TestCase):
 
         overridden = parse_args([
             "--cases", "cases.csv", "--serial-device", "/dev/ttyUSB9",
-            "--server-backend", "wolfssl",
+            "--server-backend", "wolfssl", "--mtls-mode",
         ])
         self.assertEqual(overridden.serial_device, "/dev/ttyUSB9")
         self.assertEqual(overridden.server_backend, "wolfssl")
+        self.assertTrue(overridden.mtls_mode)
 
     def test_old_config_gets_power_profiler_defaults(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -407,6 +409,23 @@ class BenchmarkTests(unittest.TestCase):
         self.assertIn("ClientSignatureAlgorithms = ECDSA+SHA256\n", openssl_config)
         self.assertNotIn("MaxSendFragment", openssl_config)
 
+    def test_mosquitto_has_distinct_server_only_and_mtls_configs(self) -> None:
+        case = {
+            "kex_group": "ECDHE-P-256",
+            "cert_sig_alg": "ECDSA-P-256",
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output = Path(tmpdir)
+            write_case_configs(case, output)
+            server_only = (output / "mosquitto.conf").read_text()
+            mutual = (output / "mosquitto-mtls.conf").read_text()
+
+        self.assertIn("require_certificate false\n", server_only)
+        self.assertNotIn("cafile ", server_only)
+        self.assertIn("require_certificate true\n", mutual)
+        self.assertIn("cafile __REMOTE_CASE_DIR__/client_ca.crt\n", mutual)
+        self.assertIn("use_identity_as_username true\n", mutual)
+
     def test_slh_openssl_server_uses_smaller_tls_records(self) -> None:
         case = {
             "kex_group": "ECDHE-P-521",
@@ -564,6 +583,57 @@ class BenchmarkTests(unittest.TestCase):
             if "gateway_tcp_connect_ms" in command
         )
         self.assertIn("BENCH_READY", readiness)
+
+    def test_gateway_selects_mtls_for_both_server_backends(self) -> None:
+        class FakeGateway(PiGateway):
+            def __init__(self) -> None:
+                super().__init__("pi", "/remote")
+                self.commands: list[str] = []
+
+            def command(self, script, log, *, check=True):  # type: ignore[no-untyped-def]
+                self.commands.append(script)
+                return None
+
+        common = {
+            "case_id": "case",
+            "remote_case_dir": "/remote/cases/case",
+            "ble_addr": "",
+            "ble_name": "PQC5340",
+            "ble_addr_type": "random",
+            "psm": "0x0080",
+            "mtu": 672,
+            "adapter": "hci0",
+            "disable_wifi": False,
+            "ready_timeout": 1,
+            "log": Path("/tmp/gateway.log"),
+            "mtls_mode": True,
+        }
+        mosquitto = FakeGateway()
+        mosquitto.start_session(**common)
+        self.assertTrue(any(
+            "mosquitto-mtls.conf" in command
+            for command in mosquitto.commands
+        ))
+
+        wolfssl = FakeGateway()
+        wolfssl.start_session(
+            **common,
+            server_backend="wolfssl",
+            wolfssl_group="WOLFSSL_ECC_SECP256R1",
+        )
+        self.assertTrue(any(
+            "wolfssl_tls_server" in command and "--mtls" in command
+            for command in wolfssl.commands
+        ))
+
+    def test_wolfssl_server_mtls_is_opt_in(self) -> None:
+        source = (
+            ROOT / "gateway" / "wolfssl_tls_server.c"
+        ).read_text()
+        self.assertIn('{ "mtls", no_argument', source)
+        self.assertIn("if (cfg->mtls)", source)
+        self.assertIn("WOLFSSL_VERIFY_FAIL_IF_NO_PEER_CERT", source)
+        self.assertIn("WOLFSSL_VERIFY_NONE", source)
 
     def test_gateway_command_creates_log_parent(self) -> None:
         class TrueGateway(PiGateway):

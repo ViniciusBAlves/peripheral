@@ -24,6 +24,7 @@ struct config {
     const char* case_dir;
     const char* group;
     int port;
+    bool mtls;
 };
 
 static void on_signal(int signo)
@@ -124,7 +125,8 @@ static int verify_callback(int preverify, WOLFSSL_X509_STORE_CTX* store)
 static void usage(const char* program)
 {
     fprintf(stderr,
-        "usage: %s --case-dir DIR --group WOLFSSL_GROUP [--port PORT]\n",
+        "usage: %s --case-dir DIR --group WOLFSSL_GROUP [--port PORT] "
+        "[--mtls]\n",
         program);
 }
 
@@ -134,6 +136,7 @@ static int parse_args(int argc, char** argv, struct config* cfg)
         { "case-dir", required_argument, NULL, 'c' },
         { "group", required_argument, NULL, 'g' },
         { "port", required_argument, NULL, 'p' },
+        { "mtls", no_argument, NULL, 'm' },
         { "help", no_argument, NULL, 'h' },
         { NULL, 0, NULL, 0 },
     };
@@ -141,9 +144,10 @@ static int parse_args(int argc, char** argv, struct config* cfg)
     cfg->case_dir = NULL;
     cfg->group = NULL;
     cfg->port = DEFAULT_PORT;
+    cfg->mtls = false;
 
     for (;;) {
-        int opt = getopt_long(argc, argv, "c:g:p:h", options, NULL);
+        int opt = getopt_long(argc, argv, "c:g:p:mh", options, NULL);
         if (opt == -1)
             break;
         switch (opt) {
@@ -155,6 +159,9 @@ static int parse_args(int argc, char** argv, struct config* cfg)
             break;
         case 'p':
             cfg->port = atoi(optarg);
+            break;
+        case 'm':
+            cfg->mtls = true;
             break;
         case 'h':
             usage(argv[0]);
@@ -230,26 +237,31 @@ static int configure_context(WOLFSSL_CTX* ctx, const struct config* cfg)
         join_path(key_file, sizeof(key_file), cfg->case_dir, "server.key") != 0)
         return -1;
 
-    wolfSSL_CTX_set_verify(
-        ctx, WOLFSSL_VERIFY_PEER | WOLFSSL_VERIFY_FAIL_IF_NO_PEER_CERT,
-        verify_callback);
+    if (cfg->mtls) {
+        wolfSSL_CTX_set_verify(
+            ctx, WOLFSSL_VERIFY_PEER | WOLFSSL_VERIFY_FAIL_IF_NO_PEER_CERT,
+            verify_callback);
 
-    ca_der = read_file(ca_der_file, &ca_der_size);
-    if (ca_der != NULL) {
-        if (wolfSSL_CTX_load_verify_buffer_ex(
-                ctx, ca_der, ca_der_size, WOLFSSL_FILETYPE_ASN1, 0,
-                WOLFSSL_LOAD_FLAG_DATE_ERR_OKAY) != WOLFSSL_SUCCESS) {
+        ca_der = read_file(ca_der_file, &ca_der_size);
+        if (ca_der != NULL) {
+            if (wolfSSL_CTX_load_verify_buffer_ex(
+                    ctx, ca_der, ca_der_size, WOLFSSL_FILETYPE_ASN1, 0,
+                    WOLFSSL_LOAD_FLAG_DATE_ERR_OKAY) != WOLFSSL_SUCCESS) {
+                free(ca_der);
+                print_wolfssl_errors("failed to load DER client CA");
+                return -1;
+            }
             free(ca_der);
-            print_wolfssl_errors("failed to load DER client CA");
+        }
+        else if (wolfSSL_CTX_load_verify_locations(
+                     ctx, ca_file, NULL) != WOLFSSL_SUCCESS) {
+            print_wolfssl_errors("failed to load PEM client CA");
+            fprintf(stderr, "client CA path: %s\n", ca_file);
             return -1;
         }
-        free(ca_der);
     }
-    else if (wolfSSL_CTX_load_verify_locations(ctx, ca_file, NULL) != WOLFSSL_SUCCESS) {
-        print_wolfssl_errors("failed to load PEM client CA");
-        fprintf(stderr, "client CA path: %s\n", ca_file);
-        return -1;
-    }
+    else
+        wolfSSL_CTX_set_verify(ctx, WOLFSSL_VERIFY_NONE, NULL);
     if (wolfSSL_CTX_use_certificate_chain_file(ctx, cert_file) != WOLFSSL_SUCCESS) {
         print_wolfssl_errors("failed to load server certificate chain");
         fprintf(stderr, "server certificate chain path: %s\n", cert_file);
@@ -359,8 +371,9 @@ int main(int argc, char** argv)
     if (listen_fd < 0)
         goto cleanup;
 
-    fprintf(stderr, "[wolfssl-server] listening on 127.0.0.1:%d group=%s\n",
-        cfg.port, cfg.group);
+    fprintf(stderr,
+        "[wolfssl-server] listening on 127.0.0.1:%d group=%s auth=%s\n",
+        cfg.port, cfg.group, cfg.mtls ? "mutual" : "server-only");
     fflush(stderr);
 
     while (keep_running) {

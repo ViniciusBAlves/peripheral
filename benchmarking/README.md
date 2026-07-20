@@ -19,8 +19,10 @@ and network cores together with sysbuild.
 
 The firmware contains every supported TLS key-exchange group and a trust bundle
 for the server CAs in the selected run. The server offers one group and one
-certificate per case. The nRF5340 uses one fixed ECDSA client identity for
-mutual TLS, so the benchmark signature algorithm describes the server side.
+certificate per case. By default, only the server is authenticated. With
+`--mtls-mode`, the server also requires the nRF5340's fixed ECDSA client
+identity, so the benchmark signature algorithm still describes the server
+side.
 
 SLH-DSA signs the server certificate chain. Its TLS `CertificateVerify` leaf
 remains ECDSA because the current TLS stacks do not negotiate SLH-DSA as a TLS
@@ -101,6 +103,32 @@ the board. The runner resets the DK after opening its VCOM so `BENCH_READY`
 is not lost. The previous Docker/OpenSSL server-chain benchmark remains
 available with `--host-only`.
 
+## KEM Operations Benchmark
+
+`run_kem_benchmarks.py` builds a separate nRF5340 image and measures recipient
+key generation, encapsulation and decapsulation directly on the application
+core. It validates that both sides derive the same secret and reports operation
+times, public/private key sizes, ciphertext and shared-secret sizes, CPU
+cycles, CPU time, and wolfSSL heap usage.
+
+```bash
+python benchmarking/run_kem_benchmarks.py \
+  --cases benchmarking/cases/all_kem_cases.csv \
+  --iterations 5 \
+  --seed 123
+```
+
+The default ML-KEM backend is the pinned `pqm4-m4fstack` implementation. Use
+`--mlkem-backend wolfssl` for a direct wolfSSL comparison. For ECDHE groups,
+the CSV labels the operation model as `dh_key_agreement`: encapsulation means
+ephemeral-key generation plus the initiator's shared-secret derivation, while
+decapsulation means the recipient's shared-secret derivation. Hybrid cases
+measure both their ML-KEM and classical components in each stage.
+
+As in the certificate benchmark, each attempt is capped at 15 minutes. A
+timeout cancels the remaining iterations of that KEM and advances to the next
+group.
+
 ## Raspberry Pi
 
 Configure SSH key authentication first. Install the system build and Bluetooth
@@ -172,10 +200,19 @@ The runner supports three server backend modes:
 - `--server-backend wolfssl`: use the wolfSSL TLS server for every selected
   case.
 
-The wolfSSL server is not a full MQTT broker. It accepts one mutual-TLS
-connection through the existing BLE bridge, reads the benchmark firmware's MQTT
-CONNECT packet, sends CONNACK, and closes cleanly. The resolved backend is saved
-in `run_manifest.csv`, `session_manifest.csv`, `attempts.csv`, and
+The wolfSSL server is not a full MQTT broker. It accepts one TLS connection
+through the existing BLE bridge, reads the benchmark firmware's MQTT CONNECT
+packet, sends CONNACK, and closes cleanly. Add `--mtls-mode` to require and
+verify the board certificate with either server backend:
+
+```bash
+python benchmarking/run_benchmarks.py \
+  --cases benchmarking/cases/<cases>.csv \
+  --seed 123 \
+  --mtls-mode
+```
+
+The authentication mode is saved in `run_config.json`, `attempts.csv`, and
 `summary.csv`.
 
 ## Hardware Run
@@ -344,6 +381,7 @@ The firmware also records the following per-attempt values:
   cryptographic verification of the server TLS 1.3 `CertificateVerify`.
 - `mtls_signature_generate_ms` measures the signature primitive used by the
   nRF5340 to produce its client-authentication `CertificateVerify`.
+  It remains zero when `--mtls-mode` is not enabled.
   `client_signature_total_ms` is the sum of X.509 verification, server
   `CertificateVerify` verification, and client mTLS signing.
 - `server_kem_encapsulation_ms` and `server_certificate_verify_sign_ms` are

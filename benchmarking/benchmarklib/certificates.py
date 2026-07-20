@@ -210,7 +210,7 @@ def generate_server_case(case: dict[str, str], output: Path, client_dir: Path, l
         )
         output_required = (
             *cached_required, "client_ca.crt", "client_ca.der",
-            "openssl.cnf", "mosquitto.conf",
+            "openssl.cnf", "mosquitto.conf", "mosquitto-mtls.conf",
         )
         if (
             _all_present(output, output_required)
@@ -263,7 +263,7 @@ def generate_server_case(case: dict[str, str], output: Path, client_dir: Path, l
     )
     output_required = (
         *cached_required, "client_ca.crt", "client_ca.der",
-        "openssl.cnf", "mosquitto.conf",
+        "openssl.cnf", "mosquitto.conf", "mosquitto-mtls.conf",
     )
     if (
         _all_present(output, output_required)
@@ -355,6 +355,13 @@ def write_case_configs(case: dict[str, str], output: Path) -> None:
         "ClientSignatureAlgorithms = ECDSA+SHA256\n"
     )
     (output / "mosquitto.conf").write_text(
+        "listener 8883\n"
+        "allow_anonymous true\n"
+        "certfile __REMOTE_CASE_DIR__/server_chain.crt\n"
+        "keyfile __REMOTE_CASE_DIR__/server.key\n"
+        "require_certificate false\n"
+    )
+    (output / "mosquitto-mtls.conf").write_text(
         "listener 8883\n"
         "allow_anonymous true\n"
         "cafile __REMOTE_CASE_DIR__/client_ca.crt\n"

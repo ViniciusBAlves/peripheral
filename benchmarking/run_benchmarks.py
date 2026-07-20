@@ -65,7 +65,7 @@ FATAL_SERVER_LOG_PATTERNS = (
 
 ATTEMPT_FIELDS = [
     "attempt_index", "schedule_index", "session", "attempt_in_session", "warmup",
-    "status", "reconnect_count", "mlkem_backend", "rsa_profile",
+    "status", "reconnect_count", "mtls_mode", "mlkem_backend", "rsa_profile",
     "kex_group", "kex_nist_level",
     "kex_public_key_bytes", "kex_ciphertext_bytes", "kex_shared_secret_bytes",
     "cert_sig_alg", "sig_nist_level", "sig_public_key_bytes",
@@ -105,7 +105,8 @@ ATTEMPT_FIELDS = [
 ]
 
 SUMMARY_FIELDS = [
-    "case_id", "mlkem_backend", "rsa_profile", "kex_group", "kex_nist_level",
+    "case_id", "mtls_mode", "mlkem_backend", "rsa_profile",
+    "kex_group", "kex_nist_level",
     "kex_public_key_bytes",
     "kex_ciphertext_bytes", "kex_shared_secret_bytes", "cert_sig_alg",
     "sig_nist_level", "sig_public_key_bytes", "sig_private_key_bytes",
@@ -547,6 +548,7 @@ def run_job(
                 server_backend=server_backend,
                 wolfssl_group=KEMS_BY_NAME[case["kex_group"]].wolfssl_group,
                 control_telemetry=getattr(args, "power_profiler", False),
+                mtls_mode=getattr(args, "mtls_mode", False),
                 )
                 remote_broker_log = f"{gateway.workdir}/logs/{case['case_id']}.broker.log"
                 fatal_detector = lambda: gateway.remote_file_contains(
@@ -625,6 +627,7 @@ def run_job(
         "warmup": job.warmup,
         "status": status,
         "reconnect_count": reconnect_count,
+        "mtls_mode": int(getattr(args, "mtls_mode", False)),
         **case_metadata(case),
         "ble_l2cap_connect_ms": gateway_values.get("ble_l2cap_connect_ms", ""),
         "gateway_tcp_connect_ms": gateway_values.get("gateway_tcp_connect_ms", ""),
@@ -849,6 +852,9 @@ def summarize(case: dict[str, str], attempts: list[dict[str, object]]) -> dict[s
         )
     return {
         "case_id": case["case_id"],
+        "mtls_mode": (
+            attempts[0].get("mtls_mode", "") if attempts else ""
+        ),
         **case_metadata(case),
         "status": status,
         "success_count": len(success),
@@ -1203,6 +1209,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default="auto",
         help="server TLS backend selection",
     )
+    parser.add_argument(
+        "--mtls-mode",
+        action="store_true",
+        help="require and verify the board client certificate during TLS",
+    )
     args = parser.parse_args(argv)
     if args.power_profiler:
         parser.error("--power-profiler is disabled for the nRF5340DK port")
@@ -1267,6 +1278,7 @@ def main() -> int:
             saved_config = json.loads(saved_config_path.read_text())
             args.mlkem_backend = saved_config["mlkem_backend"]
             args.server_backend = saved_config["server_backend"]
+            args.mtls_mode = saved_config.get("mtls_mode", False)
             args.power_profiler = saved_config.get("power_profiler", False)
             if args.power_profiler:
                 raise ValueError(
@@ -1316,6 +1328,7 @@ def main() -> int:
             "sessions_per_case": args.sessions_per_case,
             "mlkem_backend": args.mlkem_backend,
             "server_backend": args.server_backend,
+            "mtls_mode": args.mtls_mode,
             "power_profiler": args.power_profiler,
             "power_profiler_mode": "source" if args.power_profiler else "disabled",
             "power_profiler_serial_device": args.power_profiler_serial_device,

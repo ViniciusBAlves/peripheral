@@ -171,7 +171,8 @@ class PiGateway:
             log,
         )
         self.command(
-            f"sed -i 's|__REMOTE_CASE_DIR__|{remote}|g' {remote}/mosquitto.conf",
+            f"sed -i 's|__REMOTE_CASE_DIR__|{remote}|g' "
+            f"{remote}/mosquitto.conf {remote}/mosquitto-mtls.conf",
             log,
         )
         return remote
@@ -252,6 +253,7 @@ class PiGateway:
         server_backend: str = "openssl-mosquitto",
         wolfssl_group: str = "",
         control_telemetry: bool = False,
+        mtls_mode: bool = False,
     ) -> None:
         self.stop_session(log, reset_adapter=disable_wifi)
         self.ble_addr = ble_addr
@@ -283,13 +285,18 @@ class PiGateway:
                 f"setsid {shlex.quote(self.workdir)}/bin/wolfssl_tls_server "
                 f"--case-dir {remote_case_dir} "
                 f"--group {shlex.quote(wolfssl_group)} --port 8883 "
+                f"{'--mtls ' if mtls_mode else ''}"
                 f"> {broker_log} 2>&1 < /dev/null & "
                 f"echo $! > {self.workdir}/broker.pid"
             )
         else:
+            mosquitto_config = (
+                "mosquitto-mtls.conf" if mtls_mode else "mosquitto.conf"
+            )
             server_command = (
                 f"setsid env OPENSSL_CONF={remote_case_dir}/openssl.cnf "
-                f"/usr/sbin/mosquitto -c {remote_case_dir}/mosquitto.conf -v "
+                f"/usr/sbin/mosquitto -c "
+                f"{remote_case_dir}/{mosquitto_config} -v "
                 f"> {broker_log} 2>&1 < /dev/null & "
                 f"echo $! > {self.workdir}/broker.pid"
             )
