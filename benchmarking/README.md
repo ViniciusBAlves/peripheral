@@ -13,10 +13,12 @@ listener backed by OpenSSL 3.5+ and its available post-quantum providers, while
 LMS/HSS and XMSS cases use a small wolfSSL TLS server with a minimal MQTT
 CONNACK responder.
 
-The firmware contains every supported TLS key-exchange group and a trust bundle
-for the server CAs in the selected run. The server offers one group and one
-certificate per case. The nRF52840 uses one fixed ECDSA client identity for
-mutual TLS, so the benchmark signature algorithm describes the server side.
+Each firmware profile contains every supported TLS key-exchange group, the
+selected client-authentication identity, and a trust bundle for the server CAs
+in the selected run. The server offers one group and one certificate per case.
+The runner builds a profile for each `certificate_verify_alg` so the nRF52840's
+mutual-TLS `CertificateVerify` signature uses the algorithm recorded in the CSV
+when wolfSSL supports it.
 
 SLH-DSA signs the server certificate chain. Its TLS `CertificateVerify` leaf
 remains ECDSA because the current TLS stacks do not negotiate SLH-DSA as a TLS

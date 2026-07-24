@@ -12,7 +12,7 @@ from .algorithms import KEMS_BY_NAME, SIGNATURES_BY_NAME, Signature, slug
 from .server_backends import HASH_BASED_SIGNATURES
 
 
-IMAGE = "peripheral-pqc-openssl:3.6"
+IMAGE = "peripheral-pqc-openssl:3.7"
 ROOT = Path(__file__).resolve().parents[1]
 CERT_CACHE = ROOT / "work" / "certificate-cache" / "v3"
 LEGACY_CERT_CACHES = (ROOT / "work" / "certificate-cache" / "v1",)
@@ -39,7 +39,8 @@ def ensure_image(dockerfile: Path, log: Path) -> None:
         "openssl version; "
         "openssl list -kem-algorithms | grep -Eq 'MLKEM512|ML-KEM-512'; "
         "openssl list -signature-algorithms | grep -q 'SLH-DSA-SHAKE-256s'; "
-        "command -v hbs_certgen",
+        "command -v hbs_certgen; "
+        "command -v wolfssl_certgen",
     ]
     image = subprocess.run(
         ["docker", "image", "inspect", IMAGE],
@@ -148,7 +149,11 @@ def _digest_file(path: Path) -> str:
     return digest.hexdigest()[:16]
 
 
-def generate_client_identity(output: Path, log: Path) -> None:
+def generate_client_identity(
+    output: Path,
+    log: Path,
+    certificate_verify_alg: str = "ECDSA-P-256",
+) -> None:
     required = (
         "client_ca.crt", "client.crt", "client.key", "client_ca.der",
         "client_cert.der", "client_key.der", "server_root.crt",
@@ -157,7 +162,7 @@ def generate_client_identity(output: Path, log: Path) -> None:
     certs = ("client_ca.crt", "client.crt", "server_root.crt")
     if _all_present(output, required) and all(_cert_is_valid(output / name) for name in certs):
         return
-    cache = CERT_CACHE / "client-identity"
+    cache = CERT_CACHE / "client-identity" / slug(certificate_verify_alg)
     if _all_present(cache, required) and all(_cert_is_valid(cache / name) for name in certs):
         _append_log(log, f"[cert-cache] Reusing client identity from {cache}")
         _copy_files(cache, output, required)
@@ -165,6 +170,8 @@ def generate_client_identity(output: Path, log: Path) -> None:
     _append_log(log, f"[cert-cache] Generating client identity into {cache}")
     shutil.rmtree(cache, ignore_errors=True)
     cache.mkdir(parents=True, exist_ok=True)
+    client_key_args = _key_args(certificate_verify_alg)
+    client_hash_arg = _hash_arg(certificate_verify_alg)
     script = f"""
 cat > /out/client.ext <<'EOF'
 basicConstraints=critical,CA:FALSE
@@ -179,8 +186,9 @@ openssl req -x509 -new -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
   -not_before {CERT_NOT_BEFORE} -not_after {CERT_NOT_AFTER} \
   -addext basicConstraints=critical,CA:TRUE \
   -addext keyUsage=critical,keyCertSign,cRLSign
-openssl req -new -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
-  -keyout /out/client.key -out /out/client.csr -nodes -subj /CN=nrf52840-benchmark
+openssl req -new {client_key_args} \
+  -keyout /out/client.key -out /out/client.csr -nodes \
+  -subj /CN=nrf52840-benchmark {client_hash_arg}
 openssl x509 -req -in /out/client.csr -CA /out/client_ca.crt \
   -CAkey /out/client_ca.key -CAcreateserial -out /out/client.crt \
   -not_before {CERT_NOT_BEFORE} -not_after {CERT_NOT_AFTER} \
@@ -217,6 +225,9 @@ def generate_server_case(case: dict[str, str], output: Path, client_dir: Path, l
             and _cert_is_valid(output / "server_root.crt")
             and _cert_is_valid(output / "server.crt")
         ):
+            shutil.copy2(client_dir / "client_ca.crt", output / "client_ca.crt")
+            shutil.copy2(client_dir / "client_ca.der", output / "client_ca.der")
+            write_case_configs(case, output)
             return
         cache = CERT_CACHE / "server" / slug(signature.name)
         legacy_caches = [
@@ -270,6 +281,9 @@ def generate_server_case(case: dict[str, str], output: Path, client_dir: Path, l
         and _cert_is_valid(output / "server_intermediate.crt")
         and _cert_is_valid(output / "server.crt")
     ):
+        shutil.copy2(client_dir / "client_ca.crt", output / "client_ca.crt")
+        shutil.copy2(client_dir / "client_ca.der", output / "client_ca.der")
+        write_case_configs(case, output)
         return
     root_digest = _digest_file(client_dir / "server_root.crt")
     cache = CERT_CACHE / "server" / f"{root_digest}_{slug(signature.name)}"
@@ -352,7 +366,6 @@ def write_case_configs(case: dict[str, str], output: Path) -> None:
         "[system_default_sect]\nMinProtocol = TLSv1.3\n"
         f"Groups = {kem.openssl_group}\n"
         f"{max_send_fragment}"
-        "ClientSignatureAlgorithms = ECDSA+SHA256\n"
     )
     (output / "mosquitto.conf").write_text(
         "listener 8883\n"

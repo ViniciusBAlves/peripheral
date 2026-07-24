@@ -23,6 +23,15 @@ from benchmarklib.certificates import (
 )
 from benchmarklib.server_backends import HASH_BASED_SIGNATURES
 from generate_cases import FIELDS as INPUT_FIELDS
+from run_benchmarks import (
+    DEFAULT_CONFIG,
+    DEFAULT_NCS_VERSION,
+    default_ncs_chdir,
+    default_nrfutil,
+    load_config,
+    resolve_serial_device,
+)
+from run_board_certificate_benchmark import run_board_client_certificate_benchmark
 
 
 ROOT = Path(__file__).resolve().parent
@@ -41,6 +50,26 @@ ATTEMPT_FIELDS = [
     "server_chain_crt_bytes", "server_key_bytes",
     "client_ca_crt_bytes", "client_cert_crt_bytes", "client_key_bytes",
     "client_csr_der_bytes", "client_csr_pem_bytes", "output_total_bytes",
+    "client_cpu_ms", "client_cpu_cycles", "client_cycle_hz",
+    "client_cpu_usage_percent", "system_cpu_usage_percent",
+    "thread_main_cpu_percent", "thread_sysworkq_cpu_percent",
+    "thread_bt_rx_cpu_percent", "thread_bt_tx_cpu_percent",
+    "thread_idle_cpu_percent", "thread_other_cpu_percent",
+    "keygen_cpu_ms", "make_cert_cpu_ms", "sign_cert_cpu_ms",
+    "parse_cert_cpu_ms", "key_export_cpu_ms", "phase_cpu_total_ms",
+    "phase_cpu_verify",
+    "keygen_lsu_cycles", "make_cert_lsu_cycles", "sign_cert_lsu_cycles",
+    "parse_cert_lsu_cycles", "key_export_lsu_cycles",
+    "phase_lsu_total_cycles", "keygen_cpi_cycles",
+    "make_cert_cpi_cycles", "sign_cert_cpi_cycles", "parse_cert_cpi_cycles",
+    "key_export_cpi_cycles", "phase_cpi_total_cycles",
+    "phase_dwt_samples", "dwt_counters_supported", "dwt_wrap_risk",
+    "client_heap_current_bytes", "client_heap_peak_bytes",
+    "client_heap_free_bytes", "client_heap_capacity_bytes",
+    "thread_stack_used_bytes", "thread_stack_capacity_bytes",
+    "thread_stack_peak_percent", "client_cert_der_bytes",
+    "client_key_der_bytes", "client_cert_der_capacity_bytes",
+    "client_key_der_capacity_bytes", "client_hbs_state_capacity_bytes",
     "error_code", "message",
 ]
 
@@ -53,6 +82,18 @@ SUMMARY_FIELDS = [
     "server_chain_crt_bytes", "server_key_bytes",
     "client_cert_crt_bytes", "client_key_bytes",
     "client_csr_der_bytes", "client_csr_pem_bytes",
+    "mean_client_cpu_ms", "mean_thread_main_cpu_percent",
+    "mean_thread_sysworkq_cpu_percent", "mean_thread_bt_rx_cpu_percent",
+    "mean_thread_bt_tx_cpu_percent", "mean_thread_idle_cpu_percent",
+    "mean_thread_other_cpu_percent", "max_client_heap_peak_bytes",
+    "mean_keygen_cpu_ms", "mean_make_cert_cpu_ms",
+    "mean_sign_cert_cpu_ms", "mean_parse_cert_cpu_ms",
+    "mean_key_export_cpu_ms", "mean_phase_cpu_total_ms",
+    "phase_cpu_verify", "mean_phase_lsu_total_cycles",
+    "mean_phase_cpi_total_cycles", "max_phase_dwt_samples",
+    "dwt_counters_supported", "dwt_wrap_risk",
+    "max_thread_stack_peak_percent", "client_cert_der_bytes",
+    "client_key_der_bytes",
 ]
 
 MEASURE_EXEC_C = r"""
@@ -461,6 +502,34 @@ def hbs_server_chain_script(signature: Signature) -> str:
     return f"hbs_certgen {shlex.quote(signature.name)} /out"
 
 
+def wolfssl_server_chain_script(signature: Signature) -> str:
+    return f"wolfssl_certgen {shlex.quote(signature.name)} /out"
+
+
+def server_builder_for(signature: Signature, requested: str) -> str:
+    if requested == "auto":
+        return "wolfssl-hbs" if signature.name in HASH_BASED_SIGNATURES else "openssl"
+    if requested == "wolfssl" and signature.name in HASH_BASED_SIGNATURES:
+        return "wolfssl-hbs"
+    return requested
+
+
+def server_generation_scope(builder: str) -> str:
+    if builder == "wolfssl-hbs":
+        return "hash_based_root_and_leaf"
+    if builder == "wolfssl":
+        return "wolfssl_root_and_leaf"
+    return "leaf_and_intermediate_under_existing_root"
+
+
+def server_script_for(signature: Signature, builder: str) -> str:
+    if builder == "wolfssl-hbs":
+        return hbs_server_chain_script(signature)
+    if builder == "wolfssl":
+        return wolfssl_server_chain_script(signature)
+    return openssl_server_chain_script(signature)
+
+
 def attempt_row(
     *,
     attempt_index: int,
@@ -523,28 +592,79 @@ def summarize(rows: list[dict[str, object]]) -> list[dict[str, object]]:
     summaries = []
     for (_component, _signature), items in sorted(groups.items()):
         success = [item for item in items if item["status"] == "success"]
+        unsupported = [item for item in items if item["status"] == "unsupported"]
+        failed = [
+            item for item in items
+            if item["status"] not in {"success", "unsupported"}
+        ]
         base = items[0]
+        status = "success" if len(success) == len(items) else "fail"
+        if not success and len(unsupported) == len(items):
+            status = "unsupported"
         wall = numbers(success, "wall_ms")
         cpu = numbers(success, "cpu_ms")
         user_cpu = numbers(success, "user_cpu_ms")
         sys_cpu = numbers(success, "sys_cpu_ms")
         rss = numbers(success, "max_rss_kb")
         output_bytes = numbers(success, "output_total_bytes")
+        client_cpu = numbers(success, "client_cpu_ms")
+        thread_main_cpu = numbers(success, "thread_main_cpu_percent")
+        thread_sysworkq_cpu = numbers(success, "thread_sysworkq_cpu_percent")
+        thread_bt_rx_cpu = numbers(success, "thread_bt_rx_cpu_percent")
+        thread_bt_tx_cpu = numbers(success, "thread_bt_tx_cpu_percent")
+        thread_idle_cpu = numbers(success, "thread_idle_cpu_percent")
+        thread_other_cpu = numbers(success, "thread_other_cpu_percent")
+        summary_cpu = cpu if cpu else client_cpu
+        keygen_cpu = numbers(success, "keygen_cpu_ms")
+        make_cert_cpu = numbers(success, "make_cert_cpu_ms")
+        sign_cert_cpu = numbers(success, "sign_cert_cpu_ms")
+        parse_cert_cpu = numbers(success, "parse_cert_cpu_ms")
+        key_export_cpu = numbers(success, "key_export_cpu_ms")
+        phase_cpu_total = numbers(success, "phase_cpu_total_ms")
+        phase_lsu_total = numbers(success, "phase_lsu_total_cycles")
+        phase_cpi_total = numbers(success, "phase_cpi_total_cycles")
+        phase_dwt_samples = numbers(success, "phase_dwt_samples")
+        phase_verify_values = [
+            str(item.get("phase_cpu_verify", ""))
+            for item in success
+            if item.get("phase_cpu_verify", "") != ""
+        ]
+        phase_verify = ""
+        if phase_verify_values:
+            phase_verify = (
+                "pass"
+                if all(value == "pass" for value in phase_verify_values)
+                else "fail"
+            )
+        dwt_supported_values = [
+            str(item.get("dwt_counters_supported", ""))
+            for item in success
+            if item.get("dwt_counters_supported", "") != ""
+        ]
+        dwt_wrap_values = [
+            str(item.get("dwt_wrap_risk", ""))
+            for item in success
+            if item.get("dwt_wrap_risk", "") != ""
+        ]
+        client_heap_peak = numbers(success, "client_heap_peak_bytes")
+        thread_stack_peak = numbers(success, "thread_stack_peak_percent")
         summaries.append({
             "component": base["component"],
             "owner": base["owner"],
             "cert_sig_alg": base["cert_sig_alg"],
-            "sig_family": base["sig_family"],
-            "sig_nist_level": base["sig_nist_level"],
+            "sig_family": base.get("sig_family", ""),
+            "sig_nist_level": base.get("sig_nist_level", ""),
             "builder": base["builder"],
             "generation_scope": base["generation_scope"],
-            "status": "success" if len(success) == len(items) else "fail",
+            "status": status,
             "success_count": len(success),
-            "fail_count": len(items) - len(success),
+            "fail_count": len(failed),
             "mean_wall_ms": f"{sum(wall) / len(wall):.3f}" if wall else "",
             "min_wall_ms": f"{min(wall):.3f}" if wall else "",
             "max_wall_ms": f"{max(wall):.3f}" if wall else "",
-            "mean_cpu_ms": f"{sum(cpu) / len(cpu):.3f}" if cpu else "",
+            "mean_cpu_ms": (
+                f"{sum(summary_cpu) / len(summary_cpu):.3f}" if summary_cpu else ""
+            ),
             "mean_user_cpu_ms": (
                 f"{sum(user_cpu) / len(user_cpu):.3f}" if user_cpu else ""
             ),
@@ -557,36 +677,188 @@ def summarize(rows: list[dict[str, object]]) -> list[dict[str, object]]:
                 if output_bytes else ""
             ),
             "server_chain_crt_bytes": (
-                success[0]["server_chain_crt_bytes"] if success else ""
+                success[0].get("server_chain_crt_bytes", "") if success else ""
             ),
-            "server_key_bytes": success[0]["server_key_bytes"] if success else "",
+            "server_key_bytes": success[0].get("server_key_bytes", "") if success else "",
             "client_cert_crt_bytes": (
-                success[0]["client_cert_crt_bytes"] if success else ""
+                success[0].get("client_cert_crt_bytes", "") if success else ""
             ),
-            "client_key_bytes": success[0]["client_key_bytes"] if success else "",
+            "client_key_bytes": success[0].get("client_key_bytes", "") if success else "",
             "client_csr_der_bytes": (
-                success[0]["client_csr_der_bytes"] if success else ""
+                success[0].get("client_csr_der_bytes", "") if success else ""
             ),
             "client_csr_pem_bytes": (
-                success[0]["client_csr_pem_bytes"] if success else ""
+                success[0].get("client_csr_pem_bytes", "") if success else ""
+            ),
+            "mean_client_cpu_ms": (
+                f"{sum(client_cpu) / len(client_cpu):.3f}" if client_cpu else ""
+            ),
+            "mean_thread_main_cpu_percent": (
+                f"{sum(thread_main_cpu) / len(thread_main_cpu):.3f}"
+                if thread_main_cpu else ""
+            ),
+            "mean_thread_sysworkq_cpu_percent": (
+                f"{sum(thread_sysworkq_cpu) / len(thread_sysworkq_cpu):.3f}"
+                if thread_sysworkq_cpu else ""
+            ),
+            "mean_thread_bt_rx_cpu_percent": (
+                f"{sum(thread_bt_rx_cpu) / len(thread_bt_rx_cpu):.3f}"
+                if thread_bt_rx_cpu else ""
+            ),
+            "mean_thread_bt_tx_cpu_percent": (
+                f"{sum(thread_bt_tx_cpu) / len(thread_bt_tx_cpu):.3f}"
+                if thread_bt_tx_cpu else ""
+            ),
+            "mean_thread_idle_cpu_percent": (
+                f"{sum(thread_idle_cpu) / len(thread_idle_cpu):.3f}"
+                if thread_idle_cpu else ""
+            ),
+            "mean_thread_other_cpu_percent": (
+                f"{sum(thread_other_cpu) / len(thread_other_cpu):.3f}"
+                if thread_other_cpu else ""
+            ),
+            "mean_keygen_cpu_ms": (
+                f"{sum(keygen_cpu) / len(keygen_cpu):.3f}" if keygen_cpu else ""
+            ),
+            "mean_make_cert_cpu_ms": (
+                f"{sum(make_cert_cpu) / len(make_cert_cpu):.3f}"
+                if make_cert_cpu else ""
+            ),
+            "mean_sign_cert_cpu_ms": (
+                f"{sum(sign_cert_cpu) / len(sign_cert_cpu):.3f}"
+                if sign_cert_cpu else ""
+            ),
+            "mean_parse_cert_cpu_ms": (
+                f"{sum(parse_cert_cpu) / len(parse_cert_cpu):.3f}"
+                if parse_cert_cpu else ""
+            ),
+            "mean_key_export_cpu_ms": (
+                f"{sum(key_export_cpu) / len(key_export_cpu):.3f}"
+                if key_export_cpu else ""
+            ),
+            "mean_phase_cpu_total_ms": (
+                f"{sum(phase_cpu_total) / len(phase_cpu_total):.3f}"
+                if phase_cpu_total else ""
+            ),
+            "phase_cpu_verify": phase_verify,
+            "mean_phase_lsu_total_cycles": (
+                f"{sum(phase_lsu_total) / len(phase_lsu_total):.3f}"
+                if phase_lsu_total else ""
+            ),
+            "mean_phase_cpi_total_cycles": (
+                f"{sum(phase_cpi_total) / len(phase_cpi_total):.3f}"
+                if phase_cpi_total else ""
+            ),
+            "max_phase_dwt_samples": (
+                f"{max(phase_dwt_samples):.0f}" if phase_dwt_samples else ""
+            ),
+            "dwt_counters_supported": (
+                "1" if any(value == "1" for value in dwt_supported_values)
+                else "0" if dwt_supported_values else ""
+            ),
+            "dwt_wrap_risk": (
+                "1" if any(value == "1" for value in dwt_wrap_values)
+                else "0" if dwt_wrap_values else ""
+            ),
+            "max_client_heap_peak_bytes": (
+                f"{max(client_heap_peak):.0f}" if client_heap_peak else ""
+            ),
+            "max_thread_stack_peak_percent": (
+                f"{max(thread_stack_peak):.2f}" if thread_stack_peak else ""
+            ),
+            "client_cert_der_bytes": (
+                success[0].get("client_cert_der_bytes", "") if success else ""
+            ),
+            "client_key_der_bytes": (
+                success[0].get("client_key_der_bytes", "") if success else ""
             ),
         })
     return summaries
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    config_parser = argparse.ArgumentParser(add_help=False)
+    config_parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
+    config_args, _ = config_parser.parse_known_args(argv)
+    config = load_config(config_args.config)
+
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--config", type=Path, default=config_args.config)
     parser.add_argument("--cases", type=Path, required=True)
     parser.add_argument("--iterations", type=int, default=1)
     parser.add_argument("--run-id")
     parser.add_argument("--limit", type=int)
     parser.add_argument("--only-signature", action="append", default=[])
     parser.add_argument(
+        "--server-builder",
+        choices=("auto", "openssl", "wolfssl"),
+        default="auto",
+        help=(
+            "server certificate-chain generator. auto keeps the existing "
+            "OpenSSL path except LMS/XMSS, which use wolfSSL."
+        ),
+    )
+    parser.add_argument(
         "--no-client-identity",
         action="store_true",
-        help="skip the client identity provisioning benchmark",
+        help="deprecated; host-side client identity benchmark is skipped by default",
     )
+    parser.add_argument(
+        "--host-client-identity",
+        action="store_true",
+        help="also run the legacy host-side ECDSA-P-256 client CSR baseline",
+    )
+    parser.add_argument(
+        "--no-board-client",
+        action="store_true",
+        help="skip the board-side wolfSSL client certificate benchmark",
+    )
+    parser.add_argument("--skip-client-build", action="store_true")
+    parser.add_argument("--skip-client-flash", action="store_true")
+    parser.add_argument("--serial-device", default=config["serial-device"])
+    parser.add_argument("--serial-baud", type=int, default=115200)
+    parser.add_argument("--serial-timeout-sec", type=float, default=30.0)
+    parser.add_argument("--nrfutil", default=default_nrfutil())
+    parser.add_argument("--ncs-version", default=DEFAULT_NCS_VERSION)
+    parser.add_argument("--ncs-chdir", default=default_ncs_chdir())
+    parser.add_argument("--board", default="nrf52840dk/nrf52840")
     return parser.parse_args(argv)
+
+
+def board_args_from(args: argparse.Namespace) -> argparse.Namespace:
+    return argparse.Namespace(
+        config=args.config,
+        run_id=args.run_id,
+        skip_build=args.skip_client_build,
+        skip_flash=args.skip_client_flash,
+        serial_device=resolve_serial_device(args.serial_device),
+        serial_baud=args.serial_baud,
+        serial_timeout_sec=args.serial_timeout_sec,
+        nrfutil=args.nrfutil,
+        ncs_version=args.ncs_version,
+        ncs_chdir=args.ncs_chdir,
+        board=args.board,
+    )
+
+
+def board_client_error_row(
+    signature: Signature,
+    *,
+    status: str,
+    message: str,
+) -> dict[str, object]:
+    return {
+        "attempt_index": 1,
+        "component": "client_certificate",
+        "owner": "client",
+        "cert_sig_alg": signature.name,
+        "sig_family": signature.family,
+        "sig_nist_level": signature.nist_level,
+        "builder": "wolfssl_board",
+        "generation_scope": "client_self_signed_cert",
+        "status": status,
+        "message": message,
+    }
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -620,7 +892,7 @@ def main(argv: list[str] | None = None) -> int:
         raise ValueError("no signatures selected")
 
     attempts: list[dict[str, object]] = []
-    if not args.no_client_identity:
+    if args.host_client_identity:
         client_case = {
             "case_id": "client_identity",
             "cert_sig_alg": "ECDSA-P-256",
@@ -647,19 +919,50 @@ def main(argv: list[str] | None = None) -> int:
             ))
             write_csv(run_dir / "attempts.csv", ATTEMPT_FIELDS, attempts)
 
+    if not args.no_board_client:
+        for case in cases:
+            signature = SIGNATURES_BY_NAME[case["cert_sig_alg"]]
+            for attempt in range(1, args.iterations + 1):
+                print(
+                    f"[client-cert] board wolfSSL {signature.name} "
+                    f"attempt={attempt}/{args.iterations}",
+                    flush=True,
+                )
+                board_args = board_args_from(args)
+                if attempt > 1:
+                    board_args.skip_build = True
+                try:
+                    board_row = run_board_client_certificate_benchmark(
+                        board_args,
+                        run_id=run_id,
+                        run_dir=run_dir,
+                        signature=signature.name,
+                    )
+                except subprocess.CalledProcessError as error:
+                    board_row = board_client_error_row(
+                        signature,
+                        status="unsupported",
+                        message=f"board build command failed: {error.returncode}",
+                    )
+                except Exception as error:
+                    board_row = board_client_error_row(
+                        signature,
+                        status="fail",
+                        message=str(error),
+                    )
+                board_row["attempt_index"] = attempt
+                board_row["sig_family"] = signature.family
+                board_row["sig_nist_level"] = signature.nist_level
+                board_row["cpu_ms"] = board_row.get("client_cpu_ms", "")
+                attempts.append(board_row)
+                write_csv(run_dir / "attempts.csv", ATTEMPT_FIELDS, attempts)
+
     for case in cases:
         signature = SIGNATURES_BY_NAME[case["cert_sig_alg"]]
-        hash_based = signature.name in HASH_BASED_SIGNATURES
-        builder = "wolfssl-hbs" if hash_based else "openssl"
-        generation_scope = (
-            "hash_based_root_and_leaf"
-            if hash_based else "leaf_and_intermediate_under_existing_root"
-        )
-        script = (
-            hbs_server_chain_script(signature)
-            if hash_based else openssl_server_chain_script(signature)
-        )
-        mounts = [] if hash_based else [(client_dir, "/client", True)]
+        builder = server_builder_for(signature, args.server_builder)
+        generation_scope = server_generation_scope(builder)
+        script = server_script_for(signature, builder)
+        mounts = [] if builder != "openssl" else [(client_dir, "/client", True)]
         for attempt in range(1, args.iterations + 1):
             output = (
                 run_dir / "attempts" / slug(signature.name) / f"{attempt:03d}"

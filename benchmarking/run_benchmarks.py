@@ -17,7 +17,7 @@ from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
 
-from benchmarklib.algorithms import KEMS_BY_NAME, SIGNATURES_BY_NAME
+from benchmarklib.algorithms import KEMS_BY_NAME, SIGNATURES_BY_NAME, slug
 from benchmarklib.certificates import (
     ensure_image,
     generate_client_identity,
@@ -260,6 +260,10 @@ def case_metadata(case: dict[str, str]) -> dict[str, str]:
 
 def needs_large_rsa_firmware(case: dict[str, str]) -> bool:
     return False
+
+
+def certificate_verify_profile(case: dict[str, str]) -> str:
+    return case.get("certificate_verify_alg") or case["cert_sig_alg"]
 
 
 def is_rsa_pss_case(case: dict[str, str]) -> bool:
@@ -1212,13 +1216,23 @@ def main() -> int:
     docker_log = run_dir / "docker.log"
     print(f"[setup] Checking Docker OpenSSL/OQS image; log={docker_log}", flush=True)
     ensure_image(ROOT / "docker" / "Dockerfile.pqc", docker_log)
-    client_dir = run_dir / "generated-client"
-    print("[setup] Generating the fixed client identity and universal server root...", flush=True)
-    generate_client_identity(client_dir, docker_log)
+    client_root = run_dir / "generated-client"
+    print("[setup] Generating client identities and server roots...", flush=True)
+    client_dirs: dict[str, Path] = {}
+
+    def client_dir_for(case: dict[str, str]) -> Path:
+        profile = certificate_verify_profile(case)
+        client_dir = client_dirs.get(profile)
+        if client_dir is None:
+            client_dir = client_root / slug(profile)
+            generate_client_identity(client_dir, docker_log, profile)
+            client_dirs[profile] = client_dir
+        return client_dir
+
     supported: list[dict[str, str]] = []
     unsupported: dict[str, str] = {}
     server_backends: dict[str, str] = {}
-    signature_templates: dict[str, Path] = {}
+    signature_templates: dict[tuple[str, str], Path] = {}
     for case in cases:
         server_backend = server_backend_for_case(case, args.server_backend)
         if server_backend is None:
@@ -1229,17 +1243,21 @@ def main() -> int:
         server_backends[case["case_id"]] = server_backend
         try:
             generated = case_dirs[case["case_id"]] / "generated"
-            template = signature_templates.get(case["cert_sig_alg"])
+            profile = certificate_verify_profile(case)
+            template_key = (case["cert_sig_alg"], profile)
+            client_dir = client_dir_for(case)
+            template = signature_templates.get(template_key)
             if template is None:
                 print(
-                    f"[certificates] Generating server chain for {case['cert_sig_alg']}...",
+                    f"[certificates] Generating server chain for "
+                    f"{case['cert_sig_alg']} with client auth {profile}...",
                     flush=True,
                 )
                 generate_server_case(
                     case, generated, client_dir,
                     case_dirs[case["case_id"]] / "build.log",
                 )
-                signature_templates[case["cert_sig_alg"]] = generated
+                signature_templates[template_key] = generated
             else:
                 shutil.copytree(template, generated, dirs_exist_ok=True)
                 write_case_configs(case, generated)
@@ -1250,49 +1268,68 @@ def main() -> int:
     if not supported:
         raise RuntimeError("none of the selected cases passed certificate preparation")
     generated_root = WORK / "generated" / run_id
-    normal_generated_dir = generated_root / "fast-math"
-    generate_universal_header(
-        client_dir,
-        [
-            (case["case_id"], case_dirs[case["case_id"]] / "generated")
-            for case in supported
-        ],
-        normal_generated_dir / "benchmark_credentials.h",
-    )
-    build_dir = WORK / "firmware-build" / run_id
+    all_case_dirs = [
+        (case["case_id"], case_dirs[case["case_id"]] / "generated")
+        for case in supported
+    ]
+    profiles = sorted({certificate_verify_profile(case) for case in supported})
+    profile_generated_dirs: dict[str, Path] = {}
+    profile_build_dirs: dict[str, Path] = {}
+    for profile in profiles:
+        profile_generated_dir = generated_root / f"fast-math-{slug(profile)}"
+        generate_universal_header(
+            client_dirs[profile],
+            all_case_dirs,
+            profile_generated_dir / "benchmark_credentials.h",
+        )
+        profile_generated_dirs[profile] = profile_generated_dir
+        profile_build_dirs[profile] = WORK / "firmware-build" / f"{run_id}-{slug(profile)}"
     pqm4_dir = None
     if args.mlkem_backend.startswith("pqm4-"):
         pqm4_dir = WORK / "pqm4"
         print(f"[firmware] Preparing pinned pqm4 sources in {pqm4_dir}...", flush=True)
         ensure_pqm4(pqm4_dir, run_dir / "build.log")
-    normal_build_ready = (build_dir / "zephyr/zephyr.hex").exists()
-    if (
-        supported
-        and not args.skip_build
-        and not (resuming and normal_build_ready)
-    ):
-        print(f"[firmware] Building universal image; log={run_dir / 'build.log'}", flush=True)
-        build_firmware(
-            firmware_dir=ROOT / "firmware", build_dir=build_dir,
-            generated_dir=normal_generated_dir, log=run_dir / "build.log",
-            nrfutil=args.nrfutil, ncs_version=args.ncs_version,
-            ncs_chdir=args.ncs_chdir, board=args.board,
-            mlkem_backend=args.mlkem_backend, pqm4_dir=pqm4_dir,
-            large_rsa=False,
-        )
+    if supported and not args.skip_build:
+        for profile in profiles:
+            build_dir = profile_build_dirs[profile]
+            build_ready = (build_dir / "zephyr/zephyr.hex").exists()
+            if resuming and build_ready:
+                continue
+            print(
+                f"[firmware] Building image client-auth={profile}; "
+                f"log={run_dir / 'build.log'}",
+                flush=True,
+            )
+            build_firmware(
+                firmware_dir=ROOT / "firmware", build_dir=build_dir,
+                generated_dir=profile_generated_dirs[profile],
+                log=run_dir / "build.log",
+                nrfutil=args.nrfutil, ncs_version=args.ncs_version,
+                ncs_chdir=args.ncs_chdir, board=args.board,
+                mlkem_backend=args.mlkem_backend, pqm4_dir=pqm4_dir,
+                large_rsa=False,
+            )
         print("[firmware] Build completed.", flush=True)
-    if not args.skip_flash:
+    first_build_dir = profile_build_dirs[profiles[0]]
+    if not args.skip_flash and len(profiles) == 1:
+        profile = profiles[0]
         print(
-            f"[firmware] Flashing nRF52840 profile=fast-math; "
-            f"log={run_dir / 'flash.log'}",
+            f"[firmware] Flashing nRF52840 profile=fast-math "
+            f"client-auth={profile}; log={run_dir / 'flash.log'}",
             flush=True,
         )
         flash_firmware(
-            build_dir=build_dir, log=run_dir / "flash.log",
+            build_dir=first_build_dir, log=run_dir / "flash.log",
             nrfutil=args.nrfutil, ncs_version=args.ncs_version,
             ncs_chdir=args.ncs_chdir,
         )
         print("[firmware] Flash completed.", flush=True)
+    elif not args.skip_flash:
+        print(
+            f"[firmware] Prepared {len(profiles)} client-auth images; "
+            "flashing will follow the schedule.",
+            flush=True,
+        )
 
     gateway = PiGateway(args.pi_host, args.pi_workdir, args.ssh_key)
     print(
@@ -1304,7 +1341,7 @@ def main() -> int:
     atexit.register(gateway.stop_master)
     print(f"[gateway] Preparing Raspberry Pi bridge; log={run_dir / 'gateway.log'}", flush=True)
     wolfssl_archives = list(
-        (build_dir / "_deps" / "wolfssl_upstream-subbuild").glob(
+        (first_build_dir / "_deps" / "wolfssl_upstream-subbuild").glob(
             "**/dd6da70d395a0cb26446326f329678fe3bfb212c.tar.gz"
         )
     )
@@ -1337,20 +1374,31 @@ def main() -> int:
 
     interrupted = False
     serial_port = None
-    try:
-        serial_port = serial.Serial(
+    current_firmware_profile: str | None = profiles[0] if len(profiles) == 1 else None
+
+    def open_serial_and_wait(profile: str):
+        port = serial.Serial(
             args.serial_device, args.serial_baud, timeout=0.25
         )
-        serial_port.reset_input_buffer()
+        port.reset_input_buffer()
+        print(
+            f"[board] Waiting for BENCH_READY on {args.serial_device} "
+            f"client-auth={profile}...",
+            flush=True,
+        )
+        wait_for_board_ready(
+            port, run_dir / "board.log", args.board_ready_timeout_sec
+        )
+        print("[board] Firmware is ready.", flush=True)
+        return port
+
+    try:
+        if args.skip_flash:
+            serial_port = open_serial_and_wait("current")
+            current_firmware_profile = None
+        elif len(profiles) == 1:
+            serial_port = open_serial_and_wait(profiles[0])
         try:
-            print(
-                f"[board] Waiting for BENCH_READY on {args.serial_device}...",
-                flush=True,
-            )
-            wait_for_board_ready(
-                serial_port, run_dir / "board.log", args.board_ready_timeout_sec
-            )
-            print("[board] Firmware is ready.", flush=True)
             for execution_order, job in scheduled_jobs:
                 case = case_by_id[job.case_id]
                 timeout = timeout_for_case(case, args.attempt_timeout_sec)
@@ -1373,6 +1421,28 @@ def main() -> int:
                         "message": unsupported[job.case_id],
                     }
                 else:
+                    profile = certificate_verify_profile(case)
+                    if not args.skip_flash and current_firmware_profile != profile:
+                        if serial_port is not None and serial_port.is_open:
+                            serial_port.close()
+                        flash_log = run_dir / f"flash-{slug(profile)}.log"
+                        print(
+                            f"[firmware] Flashing nRF52840 profile=fast-math "
+                            f"client-auth={profile}; log={flash_log}",
+                            flush=True,
+                        )
+                        flash_firmware(
+                            build_dir=profile_build_dirs[profile],
+                            log=flash_log,
+                            nrfutil=args.nrfutil,
+                            ncs_version=args.ncs_version,
+                            ncs_chdir=args.ncs_chdir,
+                        )
+                        print("[firmware] Flash completed.", flush=True)
+                        serial_port = open_serial_and_wait(profile)
+                        current_firmware_profile = profile
+                    if serial_port is None:
+                        raise RuntimeError("serial port was not opened")
                     row = run_job(
                         job, case, case_dirs[job.case_id],
                         remote_cases[job.case_id],

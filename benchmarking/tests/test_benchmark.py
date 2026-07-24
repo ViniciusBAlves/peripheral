@@ -17,6 +17,7 @@ from benchmarklib.server_backends import server_backend_for_case
 from generate_cases import build_cases
 from run_benchmarks import (
     ATTEMPT_FIELDS,
+    certificate_verify_profile,
     client_kex_metric_keys,
     classify_gateway_start_failure,
     load_config,
@@ -32,6 +33,8 @@ from run_benchmarks import (
     wait_for_result,
     write_checkpoint,
 )
+import run_certificate_benchmarks as cert_bench
+import run_board_certificate_benchmark as board_cert_bench
 
 
 class BenchmarkTests(unittest.TestCase):
@@ -100,6 +103,34 @@ class BenchmarkTests(unittest.TestCase):
             "CertificateVerify uses ECDSA" in case["notes"]
             for case in signatures.values()
         ))
+        self.assertTrue(all(
+            case["certificate_verify_alg"] == "ECDSA-P-256"
+            for case in signatures.values()
+        ))
+
+    def test_certificate_verify_profile_uses_case_metadata(self) -> None:
+        self.assertEqual(
+            certificate_verify_profile({
+                "cert_sig_alg": "ML-DSA-65",
+                "certificate_verify_alg": "ML-DSA-65",
+            }),
+            "ML-DSA-65",
+        )
+        self.assertEqual(
+            certificate_verify_profile({"cert_sig_alg": "ECDSA-P-256"}),
+            "ECDSA-P-256",
+        )
+
+    def test_openssl_config_does_not_force_ecdsa_client_auth(self) -> None:
+        case = {
+            "kex_group": "ECDHE-P-256",
+            "cert_sig_alg": "ML-DSA-65",
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp)
+            write_case_configs(case, output)
+            config = (output / "openssl.cnf").read_text()
+        self.assertNotIn("ClientSignatureAlgorithms = ECDSA+SHA256", config)
 
     def test_config_supplies_hardware_defaults_and_cli_overrides(self) -> None:
         config = load_config(ROOT / "config.json")
@@ -264,7 +295,7 @@ class BenchmarkTests(unittest.TestCase):
         self.assertEqual(row["message"], "tlsv1 alert unknown ca")
         self.assertEqual(gateway.starts, 1)
 
-    def test_openssl_server_requests_board_client_signature_algorithm(self) -> None:
+    def test_openssl_server_does_not_force_board_client_signature_algorithm(self) -> None:
         case = {
             "kex_group": "ECDHE-P-521",
         }
@@ -274,7 +305,7 @@ class BenchmarkTests(unittest.TestCase):
             openssl_config = (output / "openssl.cnf").read_text()
 
         self.assertIn("Groups = P-521\n", openssl_config)
-        self.assertIn("ClientSignatureAlgorithms = ECDSA+SHA256\n", openssl_config)
+        self.assertNotIn("ClientSignatureAlgorithms = ECDSA+SHA256\n", openssl_config)
         self.assertNotIn("MaxSendFragment", openssl_config)
 
     def test_slh_openssl_server_uses_smaller_tls_records(self) -> None:
@@ -379,6 +410,95 @@ class BenchmarkTests(unittest.TestCase):
         )
         self.assertEqual(summary["firmware_flash_used_bytes"], "600000")
         self.assertEqual(summary["max_thread_stack_peak_percent"], "72.50")
+
+    def test_certificate_summary_uses_board_cpu_metric(self) -> None:
+        row = {field: "" for field in cert_bench.ATTEMPT_FIELDS}
+        row.update({
+            "attempt_index": 1,
+            "component": "client_certificate",
+            "owner": "client",
+            "cert_sig_alg": "ECDSA-P-256",
+            "sig_family": "classical",
+            "sig_nist_level": 1,
+            "builder": "wolfssl_board",
+            "generation_scope": "client_self_signed_cert",
+            "status": "success",
+            "wall_ms": "80",
+            "client_cpu_ms": "79.711",
+            "keygen_cpu_ms": "12.000",
+            "make_cert_cpu_ms": "3.000",
+            "sign_cert_cpu_ms": "60.000",
+            "parse_cert_cpu_ms": "1.000",
+            "key_export_cpu_ms": "2.000",
+            "phase_cpu_total_ms": "78.000",
+            "phase_cpu_verify": "pass",
+            "phase_lsu_total_cycles": "1234",
+            "phase_cpi_total_cycles": "5678",
+            "phase_dwt_samples": "90",
+            "dwt_counters_supported": "1",
+            "dwt_wrap_risk": "0",
+        })
+
+        summary = cert_bench.summarize([row])[0]
+
+        self.assertEqual(summary["mean_cpu_ms"], "79.711")
+        self.assertEqual(summary["mean_client_cpu_ms"], "79.711")
+        self.assertEqual(summary["mean_keygen_cpu_ms"], "12.000")
+        self.assertEqual(summary["mean_make_cert_cpu_ms"], "3.000")
+        self.assertEqual(summary["mean_sign_cert_cpu_ms"], "60.000")
+        self.assertEqual(summary["mean_parse_cert_cpu_ms"], "1.000")
+        self.assertEqual(summary["mean_key_export_cpu_ms"], "2.000")
+        self.assertEqual(summary["mean_phase_cpu_total_ms"], "78.000")
+        self.assertEqual(summary["phase_cpu_verify"], "pass")
+        self.assertEqual(summary["mean_phase_lsu_total_cycles"], "1234.000")
+        self.assertEqual(summary["mean_phase_cpi_total_cycles"], "5678.000")
+        self.assertEqual(summary["max_phase_dwt_samples"], "90")
+        self.assertEqual(summary["dwt_counters_supported"], "1")
+        self.assertEqual(summary["dwt_wrap_risk"], "0")
+
+    def test_board_certificate_attempt_row_parses_phase_cpu_metrics(self) -> None:
+        row = board_cert_bench.attempt_row({
+            "status": "success",
+            "algorithm": "ECDSA-P-256",
+            "wall_ms": "80",
+            "client_cpu_us": "79711",
+            "keygen_cpu_us": "12000",
+            "make_cert_cpu_us": "3000",
+            "sign_cert_cpu_us": "60000",
+            "parse_cert_cpu_us": "1000",
+            "key_export_cpu_us": "2000",
+            "phase_cpu_total_us": "78000",
+            "phase_cpu_verify": "pass",
+            "keygen_lsu_cycles": "100",
+            "make_cert_lsu_cycles": "20",
+            "sign_cert_lsu_cycles": "1000",
+            "parse_cert_lsu_cycles": "30",
+            "key_export_lsu_cycles": "84",
+            "phase_lsu_total_cycles": "1234",
+            "keygen_cpi_cycles": "500",
+            "make_cert_cpi_cycles": "40",
+            "sign_cert_cpi_cycles": "5000",
+            "parse_cert_cpi_cycles": "50",
+            "key_export_cpi_cycles": "88",
+            "phase_cpi_total_cycles": "5678",
+            "phase_dwt_samples": "90",
+            "dwt_counters_supported": "1",
+            "dwt_wrap_risk": "0",
+        })
+
+        self.assertEqual(row["client_cpu_ms"], "79.711")
+        self.assertEqual(row["keygen_cpu_ms"], "12.000")
+        self.assertEqual(row["make_cert_cpu_ms"], "3.000")
+        self.assertEqual(row["sign_cert_cpu_ms"], "60.000")
+        self.assertEqual(row["parse_cert_cpu_ms"], "1.000")
+        self.assertEqual(row["key_export_cpu_ms"], "2.000")
+        self.assertEqual(row["phase_cpu_total_ms"], "78.000")
+        self.assertEqual(row["phase_cpu_verify"], "pass")
+        self.assertEqual(row["phase_lsu_total_cycles"], "1234")
+        self.assertEqual(row["phase_cpi_total_cycles"], "5678")
+        self.assertEqual(row["phase_dwt_samples"], "90")
+        self.assertEqual(row["dwt_counters_supported"], "1")
+        self.assertEqual(row["dwt_wrap_risk"], "0")
 
     def test_heavier_signatures_receive_longer_timeouts(self) -> None:
         classic = {"kex_group": "ECDHE-P-256", "cert_sig_alg": "ECDSA-P-256"}

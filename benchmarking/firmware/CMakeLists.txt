@@ -5,6 +5,9 @@ project(peripheral)
 
 set(BENCH_MLKEM_BACKEND "pqm4-m4fstack" CACHE STRING "ML-KEM implementation")
 set_property(CACHE BENCH_MLKEM_BACKEND PROPERTY STRINGS wolfssl pqm4-m4fstack)
+option(BENCH_CLIENT_CERTGEN "Run board-side client certificate generation benchmark" OFF)
+set(BENCH_CLIENT_CERTGEN_SIG "ECDSA-P-256" CACHE STRING
+    "Signature algorithm for board-side client certificate generation")
 
 if(NOT DEFINED BENCH_GENERATED_DIR)
     message(FATAL_ERROR "BENCH_GENERATED_DIR must contain benchmark_credentials.h")
@@ -282,6 +285,13 @@ target_compile_options(app PRIVATE -include ${CMAKE_CURRENT_SOURCE_DIR}/user_set
 target_compile_definitions(app PRIVATE
     BENCH_RSA_PROFILE_NAME="fast-math"
 )
+
+if(BENCH_CLIENT_CERTGEN)
+    target_compile_definitions(app PRIVATE
+        BENCH_CLIENT_CERTGEN
+        BENCH_CLIENT_CERTGEN_SIG="${BENCH_CLIENT_CERTGEN_SIG}"
+    )
+endif()
 
 if(BENCH_MLKEM_BACKEND STREQUAL "pqm4-m4fstack")
     if(NOT DEFINED PQM4_ROOT OR
