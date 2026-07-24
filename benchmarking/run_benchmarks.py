@@ -86,6 +86,10 @@ ATTEMPT_FIELDS = [
     "client_icache_hits", "client_icache_misses", "client_icache_requests",
     "client_icache_hit_percent", "client_icache_miss_percent",
     "client_memory_access_counters_supported",
+    "dwt_cycle_counter_supported", "dwt_event_counters_supported",
+    "dwt_cyccnt", "dwt_cpicnt", "dwt_exccnt", "dwt_sleepcnt",
+    "dwt_lsucnt", "dwt_foldcnt", "dwt_cycle_counter_width_bits",
+    "dwt_event_counter_width_bits", "dwt_counts_are_modulo",
     "client_heap_current_bytes", "client_heap_peak_bytes",
     "client_heap_free_bytes", "client_heap_capacity_bytes",
     "client_heap_peak_usage_percent",
@@ -121,6 +125,11 @@ SUMMARY_FIELDS = [
     "mean_client_icache_requests", "mean_client_icache_hit_percent",
     "mean_client_icache_miss_percent",
     "client_memory_access_counters_supported",
+    "dwt_cycle_counter_supported", "dwt_event_counters_supported",
+    "mean_dwt_cyccnt", "mean_dwt_cpicnt", "mean_dwt_exccnt",
+    "mean_dwt_sleepcnt", "mean_dwt_lsucnt", "mean_dwt_foldcnt",
+    "dwt_cycle_counter_width_bits", "dwt_event_counter_width_bits",
+    "dwt_counts_are_modulo",
     "max_client_heap_peak_bytes", "min_client_heap_free_bytes",
     "client_heap_capacity_bytes", "max_client_heap_peak_usage_percent",
     "mean_communication_overhead_ms",
@@ -716,6 +725,15 @@ def run_job(
         "client_memory_access_counters_supported": final.get(
             "client_memory_access_counters_supported", "0"
         ),
+        **{
+            field: final.get(field, "") for field in (
+                "dwt_cycle_counter_supported", "dwt_event_counters_supported",
+                "dwt_cyccnt", "dwt_cpicnt", "dwt_exccnt", "dwt_sleepcnt",
+                "dwt_lsucnt", "dwt_foldcnt",
+                "dwt_cycle_counter_width_bits",
+                "dwt_event_counter_width_bits", "dwt_counts_are_modulo",
+            )
+        },
         "client_heap_current_bytes": final.get("client_heap_current_bytes", ""),
         "client_heap_peak_bytes": final.get("client_heap_peak_bytes", ""),
         "client_heap_free_bytes": final.get("client_heap_free_bytes", ""),
@@ -783,6 +801,13 @@ def summarize(case: dict[str, str], attempts: list[dict[str, object]]) -> dict[s
     icache_requests = successful_numbers("client_icache_requests")
     icache_hit_percent = successful_numbers("client_icache_hit_percent")
     icache_miss_percent = successful_numbers("client_icache_miss_percent")
+    dwt_values = {
+        field: successful_numbers(field)
+        for field in (
+            "dwt_cyccnt", "dwt_cpicnt", "dwt_exccnt", "dwt_sleepcnt",
+            "dwt_lsucnt", "dwt_foldcnt",
+        )
+    }
     communication = successful_numbers("communication_overhead_ms")
     keygen = successful_numbers("kem_keygen_ms")
     encapsulation = successful_numbers("kem_encapsulation_ms")
@@ -903,6 +928,25 @@ def summarize(case: dict[str, str], attempts: list[dict[str, object]]) -> dict[s
         "client_memory_access_counters_supported": first_successful(
             "client_memory_access_counters_supported"
         ),
+        "dwt_cycle_counter_supported": first_successful(
+            "dwt_cycle_counter_supported"
+        ),
+        "dwt_event_counters_supported": first_successful(
+            "dwt_event_counters_supported"
+        ),
+        **{
+            f"mean_{field}": (
+                f"{sum(values) / len(values):.3f}" if values else ""
+            )
+            for field, values in dwt_values.items()
+        },
+        "dwt_cycle_counter_width_bits": first_successful(
+            "dwt_cycle_counter_width_bits"
+        ),
+        "dwt_event_counter_width_bits": first_successful(
+            "dwt_event_counter_width_bits"
+        ),
+        "dwt_counts_are_modulo": first_successful("dwt_counts_are_modulo"),
         "max_client_heap_peak_bytes": max(heap) if heap else "",
         "min_client_heap_free_bytes": (
             f"{min(heap_free):.0f}" if heap_free else ""

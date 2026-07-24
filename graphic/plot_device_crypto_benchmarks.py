@@ -38,6 +38,15 @@ KEM_OPERATIONS = (
     ("encapsulation_seconds", "Encaps (s)"),
     ("decapsulation_seconds", "Decaps (s)"),
 )
+OPERATION_COLORS = {
+    "keygen_seconds": "#2563eb",
+    "make_body_seconds": "#7c3aed",
+    "sign_seconds": "#f59e0b",
+    "verify_seconds": "#10b981",
+    "encapsulation_seconds": "#dc2626",
+    "decapsulation_seconds": "#0891b2",
+    "other_seconds": "#94a3b8",
+}
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -156,13 +165,15 @@ def aggregate_certificate_rows(
     output = []
     for algorithm, all_rows in grouped.items():
         success = [row for row in all_rows if row.get("status") == "success"]
+        timed_out = any(row.get("status") == "timeout" for row in all_rows)
         output.append(
             {
                 "algorithm": algorithm,
                 "family": first_field(all_rows, "sig_family"),
                 "nist_level": first_field(all_rows, "sig_nist_level"),
                 "status": "success" if len(success) == len(all_rows) else
-                    "mixed" if success else "no_success",
+                    "mixed" if success else
+                    "timeout" if timed_out else "no_success",
                 "success_count": len(success),
                 "attempt_count": len(all_rows),
                 "mean_time_seconds": divide(
@@ -259,6 +270,8 @@ def sort_aggregates(
 
 
 def row_color(row: dict[str, object]) -> str:
+    if row.get("status") == "timeout":
+        return "#b91c1c"
     family = str(row.get("family", "")).lower()
     if family == "pqc":
         return "#0f766e"
@@ -274,6 +287,33 @@ def numeric_for_plot(
         float(row[field]) if row.get(field) is not None else 0.0
         for row in rows
     ]
+
+
+def operation_series(
+    rows: Sequence[dict[str, object]],
+    benchmark_type: str,
+) -> list[tuple[str, str, list[float]]]:
+    operations = (
+        CERTIFICATE_OPERATIONS
+        if benchmark_type == "certificate"
+        else KEM_OPERATIONS
+    )
+    series = [
+        (field, label.removesuffix(" (s)"), numeric_for_plot(rows, field))
+        for field, label in operations
+    ]
+    totals = numeric_for_plot(rows, "mean_time_seconds")
+    measured_sums = [
+        sum(values[index] for _, _, values in series)
+        for index in range(len(rows))
+    ]
+    residual = [
+        max(total - measured, 0.0)
+        for total, measured in zip(totals, measured_sums, strict=True)
+    ]
+    if any(value > 1e-9 for value in residual):
+        series.append(("other_seconds", "Other", residual))
+    return series
 
 
 def annotate_bars(
@@ -321,17 +361,17 @@ def plot_summary(
     output: Path,
     logarithmic_time: bool,
 ) -> None:
-    measured = [row for row in rows if row["mean_time_seconds"] is not None]
-    if not measured:
+    plotted = [row for row in rows if row["mean_time_seconds"] is not None]
+    if not plotted:
         raise ValueError("no successful attempts are available for plotting")
 
-    labels = [str(row["algorithm"]) for row in measured]
-    colors = [row_color(row) for row in measured]
-    positions = np.arange(len(measured))
-    time_seconds = numeric_for_plot(measured, "mean_time_seconds")
-    memory_kb = numeric_for_plot(measured, "peak_memory_kb")
-    output_bytes = numeric_for_plot(measured, "generated_output_bytes")
-    height = max(6.0, len(measured) * 0.44)
+    labels = [str(row["algorithm"]) for row in plotted]
+    colors = [row_color(row) for row in plotted]
+    positions = np.arange(len(plotted))
+    time_seconds = numeric_for_plot(plotted, "mean_time_seconds")
+    memory_kb = numeric_for_plot(plotted, "peak_memory_kb")
+    output_bytes = numeric_for_plot(plotted, "generated_output_bytes")
+    height = max(6.0, len(plotted) * 0.44)
 
     figure, axes = plt.subplots(
         1,
@@ -343,15 +383,60 @@ def plot_summary(
     title = "Certificate" if benchmark_type == "certificate" else "KEM"
     figure.suptitle(f"On-device {title} benchmark - {run_id}", fontsize=15)
 
-    configurations = (
-        (
-            axes[0],
-            time_seconds,
-            "Mean time (seconds)",
-            logarithmic_time,
-            "s",
-            3,
+    time_handles = []
+    time_series = operation_series(plotted, benchmark_type)
+    operation_height = 0.72 / max(len(time_series), 1)
+    for index, (field, label, values) in enumerate(time_series):
+        offsets = positions + (
+            index - (len(time_series) - 1) / 2
+        ) * operation_height
+        bars = axes[0].barh(
+            offsets,
+            values,
+            height=operation_height * 0.9,
+            color=OPERATION_COLORS[field],
+            edgecolor="#111827",
+            linewidth=0.25,
+            label=label,
+        )
+        time_handles.append(bars)
+    measured_positions = [
+        index for index, value in enumerate(time_seconds) if value > 0
+    ]
+    total_markers = axes[0].scatter(
+        [time_seconds[index] for index in measured_positions],
+        [positions[index] for index in measured_positions],
+        marker="|",
+        s=180,
+        linewidths=2.5,
+        color="#111827",
+        label="Total",
+        zorder=4,
+    )
+    axes[0].set_xlabel("Mean time (seconds)")
+    axes[0].grid(axis="x", linestyle=":", alpha=0.35)
+    if logarithmic_time and any(value > 0 for value in time_seconds):
+        axes[0].set_xscale("log")
+        axes[0].xaxis.set_minor_formatter(NullFormatter())
+    time_axis_values = [
+        *time_seconds,
+        *(
+            value
+            for _, _, values in time_series
+            for value in values
         ),
+    ]
+    pad_axis(axes[0], time_axis_values, logarithmic=logarithmic_time)
+    annotate_bars(
+        axes[0],
+        time_handles[-1],
+        time_seconds,
+        unit="s",
+        decimals=3,
+    )
+    axes[0].invert_yaxis()
+
+    configurations = (
         (axes[1], memory_kb, "Peak memory (KB)", False, "KB", 2),
         (
             axes[2],
@@ -382,13 +467,24 @@ def plot_summary(
         axis.invert_yaxis()
 
     axes[0].set_yticks(positions)
-    axes[0].set_yticklabels(labels, fontsize=9)
-    legend = [
+    axes[0].set_yticklabels(labels, fontsize=12)
+    axes[0].legend(
+        handles=[bars[0] for bars in time_handles] + [total_markers],
+        labels=[bars.get_label() for bars in time_handles] + ["Total"],
+        loc="upper right",
+        fontsize=8,
+        title="Operations",
+        title_fontsize=8,
+    )
+    family_legend = [
         plt.Rectangle((0, 0), 1, 1, color="#64748b", label="Classic"),
         plt.Rectangle((0, 0), 1, 1, color="#0f766e", label="PQC"),
-        plt.Rectangle((0, 0), 1, 1, color="#b45309", label="Hybrid"),
     ]
-    axes[0].legend(handles=legend, loc="lower right", fontsize=8)
+    if benchmark_type == "kem":
+        family_legend.append(
+            plt.Rectangle((0, 0), 1, 1, color="#b45309", label="Hybrid")
+        )
+    axes[1].legend(handles=family_legend, loc="lower right", fontsize=8)
     output.parent.mkdir(parents=True, exist_ok=True)
     figure.savefig(output, dpi=180)
     plt.close(figure)
@@ -468,12 +564,12 @@ def write_latex_table(
             latex_escape(row["algorithm"]),
             latex_escape(row.get("nist_level", "") or "--"),
             *(
-                latex_number(row.get(field), decimals=2)
+                latex_number(row.get(field), decimals=3)
                 for field in operation_fields
             ),
-            latex_number(row.get("mean_time_seconds"), decimals=2),
-            latex_number(row.get("peak_memory_kb"), decimals=2),
-            latex_number(row.get("generated_output_bytes"), decimals=2),
+            latex_number(row.get("mean_time_seconds"), decimals=3),
+            latex_number(row.get("peak_memory_kb"), decimals=3),
+            latex_number(row.get("generated_output_bytes"), decimals=3),
             f"{row['success_count']}/{row['attempt_count']}",
             latex_escape(row["status"]),
         ]

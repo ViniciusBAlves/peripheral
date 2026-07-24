@@ -45,6 +45,10 @@ ATTEMPT_FIELDS = [
     "kem_keygen_ms", "kem_encapsulation_ms", "kem_decapsulation_ms",
     "kem_total_ms", "secrets_match", "client_cpu_cycles",
     "client_cycle_hz", "client_heap_current_bytes",
+    "dwt_cycle_counter_supported", "dwt_event_counters_supported",
+    "dwt_cyccnt", "dwt_cpicnt", "dwt_exccnt", "dwt_sleepcnt",
+    "dwt_lsucnt", "dwt_foldcnt", "dwt_cycle_counter_width_bits",
+    "dwt_event_counter_width_bits", "dwt_counts_are_modulo",
     "client_heap_peak_bytes", "client_heap_free_bytes",
     "client_heap_capacity_bytes", "error_code", "message",
 ]
@@ -63,6 +67,8 @@ SUMMARY_FIELDS = [
     "stddev_kem_decapsulation_ms", "mean_kem_total_ms",
     "median_kem_total_ms", "p95_kem_total_ms", "stddev_kem_total_ms",
     "mean_cpu_ms", "max_client_heap_peak_bytes",
+    "mean_dwt_cyccnt", "mean_dwt_cpicnt", "mean_dwt_exccnt",
+    "mean_dwt_sleepcnt", "mean_dwt_lsucnt", "mean_dwt_foldcnt",
 ]
 
 
@@ -190,6 +196,15 @@ def attempt_row(
         "secrets_match": values.get("secrets_match", ""),
         "client_cpu_cycles": values.get("client_cpu_cycles", ""),
         "client_cycle_hz": values.get("client_cycle_hz", ""),
+        **{
+            field: values.get(field, "") for field in (
+                "dwt_cycle_counter_supported", "dwt_event_counters_supported",
+                "dwt_cyccnt", "dwt_cpicnt", "dwt_exccnt", "dwt_sleepcnt",
+                "dwt_lsucnt", "dwt_foldcnt",
+                "dwt_cycle_counter_width_bits",
+                "dwt_event_counter_width_bits", "dwt_counts_are_modulo",
+            )
+        },
         "client_heap_current_bytes": values.get(
             "client_heap_current_bytes", ""
         ),
@@ -250,6 +265,13 @@ def summarize(rows: list[dict[str, object]]) -> list[dict[str, object]]:
         total = distribution(numbers("kem_total_ms"))
         cpu = numbers("cpu_ms")
         heap = numbers("client_heap_peak_bytes")
+        dwt_values = {
+            field: numbers(field)
+            for field in (
+                "dwt_cyccnt", "dwt_cpicnt", "dwt_exccnt",
+                "dwt_sleepcnt", "dwt_lsucnt", "dwt_foldcnt",
+            )
+        }
         summaries.append({
             **{
                 field: base.get(field, "") for field in (
@@ -287,6 +309,12 @@ def summarize(rows: list[dict[str, object]]) -> list[dict[str, object]]:
             "max_client_heap_peak_bytes": (
                 f"{max(heap):.0f}" if heap else ""
             ),
+            **{
+                f"mean_{field}": (
+                    f"{statistics.mean(values):.3f}" if values else ""
+                )
+                for field, values in dwt_values.items()
+            },
         })
     return summaries
 

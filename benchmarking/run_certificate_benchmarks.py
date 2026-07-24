@@ -38,7 +38,7 @@ WORK = ROOT / "work"
 WOLFSSL_COMPAT_CFLAGS = (
     "-DFP_MAX_BITS=32768 -DRSA_MAX_SIZE=16384 -DWC_MAX_RSA_BITS=16384"
 )
-MAX_ALGORITHM_TIMEOUT_SEC = 15 * 60
+MAX_ALGORITHM_TIMEOUT_SEC = 60 * 60
 
 ATTEMPT_FIELDS = [
     "attempt_index", "component", "owner", "cert_sig_alg", "sig_family",
@@ -53,8 +53,16 @@ ATTEMPT_FIELDS = [
     "certificate_keygen_ms", "certificate_make_body_ms",
     "certificate_sign_ms", "certificate_verify_ms", "certificate_total_ms",
     "certificate_der_bytes", "client_cpu_cycles", "client_cycle_hz",
+    "client_active_cycles", "client_idle_cycles", "client_total_cycles",
+    "client_cpu_active_percent", "client_cpu_idle_percent",
+    "dwt_cycle_counter_supported", "dwt_event_counters_supported",
+    "dwt_cyccnt", "dwt_cpicnt", "dwt_exccnt", "dwt_sleepcnt",
+    "dwt_lsucnt", "dwt_foldcnt", "dwt_cycle_counter_width_bits",
+    "dwt_event_counter_width_bits", "dwt_counts_are_modulo",
     "client_heap_current_bytes", "client_heap_peak_bytes",
     "client_heap_free_bytes", "client_heap_capacity_bytes",
+    "client_stack_used_bytes", "client_stack_free_bytes",
+    "timeout_elapsed_ms", "timeout_stage_elapsed_ms", "progress_reports",
     "error_code", "message",
 ]
 
@@ -72,6 +80,14 @@ SUMMARY_FIELDS = [
     "median_certificate_sign_ms", "p95_certificate_sign_ms",
     "stddev_certificate_sign_ms", "mean_certificate_total_ms",
     "mean_certificate_der_bytes",
+    "timeout_count", "last_timeout_stage",
+    "max_observed_client_cpu_cycles", "max_observed_client_active_cycles",
+    "max_observed_client_idle_cycles",
+    "max_observed_dwt_cyccnt", "max_observed_dwt_cpicnt",
+    "max_observed_dwt_exccnt", "max_observed_dwt_sleepcnt",
+    "max_observed_dwt_lsucnt", "max_observed_dwt_foldcnt",
+    "max_observed_client_heap_peak_bytes",
+    "max_observed_client_stack_used_bytes",
 ]
 
 MEASURE_EXEC_C = r"""
@@ -563,6 +579,23 @@ def summarize(rows: list[dict[str, object]]) -> list[dict[str, object]]:
         verify = numbers(success, "certificate_verify_ms")
         cert_total = numbers(success, "certificate_total_ms")
         cert_der = numbers(success, "certificate_der_bytes")
+        timeout_rows = [item for item in items if item["status"] == "timeout"]
+        observed_cpu = numbers(items, "client_cpu_cycles")
+        observed_active = numbers(items, "client_active_cycles")
+        observed_idle = numbers(items, "client_idle_cycles")
+        observed_dwt = {
+            field: numbers(items, field)
+            for field in (
+                "dwt_cyccnt", "dwt_cpicnt", "dwt_exccnt",
+                "dwt_sleepcnt", "dwt_lsucnt", "dwt_foldcnt",
+            )
+        }
+        observed_heap = numbers(items, "client_heap_peak_bytes")
+        observed_stack = numbers(items, "client_stack_used_bytes")
+        summary_status = (
+            "success" if len(success) == len(items) else
+            "timeout" if timeout_rows and not success else "fail"
+        )
         summaries.append({
             "component": base["component"],
             "owner": base["owner"],
@@ -571,7 +604,7 @@ def summarize(rows: list[dict[str, object]]) -> list[dict[str, object]]:
             "sig_nist_level": base["sig_nist_level"],
             "builder": base["builder"],
             "generation_scope": base["generation_scope"],
-            "status": "success" if len(success) == len(items) else "fail",
+            "status": summary_status,
             "success_count": len(success),
             "fail_count": len(items) - len(success),
             "mean_wall_ms": f"{sum(wall) / len(wall):.3f}" if wall else "",
@@ -635,6 +668,31 @@ def summarize(rows: list[dict[str, object]]) -> list[dict[str, object]]:
             "mean_certificate_der_bytes": (
                 f"{sum(cert_der) / len(cert_der):.0f}" if cert_der else ""
             ),
+            "timeout_count": len(timeout_rows),
+            "last_timeout_stage": (
+                timeout_rows[-1].get("message", "") if timeout_rows else ""
+            ),
+            "max_observed_client_cpu_cycles": (
+                f"{max(observed_cpu):.0f}" if observed_cpu else ""
+            ),
+            "max_observed_client_active_cycles": (
+                f"{max(observed_active):.0f}" if observed_active else ""
+            ),
+            "max_observed_client_idle_cycles": (
+                f"{max(observed_idle):.0f}" if observed_idle else ""
+            ),
+            **{
+                f"max_observed_{field}": (
+                    f"{max(values):.0f}" if values else ""
+                )
+                for field, values in observed_dwt.items()
+            },
+            "max_observed_client_heap_peak_bytes": (
+                f"{max(observed_heap):.0f}" if observed_heap else ""
+            ),
+            "max_observed_client_stack_used_bytes": (
+                f"{max(observed_stack):.0f}" if observed_stack else ""
+            ),
         })
     return summaries
 
@@ -651,7 +709,8 @@ def parse_board_values(line: str, marker: str) -> dict[str, str] | None:
 
 
 def wait_for_board_marker(
-    serial_port, log: Path, marker: str, timeout: float
+    serial_port, log: Path, marker: str, timeout: float,
+    progress_values: dict[str, str] | None = None,
 ) -> dict[str, str]:
     deadline = time.monotonic() + timeout
     log.parent.mkdir(parents=True, exist_ok=True)
@@ -663,6 +722,12 @@ def wait_for_board_marker(
             line = raw.decode("utf-8", errors="replace").strip()
             stream.write(line + "\n")
             stream.flush()
+            progress = parse_board_values(line, "[BENCH_CERT_PROGRESS]")
+            if progress is not None and progress_values is not None:
+                reports = int(progress_values.get("_progress_reports", "0")) + 1
+                progress_values.clear()
+                progress_values.update(progress)
+                progress_values["_progress_reports"] = str(reports)
             values = parse_board_values(line, marker)
             if values is not None:
                 return values
@@ -704,7 +769,18 @@ def on_device_attempt_row(
     total_ms = us_to_ms(values, "certificate_total_us")
     cycle_hz = int(values.get("client_cycle_hz", "0") or 0)
     cycles = int(values.get("client_cpu_cycles", "0") or 0)
+    active_cycles = int(values.get("client_active_cycles", "0") or 0)
+    idle_cycles = int(values.get("client_idle_cycles", "0") or 0)
+    total_cycles = int(values.get("client_total_cycles", "0") or 0)
     cpu_ms = f"{cycles * 1000.0 / cycle_hz:.3f}" if cycle_hz else ""
+    active_percent = (
+        f"{active_cycles * 100.0 / total_cycles:.3f}"
+        if total_cycles else ""
+    )
+    idle_percent = (
+        f"{idle_cycles * 100.0 / total_cycles:.3f}"
+        if total_cycles else ""
+    )
     return {
         "attempt_index": attempt,
         "component": "on_device_certificate",
@@ -732,6 +808,20 @@ def on_device_attempt_row(
         "certificate_der_bytes": values.get("certificate_der_bytes", ""),
         "client_cpu_cycles": values.get("client_cpu_cycles", ""),
         "client_cycle_hz": values.get("client_cycle_hz", ""),
+        "client_active_cycles": values.get("client_active_cycles", ""),
+        "client_idle_cycles": values.get("client_idle_cycles", ""),
+        "client_total_cycles": values.get("client_total_cycles", ""),
+        "client_cpu_active_percent": active_percent,
+        "client_cpu_idle_percent": idle_percent,
+        **{
+            field: values.get(field, "") for field in (
+                "dwt_cycle_counter_supported", "dwt_event_counters_supported",
+                "dwt_cyccnt", "dwt_cpicnt", "dwt_exccnt", "dwt_sleepcnt",
+                "dwt_lsucnt", "dwt_foldcnt",
+                "dwt_cycle_counter_width_bits",
+                "dwt_event_counter_width_bits", "dwt_counts_are_modulo",
+            )
+        },
         "client_heap_current_bytes": values.get(
             "client_heap_current_bytes", ""
         ),
@@ -739,6 +829,18 @@ def on_device_attempt_row(
         "client_heap_free_bytes": values.get("client_heap_free_bytes", ""),
         "client_heap_capacity_bytes": values.get(
             "client_heap_capacity_bytes", ""
+        ),
+        "client_stack_used_bytes": values.get("client_stack_used_bytes", ""),
+        "client_stack_free_bytes": values.get("client_stack_free_bytes", ""),
+        "timeout_elapsed_ms": (
+            us_to_ms(values, "elapsed_us") if status == "timeout" else ""
+        ),
+        "timeout_stage_elapsed_ms": (
+            us_to_ms(values, "stage_elapsed_us")
+            if status == "timeout" else ""
+        ),
+        "progress_reports": values.get(
+            "progress_reports", values.get("_progress_reports", "")
         ),
         "error_code": (
             "metadata_mismatch" if size_mismatch else values.get("error", "")
@@ -881,15 +983,26 @@ def run_on_device(args: argparse.Namespace) -> int:
                     timeout = certificate_timeout(
                         signature.name, args.attempt_timeout_sec
                     )
+                    latest_progress: dict[str, str] = {}
                     values = wait_for_board_marker(
                         serial_port, board_log, "[BENCH_CERT_RESULT]",
                         timeout,
+                        progress_values=latest_progress,
+                    )
+                    values["progress_reports"] = latest_progress.get(
+                        "_progress_reports", "0"
                     )
                 except TimeoutError:
-                    values = {
+                    values = dict(latest_progress)
+                    values.update({
                         "status": "timeout", "stage": "board_result",
                         "error": "timeout",
-                    }
+                        "progress_reports": latest_progress.get(
+                            "_progress_reports", "0"
+                        ),
+                    })
+                    if latest_progress.get("stage"):
+                        values["stage"] = latest_progress["stage"]
                     reset_firmware(
                         log=run_dir / "flash.log", nrfutil=args.nrfutil
                     )

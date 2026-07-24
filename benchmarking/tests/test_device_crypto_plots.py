@@ -13,6 +13,7 @@ from plot_device_crypto_benchmarks import (
     aggregate_certificate_rows,
     aggregate_kem_rows,
     detect_benchmark_type,
+    operation_series,
     write_latex_table,
 )
 
@@ -88,6 +89,54 @@ class DeviceCryptoPlotTests(unittest.TestCase):
         self.assertAlmostEqual(row["peak_memory_kb"], 5.0)
         self.assertEqual(row["generated_output_bytes"], 1600)
 
+    def test_certificate_time_is_split_into_micro_operations(self) -> None:
+        rows = [{
+            "mean_time_seconds": 1.1,
+            "keygen_seconds": 0.2,
+            "make_body_seconds": 0.1,
+            "sign_seconds": 0.3,
+            "verify_seconds": 0.4,
+        }]
+        series = operation_series(rows, "certificate")
+        self.assertEqual(
+            [label for _, label, _ in series],
+            ["KeyGen", "Make body", "Sign", "Verify", "Other"],
+        )
+        self.assertAlmostEqual(sum(values[0] for _, _, values in series), 1.1)
+
+    def test_certificate_timeout_is_preserved_for_plotting(self) -> None:
+        attempts = [
+            {
+                "cert_sig_alg": "SLH-DSA-SHAKE-256s",
+                "sig_family": "pqc",
+                "sig_nist_level": "5",
+                "status": "timeout",
+            },
+            {
+                "cert_sig_alg": "SLH-DSA-SHAKE-256s",
+                "sig_family": "pqc",
+                "sig_nist_level": "5",
+                "status": "cancelled",
+            },
+        ]
+        row = aggregate_certificate_rows(attempts)[0]
+        self.assertEqual(row["status"], "timeout")
+        self.assertIsNone(row["mean_time_seconds"])
+
+    def test_kem_time_is_split_into_micro_operations(self) -> None:
+        rows = [{
+            "mean_time_seconds": 0.6,
+            "keygen_seconds": 0.1,
+            "encapsulation_seconds": 0.2,
+            "decapsulation_seconds": 0.3,
+        }]
+        series = operation_series(rows, "kem")
+        self.assertEqual(
+            [label for _, label, _ in series],
+            ["KeyGen", "Encaps", "Decaps"],
+        )
+        self.assertAlmostEqual(sum(values[0] for _, _, values in series), 0.6)
+
     def test_latex_table_contains_individual_operations_and_failures(self) -> None:
         rows = [
             {
@@ -132,8 +181,8 @@ class DeviceCryptoPlotTests(unittest.TestCase):
         self.assertIn(r"MLKEM\_512", text)
         self.assertIn(r"\caption{On-device kem benchmark}", text)
         self.assertNotIn("benchmark: kem", text)
-        self.assertIn("0.10 & 0.20 & 0.30 & 0.60", text)
-        self.assertIn("1600.00", text)
+        self.assertIn("0.100 & 0.200 & 0.300 & 0.600", text)
+        self.assertIn("1600.000", text)
         self.assertIn("0/5", text)
         self.assertIn("--", text)
 

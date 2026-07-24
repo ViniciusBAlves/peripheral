@@ -12,6 +12,7 @@
 #include <wolfssl/ssl.h>
 #include <wolfssl/wolfcrypt/memory.h>
 #include "benchmark_metrics.h"
+#include "benchmark_dwt.h"
 #include "power_markers.h"
 #ifdef BENCH_USE_PQM4_MLKEM
 #include "pqm4_mlkem_backend.h"
@@ -745,6 +746,8 @@ void start_secure_mqtt_session(struct bt_l2cap_chan *chan)
     uint32_t client_cpu_usage_bp = 0;
     uint32_t system_cpu_usage_bp = 0;
     uint32_t cpu_cycle_hz = benchmark_cpu_cycles_per_sec();
+    struct benchmark_dwt_snapshot dwt_start = {0};
+    struct benchmark_dwt_delta dwt = {0};
 
     benchmark_power_markers_reset();
     benchmark_power_total_set(true);
@@ -835,6 +838,7 @@ void start_secure_mqtt_session(struct bt_l2cap_chan *chan)
     (void)sys_heap_runtime_stats_reset_max(&wolfssl_heap.heap);
     benchmark_metrics_reset();
     benchmark_hardware_counters_start();
+    dwt_start = benchmark_dwt_snapshot_get();
     int64_t handshake_start_ms = setup_done_ms;
     tls_handshake_start_ms = handshake_start_ms;
     tls_handshake_active = true;
@@ -858,14 +862,17 @@ void start_secure_mqtt_session(struct bt_l2cap_chan *chan)
                 &client_cpu_usage_bp, &system_cpu_usage_bp);
             client_cpu_us = k_cyc_to_us_floor64(client_cpu_cycles);
             benchmark_hardware_counters_stop();
+            dwt = benchmark_dwt_delta_get(&dwt_start);
             tls_handshake_active = false;
             benchmark_power_handshake_set(false);
             BENCH_RESULT_OUT(
                 "[BENCH_RESULT] status=fail stage=tls_handshake error=%d "
                 "tls_setup_ms=%lld client_cpu_cycles=%llu "
-                "client_cpu_us=%llu client_cycle_hz=%u\n",
+                "client_cpu_us=%llu client_cycle_hz=%u "
+                BENCHMARK_DWT_FORMAT "\n",
                 error, setup_done_ms - setup_start_ms,
-                client_cpu_cycles, client_cpu_us, cpu_cycle_hz);
+                client_cpu_cycles, client_cpu_us, cpu_cycle_hz,
+                BENCHMARK_DWT_VALUES(dwt));
             wolfSSL_free(ssl);
             wolfSSL_CTX_free(ctx);
             benchmark_power_markers_reset();
@@ -878,6 +885,7 @@ void start_secure_mqtt_session(struct bt_l2cap_chan *chan)
         &client_cpu_usage_bp, &system_cpu_usage_bp);
     client_cpu_us = k_cyc_to_us_floor64(client_cpu_cycles);
     benchmark_hardware_counters_stop();
+    dwt = benchmark_dwt_delta_get(&dwt_start);
     tls_handshake_active = false;
     benchmark_power_handshake_set(false);
     handshake_done_ms = k_uptime_get();
@@ -935,7 +943,8 @@ void start_secure_mqtt_session(struct bt_l2cap_chan *chan)
                 "l2cap_rx_overflows=%u l2cap_rx_ring_peak_bytes=%u "
                 "l2cap_rx_ring_capacity_bytes=%u "
                 "client_icache_hits=%u client_icache_misses=%u "
-                "client_memory_access_counters_supported=0\n",
+                "client_memory_access_counters_supported=0 "
+                BENCHMARK_DWT_FORMAT "\n",
                 setup_done_ms - setup_start_ms,
                 handshake_done_ms - handshake_start_ms,
                 mqtt_done_ms - mqtt_start_ms,
@@ -967,7 +976,8 @@ void start_secure_mqtt_session(struct bt_l2cap_chan *chan)
                 metrics->l2cap_rx_overflows,
                 metrics->l2cap_rx_ring_peak_bytes, TLS_RX_RINGBUF_SIZE,
                 metrics->instruction_cache_hits,
-                metrics->instruction_cache_misses);
+                metrics->instruction_cache_misses,
+                BENCHMARK_DWT_VALUES(dwt));
             goto cleanup;
         }
         if (bytes_read < 0) {

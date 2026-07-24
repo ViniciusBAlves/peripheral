@@ -15,6 +15,7 @@
 #ifdef BENCH_USE_PQM4_MLKEM
 #include "pqm4_mlkem_backend.h"
 #endif
+#include "benchmark_dwt.h"
 
 #define KEM_BENCH_HEAP_SIZE (160 * 1024)
 #define KEM_MAX_CIPHERTEXT_BYTES 1665
@@ -274,7 +275,8 @@ static void emit_result(const char *case_id,
                         const char *status, const char *stage, int error,
                         uint64_t keygen_us, uint64_t encaps_us,
                         uint64_t decaps_us, uint64_t cycles,
-                        bool secrets_match)
+                        bool secrets_match,
+                        const struct benchmark_dwt_delta *dwt)
 {
     struct sys_memory_stats heap = {0};
     uint64_t total_us = keygen_us + encaps_us + decaps_us;
@@ -287,6 +289,7 @@ static void emit_result(const char *case_id,
            "kex_private_key_bytes=%d kex_ciphertext_bytes=%d "
            "kex_shared_secret_bytes=%d secrets_match=%d "
            "client_cpu_cycles=%llu client_cycle_hz=%u "
+           BENCHMARK_DWT_FORMAT " "
            "client_heap_current_bytes=%u client_heap_peak_bytes=%u "
            "client_heap_free_bytes=%u client_heap_capacity_bytes=%u "
            "mlkem_backend=%s\n",
@@ -302,6 +305,8 @@ static void emit_result(const char *case_id,
            algorithm != NULL ? algorithm->ciphertext_bytes : 0,
            algorithm != NULL ? algorithm->shared_secret_bytes : 0,
            secrets_match, cycles, sys_clock_hw_cycles_per_sec(),
+           BENCHMARK_DWT_VALUES(
+               dwt != NULL ? *dwt : (struct benchmark_dwt_delta){0}),
            (unsigned int)heap.allocated_bytes,
            (unsigned int)heap.max_allocated_bytes,
            (unsigned int)heap.free_bytes, KEM_BENCH_HEAP_SIZE,
@@ -316,6 +321,8 @@ static void run_case(const char *case_id, const char *algorithm_name)
     k_thread_runtime_stats_t cpu_start = {0};
     k_thread_runtime_stats_t cpu_end = {0};
     uint64_t cycles = 0;
+    struct benchmark_dwt_snapshot dwt_start = {0};
+    struct benchmark_dwt_delta dwt = {0};
     int64_t started;
     int ret;
     bool secrets_match = false;
@@ -323,7 +330,7 @@ static void run_case(const char *case_id, const char *algorithm_name)
 
     if (algorithm == NULL) {
         emit_result(case_id, NULL, "unsupported", stage, BAD_FUNC_ARG,
-                    0, 0, 0, 0, false);
+                    0, 0, 0, 0, false, NULL);
         return;
     }
 
@@ -340,9 +347,10 @@ static void run_case(const char *case_id, const char *algorithm_name)
     ret = init_keys(algorithm);
     if (ret != 0) {
         emit_result(case_id, algorithm, "fail", "init", ret,
-                    0, 0, 0, 0, false);
+                    0, 0, 0, 0, false, NULL);
         return;
     }
+    dwt_start = benchmark_dwt_snapshot_get();
     (void)k_thread_runtime_stats_get(k_current_get(), &cpu_start);
 
     stage = "keygen";
@@ -377,6 +385,7 @@ static void run_case(const char *case_id, const char *algorithm_name)
     }
 
 done:
+    dwt = benchmark_dwt_delta_get(&dwt_start);
     if (k_thread_runtime_stats_get(k_current_get(), &cpu_end) == 0 &&
         cpu_end.execution_cycles >= cpu_start.execution_cycles) {
         cycles = cpu_end.execution_cycles - cpu_start.execution_cycles;
@@ -384,7 +393,7 @@ done:
     emit_result(case_id, algorithm,
                 ret == 0 && secrets_match ? "success" : "fail",
                 ret == 0 && secrets_match ? "done" : stage, ret,
-                keygen_us, encaps_us, decaps_us, cycles, secrets_match);
+                keygen_us, encaps_us, decaps_us, cycles, secrets_match, &dwt);
     free_keys(algorithm);
 }
 
