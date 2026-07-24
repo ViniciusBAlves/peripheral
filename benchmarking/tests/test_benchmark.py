@@ -10,6 +10,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from benchmarklib.metrics import parse_bench_line
+from benchmarklib.power_profiler import PowerProfilerCapture
 from benchmarklib.certificates import write_case_configs
 from benchmarklib.gateway import PiGateway
 from benchmarklib.scheduler import build_jobs
@@ -25,6 +26,7 @@ from run_benchmarks import (
     parse_args,
     needs_large_rsa_firmware,
     resolve_pi_workdir,
+    resolve_power_profiler_device,
     resolve_serial_device,
     read_checkpoint,
     run_job,
@@ -143,6 +145,11 @@ class BenchmarkTests(unittest.TestCase):
         self.assertEqual(args.ble_addr, normalize_ble_addr(config["ble-addr"]))
         self.assertEqual(args.mlkem_backend, "pqm4-m4fstack")
         self.assertEqual(args.server_backend, "auto")
+        self.assertFalse(args.power_profiler)
+        self.assertEqual(
+            args.power_profiler_output_samples_per_second,
+            config["power-profiler-output-samples-per-second"],
+        )
 
         overridden = parse_args([
             "--cases", "cases.csv", "--serial-device", "/dev/ttyUSB9",
@@ -150,6 +157,85 @@ class BenchmarkTests(unittest.TestCase):
         ])
         self.assertEqual(overridden.serial_device, "/dev/ttyUSB9")
         self.assertEqual(overridden.server_backend, "wolfssl")
+
+    def test_old_config_gets_power_profiler_defaults(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = Path(tmpdir) / "config.json"
+            config_path.write_text(
+                '{"serial-device":"/dev/board","pi-host":"user@pi",'
+                '"ssh-key":"~/.ssh/key","ble-addr":"00:00:00:00:00:00"}'
+            )
+            config = load_config(config_path)
+        self.assertEqual(config["power-profiler-serial-device"], "/dev/ttyACM0")
+        self.assertEqual(config["power-profiler-vdd-mv"], 3000)
+        self.assertEqual(config["power-profiler-output-samples-per-second"], 100)
+
+    def test_power_windows_integrate_native_samples(self) -> None:
+        capture = PowerProfilerCapture("/dev/null", 3000, 100)
+        capture._process_sample(0, 100.0, 0)
+        capture._process_sample(1, 100.0, 0xf0)
+        capture._process_sample(2, 100.0, 0xf0)
+        capture._process_sample(3, 100.0, 0)
+        capture._sample_index = 4
+        values = capture._measurements()
+        self.assertEqual(values["power_status"], "success")
+        self.assertEqual(values["total_execution_duration_ms"], "0.020")
+        self.assertEqual(values["total_execution_charge_uc"], "0.002000")
+        self.assertEqual(values["total_execution_energy_uj"], "0.006000")
+
+    def test_power_windows_sum_all_crypto_pulses(self) -> None:
+        capture = PowerProfilerCapture("/dev/null", 3000, 100)
+        samples = (
+            (0, 0x00),
+            (100, 0xc0),
+            (200, 0xd0),
+            (300, 0xc0),
+            (400, 0xe0),
+            (500, 0xc0),
+            (600, 0xd0),
+            (700, 0xc0),
+            (800, 0x00),
+        )
+        for index, (current_ua, mask) in enumerate(samples):
+            capture._process_sample(index, float(current_ua), mask)
+        capture._sample_index = len(samples)
+
+        values = capture._measurements()
+
+        self.assertEqual(values["power_status"], "success")
+        self.assertEqual(values["client_signature_duration_ms"], "0.020")
+        self.assertEqual(values["client_signature_charge_uc"], "0.008000")
+        self.assertEqual(values["client_signature_energy_uj"], "0.024000")
+        self.assertEqual(values["client_signature_peak_current_ua"], "600.000")
+        self.assertEqual(values["client_kem_duration_ms"], "0.010")
+        self.assertEqual(values["client_kem_energy_uj"], "0.012000")
+        self.assertEqual(values["handshake_duration_ms"], "0.070")
+        self.assertEqual(values["total_execution_duration_ms"], "0.070")
+
+    def test_power_windows_use_only_last_complete_execution(self) -> None:
+        capture = PowerProfilerCapture("/dev/null", 3000, 100)
+        masks = (0x00, 0xf0, 0x00, 0x00, 0xf0, 0xf0, 0x00)
+        for index, mask in enumerate(masks):
+            capture._process_sample(index, 100.0, mask)
+        capture._sample_index = len(masks)
+
+        values = capture._measurements()
+
+        self.assertEqual(values["power_status"], "success")
+        self.assertEqual(values["power_profiler_window_count"], 2)
+        self.assertEqual(values["total_execution_duration_ms"], "0.020")
+        self.assertEqual(values["client_kem_duration_ms"], "0.020")
+        self.assertEqual(values["client_signature_duration_ms"], "0.020")
+
+    def test_distinct_existing_power_device_is_preserved(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            board = Path(tmpdir) / "board"
+            power = Path(tmpdir) / "power"
+            board.touch()
+            power.touch()
+            self.assertEqual(
+                resolve_power_profiler_device(str(power), str(board)), str(power)
+            )
 
     def test_resume_cli_does_not_require_cases(self) -> None:
         args = parse_args(["--resume", "run-123"])

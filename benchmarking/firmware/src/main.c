@@ -21,6 +21,7 @@
 #include <wolfssl/wolfcrypt/wc_xmss.h>
 #endif
 #include "benchmark_metrics.h"
+#include "power_markers.h"
 #ifdef BENCH_USE_PQM4_MLKEM
 #include "pqm4_mlkem_backend.h"
 #endif
@@ -1646,9 +1647,12 @@ void start_secure_mqtt_session(struct bt_l2cap_chan *chan)
     uint32_t system_cpu_usage_bp = 0;
     uint32_t cpu_cycle_hz = benchmark_cpu_cycles_per_sec();
 
+    benchmark_power_markers_reset();
+    benchmark_power_total_set(true);
     ctx = wolfSSL_CTX_new(wolfTLSv1_3_client_method());
     if (!ctx) {
         BENCH_OUT("[BENCH_RESULT] status=fail stage=tls_setup error=ctx_new\n");
+        benchmark_power_markers_reset();
         return;
     }
 #ifdef BENCH_USE_PQM4_MLKEM
@@ -1656,6 +1660,7 @@ void start_secure_mqtt_session(struct bt_l2cap_chan *chan)
     if (ret != WOLFSSL_SUCCESS) {
         BENCH_OUT("[BENCH_RESULT] status=fail stage=pqm4_device error=%d\n", ret);
         wolfSSL_CTX_free(ctx);
+        benchmark_power_markers_reset();
         return;
     }
 #endif
@@ -1672,6 +1677,7 @@ void start_secure_mqtt_session(struct bt_l2cap_chan *chan)
             BENCH_OUT("[BENCH_RESULT] status=fail stage=ca_load error=%d ca_index=%u\n",
                       ret, (unsigned int)i);
             wolfSSL_CTX_free(ctx);
+            benchmark_power_markers_reset();
             return;
         }
     }
@@ -1691,6 +1697,7 @@ void start_secure_mqtt_session(struct bt_l2cap_chan *chan)
     if (ret != WOLFSSL_SUCCESS) {
         BENCH_OUT("[BENCH_RESULT] status=fail stage=group_setup error=%d\n", ret);
         wolfSSL_CTX_free(ctx);
+        benchmark_power_markers_reset();
         return;
     }
 
@@ -1700,6 +1707,7 @@ void start_secure_mqtt_session(struct bt_l2cap_chan *chan)
     if (ret != WOLFSSL_SUCCESS) {
         BENCH_OUT("[BENCH_RESULT] status=fail stage=client_cert error=%d\n", ret);
         wolfSSL_CTX_free(ctx);
+        benchmark_power_markers_reset();
         return;
     }
     ret = wolfSSL_CTX_use_PrivateKey_buffer(
@@ -1708,6 +1716,7 @@ void start_secure_mqtt_session(struct bt_l2cap_chan *chan)
     if (ret != WOLFSSL_SUCCESS) {
         BENCH_OUT("[BENCH_RESULT] status=fail stage=client_key error=%d\n", ret);
         wolfSSL_CTX_free(ctx);
+        benchmark_power_markers_reset();
         return;
     }
 
@@ -1717,6 +1726,7 @@ void start_secure_mqtt_session(struct bt_l2cap_chan *chan)
     if (!ssl) {
         BENCH_OUT("[BENCH_RESULT] status=fail stage=tls_setup error=ssl_new\n");
         wolfSSL_CTX_free(ctx);
+        benchmark_power_markers_reset();
         return;
     }
     wolfSSL_SetIOReadCtx(ssl, chan);
@@ -1729,6 +1739,7 @@ void start_secure_mqtt_session(struct bt_l2cap_chan *chan)
     int64_t handshake_start_ms = setup_done_ms;
     tls_handshake_start_ms = handshake_start_ms;
     tls_handshake_active = true;
+    benchmark_power_handshake_set(true);
     struct benchmark_cpu_snapshot cpu_start = benchmark_cpu_snapshot_get();
     do {
         ret = wolfSSL_connect(ssl);
@@ -1749,6 +1760,7 @@ void start_secure_mqtt_session(struct bt_l2cap_chan *chan)
             client_cpu_us = k_cyc_to_us_floor64(client_cpu_cycles);
             benchmark_hardware_counters_stop();
             tls_handshake_active = false;
+            benchmark_power_handshake_set(false);
             BENCH_OUT(
                 "[BENCH_RESULT] status=fail stage=tls_handshake error=%d "
                 "tls_setup_ms=%lld client_cpu_cycles=%llu "
@@ -1757,6 +1769,7 @@ void start_secure_mqtt_session(struct bt_l2cap_chan *chan)
                 client_cpu_cycles, client_cpu_us, cpu_cycle_hz);
             wolfSSL_free(ssl);
             wolfSSL_CTX_free(ctx);
+            benchmark_power_markers_reset();
             return;
         }
     } while (ret != WOLFSSL_SUCCESS);
@@ -1767,6 +1780,7 @@ void start_secure_mqtt_session(struct bt_l2cap_chan *chan)
     client_cpu_us = k_cyc_to_us_floor64(client_cpu_cycles);
     benchmark_hardware_counters_stop();
     tls_handshake_active = false;
+    benchmark_power_handshake_set(false);
     handshake_done_ms = k_uptime_get();
 
     static const unsigned char mqtt_connect[] = {
@@ -1796,6 +1810,7 @@ void start_secure_mqtt_session(struct bt_l2cap_chan *chan)
             (void)sys_heap_runtime_stats_get(&wolfssl_heap.heap, &stats);
             struct benchmark_stack_snapshot stacks =
                 benchmark_stack_snapshot_get();
+            benchmark_power_total_set(false);
             BENCH_OUT(
                 "[BENCH_RESULT] status=success tls_setup_ms=%lld "
                 "raw_handshake_ms=%lld mqtt_connect_ms=%lld full_connect_ms=%lld "
@@ -1869,6 +1884,7 @@ void start_secure_mqtt_session(struct bt_l2cap_chan *chan)
 
 cleanup:
     benchmark_metrics_stop();
+    benchmark_power_markers_reset();
     shutdown_tls_gracefully(ssl, chan);
     wolfSSL_free(ssl);
     wolfSSL_CTX_free(ctx);
@@ -1896,6 +1912,8 @@ static void print_local_identities(void)
 }
 
 int main(void) {
+    benchmark_power_markers_init();
+    benchmark_power_markers_reset();
 #if HAS_STATUS_LED
     if (!gpio_is_ready_dt(&led)) {
         BENCH_LOG("Error: LED device %s is not ready\n", led.port->name);

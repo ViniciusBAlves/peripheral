@@ -135,10 +135,12 @@ def build(
     pqm4_dir: Path | None,
     large_rsa: bool = False,
     extra_cmake_args: list[str] | None = None,
+    power_markers: bool = False,
 ) -> None:
     cmake_args = [
         f"-DBENCH_GENERATED_DIR={generated_dir}",
         f"-DBENCH_MLKEM_BACKEND={mlkem_backend}",
+        f"-DBENCH_POWER_MARKERS={'ON' if power_markers else 'OFF'}",
     ]
     if extra_cmake_args:
         cmake_args.extend(extra_cmake_args)
@@ -176,3 +178,12 @@ def flash(
         west_args=["flash", "-d", str(build_dir), "--runner", "nrfutil"],
     )
     run_logged(command, log, cwd=cwd, env=env)
+
+
+def reset(*, log: Path, nrfutil: str) -> None:
+    """Reset the attached DK after its measured VDD rail is restored."""
+    run_logged(
+        [nrfutil, "device", "reset", "--traits", "jlink"],
+        log,
+        env=toolchain_environment(nrfutil),
+    )

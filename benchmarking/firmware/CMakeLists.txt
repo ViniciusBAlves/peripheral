@@ -4,6 +4,7 @@ find_package(Zephyr REQUIRED HINTS $ENV{ZEPHYR_BASE})
 project(peripheral)
 
 set(BENCH_MLKEM_BACKEND "pqm4-m4fstack" CACHE STRING "ML-KEM implementation")
+option(BENCH_POWER_MARKERS "Enable PPK2 GPIO timing markers" OFF)
 set_property(CACHE BENCH_MLKEM_BACKEND PROPERTY STRINGS wolfssl pqm4-m4fstack)
 option(BENCH_CLIENT_CERTGEN "Run board-side client certificate generation benchmark" OFF)
 set(BENCH_CLIENT_CERTGEN_SIG "ECDSA-P-256" CACHE STRING
@@ -39,7 +40,7 @@ set(WOLFSSL_ASN_C "${WOLFSSL_ROOT_DIR}/wolfcrypt/src/asn.c")
 file(READ "${WOLFSSL_ASN_C}" WOLFSSL_ASN_TEXT)
 string(REPLACE
     "    WOLFSSL_ENTER(\"ConfirmSignature\");"
-    "    benchmark_timepoint_t benchmark_verify_start = benchmark_metric_start();\n    WOLFSSL_ENTER(\"ConfirmSignature\");"
+    "    benchmark_timepoint_t benchmark_verify_start = benchmark_crypto_metric_start(BENCH_CRYPTO_CERT_VERIFY);\n    WOLFSSL_ENTER(\"ConfirmSignature\");"
     WOLFSSL_ASN_TEXT "${WOLFSSL_ASN_TEXT}"
 )
 string(REPLACE
@@ -54,6 +55,7 @@ string(REPLACE
 )
 file(WRITE "${WOLFSSL_ASN_C}" "${WOLFSSL_ASN_TEXT}")
 
+if(NOT BENCH_MLKEM_BACKEND STREQUAL "pqm4-m4fstack")
 set(WOLFSSL_MLKEM_C "${WOLFSSL_ROOT_DIR}/wolfcrypt/src/wc_mlkem.c")
 file(READ "${WOLFSSL_MLKEM_C}" WOLFSSL_MLKEM_TEXT)
 string(REPLACE
@@ -63,7 +65,7 @@ string(REPLACE
 )
 string(REPLACE
     "    unsigned char rand[WC_ML_KEM_MAKEKEY_RAND_SZ];"
-    "    unsigned char rand[WC_ML_KEM_MAKEKEY_RAND_SZ];\n    benchmark_timepoint_t benchmark_kem_start = benchmark_metric_start();"
+    "    unsigned char rand[WC_ML_KEM_MAKEKEY_RAND_SZ];\n    benchmark_timepoint_t benchmark_kem_start = benchmark_crypto_metric_start(BENCH_CRYPTO_KEM_KEYGEN);"
     WOLFSSL_MLKEM_TEXT "${WOLFSSL_MLKEM_TEXT}"
 )
 string(REPLACE
@@ -73,7 +75,7 @@ string(REPLACE
 )
 string(REPLACE
     "    unsigned char m[WC_ML_KEM_ENC_RAND_SZ];"
-    "    unsigned char m[WC_ML_KEM_ENC_RAND_SZ];\n    benchmark_timepoint_t benchmark_kem_start = benchmark_metric_start();"
+    "    unsigned char m[WC_ML_KEM_ENC_RAND_SZ];\n    benchmark_timepoint_t benchmark_kem_start = benchmark_crypto_metric_start(BENCH_CRYPTO_KEM_ENCAPSULATE);"
     WOLFSSL_MLKEM_TEXT "${WOLFSSL_MLKEM_TEXT}"
 )
 string(REPLACE
@@ -83,7 +85,7 @@ string(REPLACE
 )
 string(REPLACE
     "    int ret = 0;\n    unsigned int ctSz = 0;"
-    "    int ret = 0;\n    benchmark_timepoint_t benchmark_kem_start = benchmark_metric_start();\n    unsigned int ctSz = 0;"
+    "    int ret = 0;\n    benchmark_timepoint_t benchmark_kem_start = benchmark_crypto_metric_start(BENCH_CRYPTO_KEM_DECAPSULATE);\n    unsigned int ctSz = 0;"
     WOLFSSL_MLKEM_TEXT "${WOLFSSL_MLKEM_TEXT}"
 )
 string(REPLACE
@@ -92,6 +94,23 @@ string(REPLACE
     WOLFSSL_MLKEM_TEXT "${WOLFSSL_MLKEM_TEXT}"
 )
 file(WRITE "${WOLFSSL_MLKEM_C}" "${WOLFSSL_MLKEM_TEXT}")
+endif()
+
+# Hybrid X25519 key shares derive their classical secret directly in tls.c,
+# bypassing the X25519SharedSecret wrapper instrumented below.
+set(WOLFSSL_TLS_C "${WOLFSSL_ROOT_DIR}/src/tls.c")
+file(READ "${WOLFSSL_TLS_C}" WOLFSSL_TLS_TEXT)
+string(REPLACE
+    "#include <wolfssl/wolfcrypt/libwolfssl_sources.h>"
+    "#include <wolfssl/wolfcrypt/libwolfssl_sources.h>\n#include \"benchmark_metrics.h\""
+    WOLFSSL_TLS_TEXT "${WOLFSSL_TLS_TEXT}"
+)
+string(REPLACE
+    "            ret = wc_curve25519_shared_secret_ex(key, ssl->peerX25519Key,\n                        ssOutput, ssOutSz, EC25519_LITTLE_ENDIAN);"
+    "            benchmark_timepoint_t benchmark_x25519_hybrid_start =\n                benchmark_crypto_metric_start(BENCH_CRYPTO_CLASSICAL_KEX_SHARED_SECRET);\n            ret = wc_curve25519_shared_secret_ex(key, ssl->peerX25519Key,\n                        ssOutput, ssOutSz, EC25519_LITTLE_ENDIAN);\n            benchmark_metric_stop(BENCH_CRYPTO_CLASSICAL_KEX_SHARED_SECRET,\n                                  benchmark_x25519_hybrid_start);"
+    WOLFSSL_TLS_TEXT "${WOLFSSL_TLS_TEXT}"
+)
+file(WRITE "${WOLFSSL_TLS_C}" "${WOLFSSL_TLS_TEXT}")
 
 # Heap-integer RSA-15360 spends several seconds inside modular exponentiation.
 # Add scheduler points between exponent steps so Bluetooth controller threads
@@ -148,7 +167,7 @@ foreach(PAIR IN ITEMS
     list(GET PAIR_PARTS 1 METRIC_NAME)
     string(REPLACE
         "    WOLFSSL_ENTER(\"${FUNCTION_NAME}\");"
-        "    benchmark_timepoint_t benchmark_${FUNCTION_NAME}_start = benchmark_metric_start();\n    WOLFSSL_ENTER(\"${FUNCTION_NAME}\");"
+        "    benchmark_timepoint_t benchmark_${FUNCTION_NAME}_start = benchmark_crypto_metric_start(${METRIC_NAME});\n    WOLFSSL_ENTER(\"${FUNCTION_NAME}\");"
         WOLFSSL_INTERNAL_TEXT "${WOLFSSL_INTERNAL_TEXT}"
     )
     string(REPLACE
@@ -170,7 +189,7 @@ string(REPLACE
 )
 string(REPLACE
     "static int DoTls13CertificateVerify(WOLFSSL* ssl, byte* input,\n                                    word32* inOutIdx, word32 totalSz)\n{\n    int         ret = 0;"
-    "static int DoTls13CertificateVerify(WOLFSSL* ssl, byte* input,\n                                    word32* inOutIdx, word32 totalSz)\n{\n    benchmark_timepoint_t benchmark_tls_cert_verify_start = benchmark_metric_start();\n    int         ret = 0;"
+    "static int DoTls13CertificateVerify(WOLFSSL* ssl, byte* input,\n                                    word32* inOutIdx, word32 totalSz)\n{\n    benchmark_timepoint_t benchmark_tls_cert_verify_start = benchmark_crypto_metric_start(BENCH_CRYPTO_TLS_CERT_VERIFY);\n    int         ret = 0;"
     WOLFSSL_TLS13_TEXT "${WOLFSSL_TLS13_TEXT}"
 )
 string(REPLACE
@@ -207,7 +226,7 @@ string(REPLACE
 file(WRITE "${WOLFSSL_INTERNAL_H}" "${WOLFSSL_INTERNAL_TEXT}")
 
 # 1. Bind EVERYTHING directly to the 'app' target
-target_sources(app PRIVATE src/main.c src/benchmark_metrics.c
+target_sources(app PRIVATE src/main.c src/benchmark_metrics.c src/power_markers.c
     # --- Post Quantum Math ---
     ${WOLFSSL_ROOT_DIR}/wolfcrypt/src/wc_mlkem.c
     ${WOLFSSL_ROOT_DIR}/wolfcrypt/src/wc_mlkem_poly.c
@@ -265,6 +284,10 @@ target_sources(app PRIVATE src/main.c src/benchmark_metrics.c
     ${WOLFSSL_ROOT_DIR}/src/internal.c
     ${WOLFSSL_ROOT_DIR}/src/wolfio.c
 )
+
+if(BENCH_POWER_MARKERS)
+    target_compile_definitions(app PRIVATE BENCH_POWER_MARKERS=1)
+endif()
 
 target_include_directories(app PRIVATE 
     ${CMAKE_CURRENT_SOURCE_DIR}

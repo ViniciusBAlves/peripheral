@@ -2,6 +2,7 @@
 
 #include <zephyr/kernel.h>
 #include <hal/nrf_nvmc.h>
+#include "power_markers.h"
 
 static struct benchmark_metrics metrics;
 static bool metrics_active;
@@ -49,6 +50,13 @@ benchmark_timepoint_t benchmark_metric_start(void)
     return k_uptime_ticks();
 }
 
+benchmark_timepoint_t benchmark_crypto_metric_start(
+    enum benchmark_crypto_operation operation)
+{
+    benchmark_power_crypto_start(operation);
+    return benchmark_metric_start();
+}
+
 static uint64_t elapsed_us(benchmark_timepoint_t start)
 {
     int64_t elapsed_ticks = k_uptime_ticks() - start;
@@ -61,6 +69,7 @@ void benchmark_metric_stop(enum benchmark_crypto_operation operation,
 {
     uint64_t elapsed;
 
+    benchmark_power_crypto_stop(operation);
     if (!metrics_active) {
         return;
     }
