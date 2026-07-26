@@ -1,3 +1,4 @@
+#define _GNU_SOURCE
 #include <arpa/inet.h>
 #include <bluetooth/bluetooth.h>
 #include <bluetooth/l2cap.h>
@@ -83,6 +84,8 @@ struct config {
     bool reset_adapter;
     bool disable_wifi;
     bool wifi_disabled;
+    bool mtls_mode;
+    const char *client_identity;
 };
 
 struct command_result {
@@ -106,6 +109,8 @@ struct control_state {
     uint8_t *pending;
     size_t pending_len;
     size_t pending_cap;
+    bool identity_ready;
+    bool identity_error;
 };
 
 static int send_stream(int fd, const uint8_t *data, size_t length);
@@ -155,6 +160,14 @@ static int handle_control_frame(struct control_state *state,
     state->pending_len += payload_len;
 
     if (flags & CONTROL_FLAG_END) {
+        if (memmem(state->pending, state->pending_len,
+                   "[BENCH_IDENTITY] status=ready", 29) != NULL) {
+            state->identity_ready = true;
+        }
+        if (memmem(state->pending, state->pending_len,
+                   "[BENCH_IDENTITY] status=error", 29) != NULL) {
+            state->identity_error = true;
+        }
         fwrite(state->pending, 1, state->pending_len, stdout);
         if (state->pending_len == 0 ||
             state->pending[state->pending_len - 1] != '\n') {
@@ -189,7 +202,9 @@ static void usage(const char *program)
             "  --forget-cache               Remove cached BlueZ device first\n"
             "  --no-acl-prime               Skip bluetoothctl connect before L2CAP\n"
             "  --reset-adapter              Power-cycle the adapter before scanning\n"
-            "  --disable-wifi               Disable Pi Wi-Fi while BLE bridge runs\n",
+            "  --disable-wifi               Disable Pi Wi-Fi while BLE bridge runs\n"
+            "  --mtls                       Select a client identity for mTLS\n"
+            "  --client-identity NAME       Benchmark certificate identity\n",
             program);
 }
 
@@ -221,6 +236,8 @@ static int parse_args(int argc, char **argv, struct config *cfg)
         .reset_adapter = false,
         .disable_wifi = false,
         .wifi_disabled = false,
+        .mtls_mode = false,
+        .client_identity = NULL,
     };
 
     for (int i = 1; i < argc; i++) {
@@ -267,6 +284,10 @@ static int parse_args(int argc, char **argv, struct config *cfg)
             cfg->reset_adapter = true;
         } else if (!strcmp(argv[i], "--disable-wifi")) {
             cfg->disable_wifi = true;
+        } else if (!strcmp(argv[i], "--mtls")) {
+            cfg->mtls_mode = true;
+        } else if (!strcmp(argv[i], "--client-identity") && i + 1 < argc) {
+            cfg->client_identity = argv[++i];
         } else if (!strcmp(argv[i], "--help")) {
             usage(argv[0]);
             exit(0);
@@ -686,6 +707,63 @@ static int send_l2cap_sdu(int fd, const uint8_t *data, size_t length)
     return -1;
 }
 
+static int select_client_identity(int ble_fd, const struct config *cfg)
+{
+    uint8_t frame[256] = {'B', 'C', 'T', 'L', '1',
+                          CONTROL_FLAG_START | CONTROL_FLAG_END, 1, 0};
+    uint8_t received[BRIDGE_RECV_BUFFER_SIZE];
+    struct control_state control = {0};
+    const char *identity = cfg->client_identity;
+    int payload_len;
+    double deadline;
+
+    if (identity == NULL || identity[0] == '\0') {
+        fprintf(stderr, "[-] --client-identity is required\n");
+        return -1;
+    }
+    payload_len = snprintf(
+        (char *)frame + CONTROL_HEADER_SIZE,
+        sizeof(frame) - CONTROL_HEADER_SIZE,
+        "[BENCH_SELECT] mtls=%d identity=%s",
+        cfg->mtls_mode ? 1 : 0, identity);
+    if (payload_len <= 0 ||
+        (size_t)payload_len >= sizeof(frame) - CONTROL_HEADER_SIZE ||
+        send_l2cap_sdu(
+            ble_fd, frame, CONTROL_HEADER_SIZE + (size_t)payload_len) != 0) {
+        return -1;
+    }
+
+    deadline = monotonic_ms() + 10000.0;
+    while (monotonic_ms() < deadline) {
+        struct pollfd descriptor = {.fd = ble_fd, .events = POLLIN};
+        int poll_result = poll(&descriptor, 1, 250);
+        if (poll_result < 0 && errno == EINTR) {
+            continue;
+        }
+        if (poll_result < 0) {
+            break;
+        }
+        if (poll_result == 0) {
+            continue;
+        }
+        ssize_t length = recv(ble_fd, received, sizeof(received), 0);
+        if (length <= 0 ||
+            handle_control_frame(&control, received, (size_t)length) < 0) {
+            break;
+        }
+        if (control.identity_ready) {
+            free(control.pending);
+            return 0;
+        }
+        if (control.identity_error) {
+            break;
+        }
+    }
+    free(control.pending);
+    fprintf(stderr, "[-] Client identity selection was not acknowledged\n");
+    return -1;
+}
+
 static int append_pending(struct sdu_prefix_state *state,
                           const uint8_t *data, size_t length)
 {
@@ -999,6 +1077,14 @@ int main(int argc, char **argv)
     }
     printf("[BENCH_GATEWAY] ble_l2cap_connect_ms=%.3f\n",
            monotonic_ms() - l2cap_start_ms);
+
+    if (select_client_identity(ble_fd, &cfg) != 0) {
+        close(ble_fd);
+        if (cfg.wifi_disabled) {
+            set_wifi_enabled(true);
+        }
+        return 1;
+    }
 
     double tcp_start_ms = monotonic_ms();
     int tcp_fd = connect_tcp(cfg.tcp_host, cfg.tcp_port);

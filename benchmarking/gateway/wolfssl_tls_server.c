@@ -23,8 +23,10 @@ static volatile sig_atomic_t keep_running = 1;
 struct config {
     const char* case_dir;
     const char* group;
+    const char* sigalg;
     int port;
     bool mtls;
+    int timeout_sec;
 };
 
 static void on_signal(int signo)
@@ -56,6 +58,46 @@ static int group_id(const char* group)
             return groups[i].id;
     }
     return 0;
+}
+
+static int signature_scheme_id(const char* name)
+{
+    static const struct {
+        const char* name;
+        int id;
+    } schemes[] = {
+        { "ecdsa_secp256r1_sha256", 0x0403 },
+        { "ecdsa_secp384r1_sha384", 0x0503 },
+        { "ecdsa_secp521r1_sha512", 0x0603 },
+        { "rsa_pss_rsae_sha256", 0x0804 },
+        { "rsa_pss_rsae_sha384", 0x0805 },
+        { "rsa_pss_rsae_sha512", 0x0806 },
+        { "mldsa44", 0x0904 },
+        { "mldsa65", 0x0905 },
+        { "mldsa87", 0x0906 },
+    };
+    for (size_t i = 0; i < sizeof(schemes) / sizeof(schemes[0]); i++) {
+        if (strcmp(name, schemes[i].name) == 0)
+            return schemes[i].id;
+    }
+    return 0;
+}
+
+static const char* wolfssl_signature_list(const char* name)
+{
+    if (strcmp(name, "ecdsa_secp256r1_sha256") == 0)
+        return "ECDSA+SHA256";
+    if (strcmp(name, "ecdsa_secp384r1_sha384") == 0)
+        return "ECDSA+SHA384";
+    if (strcmp(name, "ecdsa_secp521r1_sha512") == 0)
+        return "ECDSA+SHA512";
+    if (strcmp(name, "rsa_pss_rsae_sha256") == 0)
+        return "RSA-PSS+SHA256";
+    if (strcmp(name, "rsa_pss_rsae_sha384") == 0)
+        return "RSA-PSS+SHA384";
+    if (strcmp(name, "rsa_pss_rsae_sha512") == 0)
+        return "RSA-PSS+SHA512";
+    return NULL;
 }
 
 static int join_path(char* out, size_t out_len, const char* dir, const char* name)
@@ -125,8 +167,8 @@ static int verify_callback(int preverify, WOLFSSL_X509_STORE_CTX* store)
 static void usage(const char* program)
 {
     fprintf(stderr,
-        "usage: %s --case-dir DIR --group WOLFSSL_GROUP [--port PORT] "
-        "[--mtls]\n",
+        "usage: %s --case-dir DIR --group WOLFSSL_GROUP --sigalg NAME [--port PORT] "
+        "[--mtls] [--timeout SECONDS]\n",
         program);
 }
 
@@ -135,19 +177,23 @@ static int parse_args(int argc, char** argv, struct config* cfg)
     static const struct option options[] = {
         { "case-dir", required_argument, NULL, 'c' },
         { "group", required_argument, NULL, 'g' },
+        { "sigalg", required_argument, NULL, 's' },
         { "port", required_argument, NULL, 'p' },
         { "mtls", no_argument, NULL, 'm' },
+        { "timeout", required_argument, NULL, 't' },
         { "help", no_argument, NULL, 'h' },
         { NULL, 0, NULL, 0 },
     };
 
     cfg->case_dir = NULL;
     cfg->group = NULL;
+    cfg->sigalg = NULL;
     cfg->port = DEFAULT_PORT;
     cfg->mtls = false;
+    cfg->timeout_sec = 60;
 
     for (;;) {
-        int opt = getopt_long(argc, argv, "c:g:p:mh", options, NULL);
+        int opt = getopt_long(argc, argv, "c:g:s:p:mt:h", options, NULL);
         if (opt == -1)
             break;
         switch (opt) {
@@ -157,11 +203,17 @@ static int parse_args(int argc, char** argv, struct config* cfg)
         case 'g':
             cfg->group = optarg;
             break;
+        case 's':
+            cfg->sigalg = optarg;
+            break;
         case 'p':
             cfg->port = atoi(optarg);
             break;
         case 'm':
             cfg->mtls = true;
+            break;
+        case 't':
+            cfg->timeout_sec = atoi(optarg);
             break;
         case 'h':
             usage(argv[0]);
@@ -172,13 +224,19 @@ static int parse_args(int argc, char** argv, struct config* cfg)
         }
     }
 
-    if (cfg->case_dir == NULL || cfg->group == NULL || cfg->port <= 0 ||
-        cfg->port > 65535) {
+    if (cfg->case_dir == NULL || cfg->group == NULL || cfg->sigalg == NULL ||
+        cfg->port <= 0 ||
+        cfg->port > 65535 || cfg->timeout_sec <= 0) {
         usage(argv[0]);
         return -1;
     }
     if (group_id(cfg->group) == 0) {
         fprintf(stderr, "unsupported wolfSSL group name: %s\n", cfg->group);
+        return -1;
+    }
+    if (signature_scheme_id(cfg->sigalg) == 0) {
+        fprintf(stderr, "unsupported wolfSSL signature scheme: %s\n",
+            cfg->sigalg);
         return -1;
     }
     return 0;
@@ -280,6 +338,16 @@ static int configure_context(WOLFSSL_CTX* ctx, const struct config* cfg)
         fprintf(stderr, "wolfSSL group: %s\n", cfg->group);
         return -1;
     }
+    /* Some wolfSSL builds compile session tickets out and report failure here.
+     * In that case tickets are already unavailable, so server startup must
+     * continue instead of leaving the bridge with no listener on port 8883. */
+    (void)wolfSSL_CTX_no_ticket_TLSv13(ctx);
+    const char* sigalg_list = wolfssl_signature_list(cfg->sigalg);
+    if (sigalg_list == NULL ||
+        wolfSSL_CTX_set1_sigalgs_list(ctx, sigalg_list) != WOLFSSL_SUCCESS) {
+        print_wolfssl_errors("failed to configure wolfSSL signature scheme");
+        return -1;
+    }
     return 0;
 }
 
@@ -372,14 +440,18 @@ int main(int argc, char** argv)
         goto cleanup;
 
     fprintf(stderr,
-        "[wolfssl-server] listening on 127.0.0.1:%d group=%s auth=%s\n",
-        cfg.port, cfg.group, cfg.mtls ? "mutual" : "server-only");
+        "[wolfssl-server] listening on 127.0.0.1:%d group=%s sigalg=%s auth=%s\n",
+        cfg.port, cfg.group, cfg.sigalg,
+        cfg.mtls ? "mutual" : "server-only");
     fflush(stderr);
 
     while (keep_running) {
         struct sockaddr_in peer;
         socklen_t peer_len = sizeof(peer);
-        struct timeval timeout = { .tv_sec = 45, .tv_usec = 0 };
+        struct timeval timeout = {
+            .tv_sec = cfg.timeout_sec,
+            .tv_usec = 0,
+        };
 
         client_fd = accept(listen_fd, (struct sockaddr*)&peer, &peer_len);
         if (client_fd < 0) {

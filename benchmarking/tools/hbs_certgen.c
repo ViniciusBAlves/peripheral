@@ -120,14 +120,14 @@ static void set_root_name(Cert* cert, const char* cn)
     snprintf(cert->subject.commonName, sizeof(cert->subject.commonName), "%s", cn);
 }
 
-static void set_leaf_name(Cert* cert)
+static void set_leaf_name(Cert* cert, const char* commonName)
 {
     XSTRNCPY(cert->subject.country, "US", CTC_NAME_SIZE);
     XSTRNCPY(cert->subject.state, "OR", CTC_NAME_SIZE);
     XSTRNCPY(cert->subject.locality, "Portland", CTC_NAME_SIZE);
     XSTRNCPY(cert->subject.org, "Peripheral Benchmark", CTC_NAME_SIZE);
     XSTRNCPY(cert->subject.unit, "TLS Leaf", CTC_NAME_SIZE);
-    XSTRNCPY(cert->subject.commonName, "localhost", CTC_NAME_SIZE);
+    XSTRNCPY(cert->subject.commonName, commonName, CTC_NAME_SIZE);
 }
 
 static void set_fixed_validity(Cert* cert)
@@ -163,7 +163,7 @@ static int make_root(void* key, int keyType, int sigType, WC_RNG* rng,
 
 static int make_leaf(void* caKey, int caKeyType, int caSigType, WC_RNG* rng,
     const unsigned char* rootDer, int rootSz, unsigned char* leafDer,
-    unsigned char* leafKeyDer, int* leafKeySzOut)
+    unsigned char* leafKeyDer, int* leafKeySzOut, const char* commonName)
 {
     Cert leaf;
     ecc_key leafKey;
@@ -174,10 +174,20 @@ static int make_leaf(void* caKey, int caKeyType, int caSigType, WC_RNG* rng,
     ret = wc_ecc_init(&leafKey);
     if (ret != 0)
         return ret;
-    ret = wc_ecc_make_key(rng, 32, &leafKey);
-    if (ret != 0) {
-        wc_ecc_free(&leafKey);
-        return ret;
+    if (*leafKeySzOut > 0) {
+        word32 keyIdx = 0;
+        ret = wc_EccPrivateKeyDecode(
+            leafKeyDer, &keyIdx, &leafKey, (word32)*leafKeySzOut);
+        if (ret != 0) {
+            wc_ecc_free(&leafKey);
+            return ret;
+        }
+    } else {
+        ret = wc_ecc_make_key(rng, 32, &leafKey);
+        if (ret != 0) {
+            wc_ecc_free(&leafKey);
+            return ret;
+        }
     }
 
     leafKeySz = wc_EccKeyToDer(&leafKey, leafKeyDer, KEY_CAP);
@@ -191,7 +201,7 @@ static int make_leaf(void* caKey, int caKeyType, int caSigType, WC_RNG* rng,
         wc_ecc_free(&leafKey);
         return -1;
     }
-    set_leaf_name(&leaf);
+    set_leaf_name(&leaf, commonName);
     leaf.sigType = caSigType;
     leaf.daysValid = 3650;
     set_fixed_validity(&leaf);
@@ -215,7 +225,9 @@ static int make_leaf(void* caKey, int caKeyType, int caSigType, WC_RNG* rng,
 
 static int generate_lms(const char* outdir, WC_RNG* rng,
     unsigned char* rootDer, int* rootSzOut, unsigned char* leafDer,
-    int* leafSzOut, unsigned char* leafKeyDer, int* leafKeySzOut)
+    int* leafSzOut, unsigned char* leafKeyDer, int* leafKeySzOut,
+    unsigned char* clientDer, int* clientSzOut,
+    unsigned char* clientKeyDer, int* clientKeySzOut)
 {
     LmsKey key;
     int rootSz;
@@ -242,11 +254,16 @@ static int generate_lms(const char* outdir, WC_RNG* rng,
     if (rootSz <= 0)
         return rootSz;
     leafSz = make_leaf(&key, LMS_TYPE, CTC_HSS_LMS, rng, rootDer, rootSz,
-        leafDer, leafKeyDer, leafKeySzOut);
+        leafDer, leafKeyDer, leafKeySzOut, "localhost");
+    if (leafSz > 0) {
+        *clientSzOut = make_leaf(&key, LMS_TYPE, CTC_HSS_LMS, rng,
+            rootDer, rootSz, clientDer, clientKeyDer, clientKeySzOut,
+            "nrf5340-benchmark");
+    }
     wc_LmsKey_Free(&key);
     remove(g_state_path);
     (void)outdir;
-    if (leafSz <= 0)
+    if (leafSz <= 0 || *clientSzOut <= 0)
         return leafSz;
     *rootSzOut = rootSz;
     *leafSzOut = leafSz;
@@ -255,7 +272,9 @@ static int generate_lms(const char* outdir, WC_RNG* rng,
 
 static int generate_xmss(const char* outdir, WC_RNG* rng,
     unsigned char* rootDer, int* rootSzOut, unsigned char* leafDer,
-    int* leafSzOut, unsigned char* leafKeyDer, int* leafKeySzOut)
+    int* leafSzOut, unsigned char* leafKeyDer, int* leafKeySzOut,
+    unsigned char* clientDer, int* clientSzOut,
+    unsigned char* clientKeyDer, int* clientKeySzOut)
 {
     XmssKey key;
     int rootSz;
@@ -282,11 +301,16 @@ static int generate_xmss(const char* outdir, WC_RNG* rng,
     if (rootSz <= 0)
         return rootSz;
     leafSz = make_leaf(&key, XMSS_TYPE, CTC_XMSS, rng, rootDer, rootSz,
-        leafDer, leafKeyDer, leafKeySzOut);
+        leafDer, leafKeyDer, leafKeySzOut, "localhost");
+    if (leafSz > 0) {
+        *clientSzOut = make_leaf(&key, XMSS_TYPE, CTC_XMSS, rng,
+            rootDer, rootSz, clientDer, clientKeyDer, clientKeySzOut,
+            "nrf5340-benchmark");
+    }
     wc_XmssKey_Free(&key);
     remove(g_state_path);
     (void)outdir;
-    if (leafSz <= 0)
+    if (leafSz <= 0 || *clientSzOut <= 0)
         return leafSz;
     *rootSzOut = rootSz;
     *leafSzOut = leafSz;
@@ -301,9 +325,13 @@ int main(int argc, char** argv)
     unsigned char* rootDer;
     unsigned char* leafDer;
     unsigned char* leafKeyDer;
+    unsigned char* clientDer;
+    unsigned char* clientKeyDer;
     int rootSz = 0;
     int leafSz = 0;
     int leafKeySz = 0;
+    int clientSz = 0;
+    int clientKeySz = 0;
     int genRet;
     int ret = 1;
     WC_RNG rng;
@@ -318,20 +346,31 @@ int main(int argc, char** argv)
     rootDer = malloc(DER_CAP);
     leafDer = malloc(DER_CAP);
     leafKeyDer = malloc(KEY_CAP);
-    if (rootDer == NULL || leafDer == NULL || leafKeyDer == NULL)
+    clientDer = malloc(DER_CAP);
+    clientKeyDer = malloc(KEY_CAP);
+    if (rootDer == NULL || leafDer == NULL || leafKeyDer == NULL ||
+        clientDer == NULL || clientKeyDer == NULL)
         goto exit;
 
     wolfSSL_Init();
     if (wc_InitRng(&rng) != 0)
         goto exit;
+    snprintf(path, sizeof(path), "%s/client_key.der", outdir);
+    clientKeySz = read_file(path, clientKeyDer, KEY_CAP);
+    if (clientKeySz <= 0) {
+        fprintf(stderr, "shared client key is missing: %s\n", path);
+        goto free_rng;
+    }
 
     if (strcmp(alg, "LMS-HSS-L2-H10-W4") == 0) {
         genRet = generate_lms(outdir, &rng, rootDer, &rootSz, leafDer,
-            &leafSz, leafKeyDer, &leafKeySz);
+            &leafSz, leafKeyDer, &leafKeySz, clientDer, &clientSz,
+            clientKeyDer, &clientKeySz);
     }
     else if (strcmp(alg, "XMSS-SHA2_20_256") == 0) {
         genRet = generate_xmss(outdir, &rng, rootDer, &rootSz, leafDer,
-            &leafSz, leafKeyDer, &leafKeySz);
+            &leafSz, leafKeyDer, &leafKeySz, clientDer, &clientSz,
+            clientKeyDer, &clientKeySz);
     }
     else {
         fprintf(stderr, "unsupported algorithm: %s\n", alg);
@@ -355,8 +394,32 @@ int main(int argc, char** argv)
     snprintf(path, sizeof(path), "%s/server_chain.crt", outdir);
     if (write_pem_cert(path, leafDer, leafSz) != 0)
         goto free_rng;
+    {
+        FILE* chain = fopen(path, "ab");
+        unsigned char pem[DER_CAP * 2];
+        int pemSz = wc_DerToPem(rootDer, rootSz, pem, sizeof(pem), CERT_TYPE);
+        if (chain == NULL || pemSz <= 0 ||
+            fwrite(pem, 1, (size_t)pemSz, chain) != (size_t)pemSz) {
+            if (chain != NULL)
+                fclose(chain);
+            goto free_rng;
+        }
+        fclose(chain);
+    }
     snprintf(path, sizeof(path), "%s/server.key", outdir);
     if (write_pem_key(path, leafKeyDer, leafKeySz) != 0)
+        goto free_rng;
+    snprintf(path, sizeof(path), "%s/client.crt", outdir);
+    if (write_pem_cert(path, clientDer, clientSz) != 0)
+        goto free_rng;
+    snprintf(path, sizeof(path), "%s/client.key", outdir);
+    if (write_pem_key(path, clientKeyDer, clientKeySz) != 0)
+        goto free_rng;
+    snprintf(path, sizeof(path), "%s/client_cert.der", outdir);
+    if (write_file(path, clientDer, clientSz) != 0)
+        goto free_rng;
+    snprintf(path, sizeof(path), "%s/client_key.der", outdir);
+    if (write_file(path, clientKeyDer, clientKeySz) != 0)
         goto free_rng;
 
     ret = 0;
@@ -367,6 +430,8 @@ exit:
     free(rootDer);
     free(leafDer);
     free(leafKeyDer);
+    free(clientDer);
+    free(clientKeyDer);
     wolfSSL_Cleanup();
     return ret;
 }

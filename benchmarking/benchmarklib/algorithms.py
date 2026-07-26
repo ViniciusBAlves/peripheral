@@ -27,6 +27,8 @@ class Signature:
     issuer_key_type: str
     leaf_key_type: str
     certificate_verify: str
+    tls_signature_scheme: str
+    tls_signature_scheme_id: int
     expected_support: str = "required"
     notes: str = ""
 
@@ -54,35 +56,58 @@ KEMS = (
 
 SIGNATURES = (
     Signature("ECDSA-P-256", 1, 65, 32, 64, "classic",
-              "ec:prime256v1", "ec:prime256v1", "ECDSA-P-256"),
+              "ec:prime256v1", "ec:prime256v1", "ECDSA-P-256",
+              "ecdsa_secp256r1_sha256", 0x0403),
     Signature("ECDSA-P-384", 3, 97, 48, 96, "classic",
-              "ec:secp384r1", "ec:secp384r1", "ECDSA-P-384"),
+              "ec:secp384r1", "ec:secp384r1", "ECDSA-P-384",
+              "ecdsa_secp384r1_sha384", 0x0503),
     Signature("ECDSA-P-521", 5, 133, 66, 132, "classic",
-              "ec:secp521r1", "ec:secp521r1", "ECDSA-P-521"),
+              "ec:secp521r1", "ec:secp521r1", "ECDSA-P-521",
+              "ecdsa_secp521r1_sha512", 0x0603),
     Signature("RSA-PSS-3072", 1, 384, 384, 384, "classic",
-              "RSA-PSS-3072", "RSA-PSS-3072", "RSA-PSS-3072"),
+              "RSA-PSS-3072", "RSA-PSS-3072", "RSA-PSS-3072",
+              "rsa_pss_rsae_sha256", 0x0804),
     Signature("RSA-PSS-7680", 3, 960, 960, 960, "classic",
-              "RSA-PSS-7680", "RSA-PSS-7680", "RSA-PSS-7680"),
+              "RSA-PSS-7680", "RSA-PSS-7680", "RSA-PSS-7680",
+              "rsa_pss_rsae_sha384", 0x0805),
     Signature("RSA-PSS-15360", 5, 1920, 1920, 1920, "classic",
-              "RSA-PSS-15360", "RSA-PSS-15360", "RSA-PSS-15360"),
+              "RSA-PSS-15360", "RSA-PSS-15360", "RSA-PSS-15360",
+              "rsa_pss_rsae_sha512", 0x0806),
     Signature("ML-DSA-44", 2, 1312, 2560, 2420, "pqc",
-              "ML-DSA-44", "ML-DSA-44", "ML-DSA-44"),
+              "ML-DSA-44", "ML-DSA-44", "ML-DSA-44",
+              "mldsa44", 0x0904),
     Signature("ML-DSA-65", 3, 1952, 4032, 3309, "pqc",
-              "ML-DSA-65", "ML-DSA-65", "ML-DSA-65"),
+              "ML-DSA-65", "ML-DSA-65", "ML-DSA-65",
+              "mldsa65", 0x0905),
     Signature("ML-DSA-87", 5, 2592, 4896, 4627, "pqc",
-              "ML-DSA-87", "ML-DSA-87", "ML-DSA-87"),
+              "ML-DSA-87", "ML-DSA-87", "ML-DSA-87",
+              "mldsa87", 0x0906),
     # Current OpenSSL/wolfSSL TLS stacks use an ECDSA leaf for CertificateVerify.
     Signature("SLH-DSA-SHAKE-128s", 1, 32, 64, 7856, "pqc",
-              "SLH-DSA-SHAKE-128s", "ec:prime256v1", "ECDSA-P-256"),
+              "SLH-DSA-SHAKE-128s", "ec:prime256v1", "ECDSA-P-256",
+              "ecdsa_secp256r1_sha256", 0x0403),
+    Signature("SLH-DSA-SHAKE-128f", 1, 32, 64, 17088, "pqc",
+              "SLH-DSA-SHAKE-128f", "ec:prime256v1", "ECDSA-P-256",
+              "ecdsa_secp256r1_sha256", 0x0403),
     Signature("SLH-DSA-SHAKE-192s", 3, 48, 96, 16224, "pqc",
-              "SLH-DSA-SHAKE-192s", "ec:secp384r1", "ECDSA-P-384"),
+              "SLH-DSA-SHAKE-192s", "ec:secp384r1", "ECDSA-P-384",
+              "ecdsa_secp384r1_sha384", 0x0503),
+    Signature("SLH-DSA-SHAKE-192f", 3, 48, 96, 35664, "pqc",
+              "SLH-DSA-SHAKE-192f", "ec:secp384r1", "ECDSA-P-384",
+              "ecdsa_secp384r1_sha384", 0x0503),
     Signature("SLH-DSA-SHAKE-256s", 5, 64, 128, 29792, "pqc",
-              "SLH-DSA-SHAKE-256s", "ec:secp521r1", "ECDSA-P-521"),
+              "SLH-DSA-SHAKE-256s", "ec:secp521r1", "ECDSA-P-521",
+              "ecdsa_secp521r1_sha512", 0x0603),
+    Signature("SLH-DSA-SHAKE-256f", 5, 64, 128, 49856, "pqc",
+              "SLH-DSA-SHAKE-256f", "ec:secp521r1", "ECDSA-P-521",
+              "ecdsa_secp521r1_sha512", 0x0603),
     Signature("LMS-HSS-L2-H10-W4", 5, 60, 64, 5076, "pqc",
-              "LMS-HSS-L2-H10-W4", "LMS-HSS-L2-H10-W4", "LMS-HSS-L2-H10-W4",
+              "LMS-HSS-L2-H10-W4", "ec:prime256v1", "ECDSA-P-256",
+              "ecdsa_secp256r1_sha256", 0x0403,
               notes="LMS/HSS signs the chain; TLS CertificateVerify uses ECDSA"),
     Signature("XMSS-SHA2_20_256", 5, 68, 2573, 2820, "pqc",
-              "XMSS-SHA2_20_256", "XMSS-SHA2_20_256", "XMSS-SHA2_20_256",
+              "XMSS-SHA2_20_256", "ec:prime256v1", "ECDSA-P-256",
+              "ecdsa_secp256r1_sha256", 0x0403,
               notes="XMSS signs the chain; TLS CertificateVerify uses ECDSA"),
 )
 
@@ -92,3 +117,25 @@ SIGNATURES_BY_NAME = {item.name: item for item in SIGNATURES}
 
 def slug(value: str) -> str:
     return re.sub(r"_+", "_", re.sub(r"[^a-z0-9]+", "_", value.lower())).strip("_")
+
+
+SIGNATURE_SCHEME_NAMES = {
+    item.tls_signature_scheme_id: item.tls_signature_scheme
+    for item in SIGNATURES
+}
+
+
+def expected_signature_scheme(signature_name: str) -> str:
+    return SIGNATURES_BY_NAME[signature_name].tls_signature_scheme
+
+
+def normalize_signature_scheme(value: str, signature_name: str) -> str:
+    """Map legacy CSV labels to the exact negotiated TLS SignatureScheme."""
+    signature = SIGNATURES_BY_NAME[signature_name]
+    if not value or value in {
+        signature.name,
+        signature.certificate_verify,
+        signature.leaf_key_type,
+    }:
+        return signature.tls_signature_scheme
+    return value

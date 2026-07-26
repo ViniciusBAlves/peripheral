@@ -35,6 +35,8 @@ struct benchmark_metrics {
     uint32_t l2cap_rx_ring_peak_bytes;
     uint32_t instruction_cache_hits;
     uint32_t instruction_cache_misses;
+    uint16_t server_certificate_verify_scheme;
+    uint8_t server_certificate_verify_scheme_seen;
 };
 
 void benchmark_metrics_reset(void);
@@ -54,4 +56,6 @@ void benchmark_l2cap_tx_retry(void);
 void benchmark_l2cap_tx_wait_stop(benchmark_timepoint_t start);
 void benchmark_l2cap_rx_overflow(void);
 void benchmark_l2cap_rx_ring_usage(uint32_t bytes);
+void benchmark_record_server_certificate_verify_scheme(uint16_t scheme);
+const char *benchmark_signature_scheme_name(uint16_t scheme);
 const struct benchmark_metrics *benchmark_metrics_get(void);

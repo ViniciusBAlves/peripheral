@@ -5,6 +5,7 @@ import shlex
 import subprocess
 import tarfile
 import tempfile
+import time
 from pathlib import Path
 
 
@@ -26,9 +27,24 @@ class PiGateway:
             command.extend(["-i", self.ssh_key])
         return command
 
-    def start_master(self, log: Path) -> None:
+    def start_master(
+        self, log: Path, *, attempts: int = 6, retry_delay: float = 5.0
+    ) -> None:
         command = [*self.ssh_base(), "-MNf", self.host]
-        self._local(command, log)
+        for attempt in range(1, attempts + 1):
+            try:
+                self._local(command, log)
+                return
+            except RuntimeError:
+                Path(self.control_path).unlink(missing_ok=True)
+                if attempt == attempts:
+                    raise
+                with log.open("a") as stream:
+                    stream.write(
+                        f"[ssh] master connection attempt {attempt}/{attempts} "
+                        f"failed; retrying in {retry_delay:g}s\n"
+                    )
+                time.sleep(retry_delay)
 
     def stop_master(self) -> None:
         subprocess.run([*self.ssh_base(), "-O", "exit", self.host], capture_output=True)
@@ -254,6 +270,9 @@ class PiGateway:
         wolfssl_group: str = "",
         control_telemetry: bool = False,
         mtls_mode: bool = False,
+        client_identity: str = "",
+        signature_scheme: str = "",
+        tls_timeout_sec: float = 60.0,
     ) -> None:
         self.stop_session(log, reset_adapter=disable_wifi)
         self.ble_addr = ble_addr
@@ -274,6 +293,8 @@ class PiGateway:
             f"{address} --addr-type {shlex.quote(ble_addr_type)} "
             f"--psm {shlex.quote(psm)} --tcp-host 127.0.0.1 --tcp-port 8883 "
             f"--mtu {mtu} --scan-timeout 5 "
+            f"--client-identity {shlex.quote(client_identity)} "
+            f"{'--mtls ' if mtls_mode else ''}"
             f"{'--disable-wifi ' if disable_wifi else ''}"
             f"> {gateway_log} 2>&1 < /dev/null & "
             f"echo $! > {self.workdir}/bridge.pid"
@@ -285,6 +306,8 @@ class PiGateway:
                 f"setsid {shlex.quote(self.workdir)}/bin/wolfssl_tls_server "
                 f"--case-dir {remote_case_dir} "
                 f"--group {shlex.quote(wolfssl_group)} --port 8883 "
+                f"--sigalg {shlex.quote(signature_scheme)} "
+                f"--timeout {max(1, int(tls_timeout_sec))} "
                 f"{'--mtls ' if mtls_mode else ''}"
                 f"> {broker_log} 2>&1 < /dev/null & "
                 f"echo $! > {self.workdir}/broker.pid"

@@ -176,6 +176,7 @@ foreach(PAIR IN ITEMS
     "X25519SharedSecret|BENCH_CRYPTO_CLASSICAL_KEX_SHARED_SECRET"
     "X25519MakeKey|BENCH_CRYPTO_CLASSICAL_KEX_KEYGEN"
     "EccSign|BENCH_CRYPTO_MTLS_SIGN"
+    "RsaSign|BENCH_CRYPTO_MTLS_SIGN"
 )
     string(REPLACE "|" ";" PAIR_PARTS "${PAIR}")
     list(GET PAIR_PARTS 0 FUNCTION_NAME)
@@ -210,6 +211,16 @@ string(REPLACE
 string(REPLACE
     "exit_dcv:\n\n    WOLFSSL_LEAVE(\"DoTls13CertificateVerify\", ret);"
     "exit_dcv:\n\n    benchmark_metric_stop(BENCH_CRYPTO_TLS_CERT_VERIFY, benchmark_tls_cert_verify_start);\n    WOLFSSL_LEAVE(\"DoTls13CertificateVerify\", ret);"
+    WOLFSSL_TLS13_TEXT "${WOLFSSL_TLS13_TEXT}"
+)
+string(REPLACE
+    "                ret = DecodeTls13SigAlg(input + args->idx,"
+    "                benchmark_record_server_certificate_verify_scheme(\n                    ((word16)input[args->idx] << 8) | input[args->idx + 1]);\n                ret = DecodeTls13SigAlg(input + args->idx,"
+    WOLFSSL_TLS13_TEXT "${WOLFSSL_TLS13_TEXT}"
+)
+string(REPLACE
+    "                ret = wc_MlDsaKey_SignCtx((wc_MlDsaKey*)ssl->hsKey, NULL, 0,\n                                          sigOut, &args->sigLen,\n                                          args->sigData, args->sigDataSz,\n                                          ssl->rng);\n                args->length = (word16)args->sigLen;"
+    "                benchmark_timepoint_t benchmark_mldsa_mtls_start =\n                    benchmark_crypto_metric_start(BENCH_CRYPTO_MTLS_SIGN);\n                ret = wc_MlDsaKey_SignCtx((wc_MlDsaKey*)ssl->hsKey, NULL, 0,\n                                          sigOut, &args->sigLen,\n                                          args->sigData, args->sigDataSz,\n                                          ssl->rng);\n                benchmark_metric_stop(BENCH_CRYPTO_MTLS_SIGN,\n                                      benchmark_mldsa_mtls_start);\n                args->length = (word16)args->sigLen;"
     WOLFSSL_TLS13_TEXT "${WOLFSSL_TLS13_TEXT}"
 )
 file(WRITE "${WOLFSSL_TLS13_C}" "${WOLFSSL_TLS13_TEXT}")

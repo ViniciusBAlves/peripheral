@@ -20,13 +20,16 @@ and network cores together with sysbuild.
 The firmware contains every supported TLS key-exchange group and a trust bundle
 for the server CAs in the selected run. The server offers one group and one
 certificate per case. By default, only the server is authenticated. With
-`--mtls-mode`, the server also requires the nRF5340's fixed ECDSA client
-identity, so the benchmark signature algorithm still describes the server
-side.
+`--mtls-mode`, the server also requires a client identity selected from the
+universal firmware before TLS starts. The client uses the same TLS 1.3
+`SignatureScheme` as the server's observed `CertificateVerify`.
 
-SLH-DSA signs the server certificate chain. Its TLS `CertificateVerify` leaf
-remains ECDSA because the current TLS stacks do not negotiate SLH-DSA as a TLS
-signature scheme. Both values are recorded explicitly in the CSV.
+Each signature case has one root that directly signs both the server and device
+leaf certificates; there is no intermediate CA. The server sends leaf plus
+root, while the device sends only its leaf. SLH-DSA signs those X.509
+certificates, but its TLS `CertificateVerify` uses the corresponding ECDSA
+P-256/P-384/P-521 identity. LMS/HSS and XMSS use ECDSA P-256 for
+`CertificateVerify`.
 
 LMS/HSS and XMSS also sign the server certificate chain while keeping an ECDSA
 TLS leaf key. OpenSSL/Mosquitto cannot load those chains for TLS, so the runner
@@ -35,6 +38,11 @@ uses wolfSSL for those cases when `--server-backend auto` is selected.
 RSA-PSS-3072, RSA-PSS-7680, and RSA-PSS-15360 all run in the normal wolfSSL
 `USE_FAST_MATH` firmware profile. RSA-PSS-15360 is not silently substituted
 with RSA-PSS-7680.
+
+In automatic server mode, RSA-PSS-7680 and RSA-PSS-15360 use the benchmark
+wolfSSL server. Their client-side private operations can exceed Mosquitto's
+fixed pre-CONNECT timeout, so the wolfSSL server receives the adaptive case
+timeout while retaining the exact TLS signature scheme and mutual-auth root.
 
 ## Connection Configuration
 
@@ -84,8 +92,9 @@ python benchmarking/run_certificate_benchmarks.py \
 Each attempt reports separate `certificate_keygen_ms`,
 `certificate_make_body_ms`, `certificate_sign_ms`, and
 `certificate_verify_ms` values, plus total time, DER size, CPU cycles, and
-wolfSSL heap usage. The firmware supports ECDSA, RSA-PSS, ML-DSA, SLH-DSA,
-LMS/HSS, and XMSS cases from `benchmarklib/algorithms.py`. Large RSA key
+wolfSSL heap usage. The firmware supports ECDSA, RSA-PSS, ML-DSA,
+SLH-DSA-SHAKE `128s/128f`, `192s/192f`, and `256s/256f`, LMS/HSS, and XMSS
+cases from `benchmarklib/algorithms.py`. Large RSA key
 generation and the small-memory SLH/LMS/XMSS implementations can take many
 minutes. Every attempt has a hard 15-minute ceiling; after a timeout, the
 remaining iterations of that signature are recorded as `cancelled` and the
@@ -213,7 +222,10 @@ python benchmarking/run_benchmarks.py \
 ```
 
 The authentication mode is saved in `run_config.json`, `attempts.csv`, and
-`summary.csv`.
+`summary.csv`. The attempts output also records the raw two-byte scheme ID,
+the observed server scheme, the expected scheme, the selected client identity,
+and whether all three matched. A mismatch is a benchmark failure rather than a
+silent fallback.
 
 ## Hardware Run
 

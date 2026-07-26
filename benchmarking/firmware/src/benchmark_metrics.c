@@ -154,6 +154,30 @@ void benchmark_l2cap_rx_ring_usage(uint32_t bytes)
     }
 }
 
+void benchmark_record_server_certificate_verify_scheme(uint16_t scheme)
+{
+    if (metrics_active) {
+        metrics.server_certificate_verify_scheme = scheme;
+        metrics.server_certificate_verify_scheme_seen = 1;
+    }
+}
+
+const char *benchmark_signature_scheme_name(uint16_t scheme)
+{
+    switch (scheme) {
+    case 0x0403: return "ecdsa_secp256r1_sha256";
+    case 0x0503: return "ecdsa_secp384r1_sha384";
+    case 0x0603: return "ecdsa_secp521r1_sha512";
+    case 0x0804: return "rsa_pss_rsae_sha256";
+    case 0x0805: return "rsa_pss_rsae_sha384";
+    case 0x0806: return "rsa_pss_rsae_sha512";
+    case 0x0904: return "mldsa44";
+    case 0x0905: return "mldsa65";
+    case 0x0906: return "mldsa87";
+    default: return "unknown";
+    }
+}
+
 const struct benchmark_metrics *benchmark_metrics_get(void)
 {
     return &metrics;

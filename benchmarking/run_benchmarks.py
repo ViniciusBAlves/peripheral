@@ -17,10 +17,13 @@ from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
 
-from benchmarklib.algorithms import KEMS_BY_NAME, SIGNATURES_BY_NAME
+from benchmarklib.algorithms import (
+    KEMS_BY_NAME,
+    SIGNATURES_BY_NAME,
+    normalize_signature_scheme,
+)
 from benchmarklib.certificates import (
     ensure_image,
-    generate_client_identity,
     generate_server_case,
     generate_universal_header,
     write_case_configs,
@@ -69,7 +72,10 @@ ATTEMPT_FIELDS = [
     "kex_group", "kex_nist_level",
     "kex_public_key_bytes", "kex_ciphertext_bytes", "kex_shared_secret_bytes",
     "cert_sig_alg", "sig_nist_level", "sig_public_key_bytes",
-    "sig_private_key_bytes", "sig_signature_bytes", "certificate_verify_alg",
+    "sig_private_key_bytes", "sig_signature_bytes",
+    "certificate_verify_alg", "certificate_verify_scheme_id",
+    "expected_certificate_verify_alg", "client_certificate_verify_alg",
+    "client_identity_id", "certificate_verify_match",
     "ble_l2cap_connect_ms", "gateway_tcp_connect_ms", "tls_setup_ms",
     "raw_handshake_ms", "mqtt_connect_ms", "full_connect_ms", "end_to_end_ms",
     "communication_overhead_ms", "kem_keygen_ms", "kem_encapsulation_ms",
@@ -114,7 +120,9 @@ SUMMARY_FIELDS = [
     "kex_public_key_bytes",
     "kex_ciphertext_bytes", "kex_shared_secret_bytes", "cert_sig_alg",
     "sig_nist_level", "sig_public_key_bytes", "sig_private_key_bytes",
-    "sig_signature_bytes", "certificate_verify_alg", "status",
+    "sig_signature_bytes", "certificate_verify_alg",
+    "expected_certificate_verify_alg", "client_certificate_verify_alg",
+    "certificate_verify_match", "status",
     "success_count", "fail_count", "timeout_count", "unsupported_count",
     "mean_raw_handshake_ms", "median_raw_handshake_ms", "p95_raw_handshake_ms",
     "min_raw_handshake_ms", "max_raw_handshake_ms", "stddev_raw_handshake_ms",
@@ -282,14 +290,18 @@ def write_checkpoint(
 
 
 def case_metadata(case: dict[str, str]) -> dict[str, str]:
-    return {
+    metadata = {
         key: case[key] for key in (
             "kex_group", "kex_nist_level", "kex_public_key_bytes",
             "kex_ciphertext_bytes", "kex_shared_secret_bytes", "cert_sig_alg",
             "sig_nist_level", "sig_public_key_bytes", "sig_private_key_bytes",
-            "sig_signature_bytes", "certificate_verify_alg",
+            "sig_signature_bytes",
         )
     }
+    metadata["expected_certificate_verify_alg"] = normalize_signature_scheme(
+        case.get("certificate_verify_alg", ""), case["cert_sig_alg"]
+    )
+    return metadata
 
 
 def needs_large_rsa_firmware(case: dict[str, str]) -> bool:
@@ -462,9 +474,9 @@ def timeout_for_case(case: dict[str, str], override: float | None) -> float:
     elif signature.startswith("SLH-DSA-SHAKE-128"):
         timeout = 75.0
     elif signature == "RSA-PSS-15360":
-        timeout = 240.0
+        timeout = 3600.0
     elif signature == "RSA-PSS-7680":
-        timeout = 120.0
+        timeout = 900.0
     elif signature == "RSA-PSS-3072":
         timeout = 45.0
     elif signature == "LMS-HSS-L2-H10-W4":
@@ -558,6 +570,11 @@ def run_job(
                 wolfssl_group=KEMS_BY_NAME[case["kex_group"]].wolfssl_group,
                 control_telemetry=getattr(args, "power_profiler", False),
                 mtls_mode=getattr(args, "mtls_mode", False),
+                client_identity=case["cert_sig_alg"],
+                signature_scheme=SIGNATURES_BY_NAME[
+                    case["cert_sig_alg"]
+                ].tls_signature_scheme,
+                tls_timeout_sec=attempt_timeout,
                 )
                 remote_broker_log = f"{gateway.workdir}/logs/{case['case_id']}.broker.log"
                 fatal_detector = lambda: gateway.remote_file_contains(
@@ -628,6 +645,19 @@ def run_job(
         if icache_hits is not None and icache_misses is not None else None
     )
     status = final.get("status", "fail").lower()
+    expected_scheme = normalize_signature_scheme(
+        case.get("certificate_verify_alg", ""), case["cert_sig_alg"]
+    )
+    observed_scheme = final.get("certificate_verify_alg", "")
+    client_scheme = final.get("client_certificate_verify_alg", "")
+    scheme_match = (
+        observed_scheme == expected_scheme and
+        (not getattr(args, "mtls_mode", False) or client_scheme == observed_scheme)
+    )
+    if status == "success" and not scheme_match:
+        status = "fail"
+        final["stage"] = "certificate_verify_mismatch"
+        final["error"] = "certificate_verify_mismatch"
     return {
         "attempt_index": attempt_index,
         "schedule_index": job.sequence,
@@ -638,6 +668,12 @@ def run_job(
         "reconnect_count": reconnect_count,
         "mtls_mode": int(getattr(args, "mtls_mode", False)),
         **case_metadata(case),
+        "certificate_verify_alg": observed_scheme,
+        "certificate_verify_scheme_id":
+            final.get("certificate_verify_scheme_id", ""),
+        "client_certificate_verify_alg": client_scheme,
+        "client_identity_id": final.get("client_identity_id", ""),
+        "certificate_verify_match": int(scheme_match),
         "ble_l2cap_connect_ms": gateway_values.get("ble_l2cap_connect_ms", ""),
         "gateway_tcp_connect_ms": gateway_values.get("gateway_tcp_connect_ms", ""),
         "tls_setup_ms": final.get("tls_setup_ms", ""),
@@ -881,6 +917,15 @@ def summarize(case: dict[str, str], attempts: list[dict[str, object]]) -> dict[s
             attempts[0].get("mtls_mode", "") if attempts else ""
         ),
         **case_metadata(case),
+        "certificate_verify_alg": first_successful(
+            "certificate_verify_alg"
+        ),
+        "client_certificate_verify_alg": first_successful(
+            "client_certificate_verify_alg"
+        ),
+        "certificate_verify_match": first_successful(
+            "certificate_verify_match"
+        ),
         "status": status,
         "success_count": len(success),
         "fail_count": sum(row["status"] == "fail" for row in measured),
@@ -1449,6 +1494,7 @@ def main() -> int:
             {
                 "case_id": case["case_id"], "mlkem_backend": args.mlkem_backend,
                 "rsa_profile": "fast-math",
+                "mtls_mode": int(args.mtls_mode),
                 **case_metadata(case),
                 "status": "dry_run", "success_count": 0, "fail_count": 0,
                 "timeout_count": 0, "unsupported_count": 0,
@@ -1470,13 +1516,31 @@ def main() -> int:
     docker_log = run_dir / "docker.log"
     print(f"[setup] Checking Docker OpenSSL/OQS image; log={docker_log}", flush=True)
     ensure_image(ROOT / "docker" / "Dockerfile.pqc", docker_log)
+    generated_root = WORK / "generated" / run_id
     client_dir = run_dir / "generated-client"
-    print("[setup] Generating the fixed client identity and universal server root...", flush=True)
-    generate_client_identity(client_dir, docker_log)
+    client_dir.mkdir(parents=True, exist_ok=True)
+    print("[setup] Preparing one direct-root PKI per signature...", flush=True)
     supported: list[dict[str, str]] = []
     unsupported: dict[str, str] = {}
     server_backends: dict[str, str] = {}
     signature_templates: dict[str, Path] = {}
+    for signature_name in SIGNATURES_BY_NAME:
+        template = generated_root / "identities" / signature_name
+        print(
+            f"[certificates] Preparing universal identity for {signature_name}...",
+            flush=True,
+        )
+        generate_server_case(
+            {
+                "kex_group": "ECDHE-P-256",
+                "cert_sig_alg": signature_name,
+            },
+            template,
+            client_dir,
+            run_dir / "build.log",
+        )
+        signature_templates[signature_name] = template
+
     for case in cases:
         server_backend = server_backend_for_case(case, args.server_backend)
         if server_backend is None:
@@ -1487,33 +1551,21 @@ def main() -> int:
         server_backends[case["case_id"]] = server_backend
         try:
             generated = case_dirs[case["case_id"]] / "generated"
-            template = signature_templates.get(case["cert_sig_alg"])
-            if template is None:
-                print(
-                    f"[certificates] Generating server chain for {case['cert_sig_alg']}...",
-                    flush=True,
-                )
-                generate_server_case(
-                    case, generated, client_dir,
-                    case_dirs[case["case_id"]] / "build.log",
-                )
-                signature_templates[case["cert_sig_alg"]] = generated
-            else:
-                shutil.copytree(template, generated, dirs_exist_ok=True)
-                write_case_configs(case, generated)
+            template = signature_templates[case["cert_sig_alg"]]
+            shutil.copytree(template, generated, dirs_exist_ok=True)
+            write_case_configs(case, generated)
             supported.append(case)
         except Exception as error:
             unsupported[case["case_id"]] = str(error)
 
     if not supported:
         raise RuntimeError("none of the selected cases passed certificate preparation")
-    generated_root = WORK / "generated" / run_id
     normal_generated_dir = generated_root / "fast-math"
     generate_universal_header(
         client_dir,
         [
-            (case["case_id"], case_dirs[case["case_id"]] / "generated")
-            for case in supported
+            (signature_name, template)
+            for signature_name, template in signature_templates.items()
         ],
         normal_generated_dir / "benchmark_credentials.h",
     )

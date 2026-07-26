@@ -57,7 +57,8 @@ ENV OPENSSL_MODULES=/usr/local/lib/ossl-modules
 
 RUN openssl list -providers | grep -q oqsprovider \
     && openssl list -kem-algorithms | grep -Eq 'MLKEM512|ML-KEM-512' \
-    && openssl list -signature-algorithms | grep -q 'SLH-DSA-SHAKE-256s'
+    && openssl list -signature-algorithms | grep -q 'SLH-DSA-SHAKE-256s' \
+    && openssl list -signature-algorithms | grep -q 'SLH-DSA-SHAKE-256f'
 
 ARG WOLFSSL_REV=dd6da70d395a0cb26446326f329678fe3bfb212c
 RUN git init /tmp/wolfssl \
