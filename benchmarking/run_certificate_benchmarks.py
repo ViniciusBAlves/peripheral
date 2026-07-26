@@ -40,6 +40,8 @@ WORK = ROOT / "work"
 WOLFSSL_COMPAT_CFLAGS = (
     "-DFP_MAX_BITS=32768 -DRSA_MAX_SIZE=16384 -DWC_MAX_RSA_BITS=16384"
 )
+PHASES = ["keygen", "make_cert", "sign_cert", "parse_cert", "key_export"]
+PHASE_THREAD_BUCKETS = ["main", "sysworkq", "bt_rx", "bt_tx", "idle", "other"]
 
 ATTEMPT_FIELDS = [
     "attempt_index", "component", "owner", "cert_sig_alg", "sig_family",
@@ -58,6 +60,14 @@ ATTEMPT_FIELDS = [
     "keygen_cpu_ms", "make_cert_cpu_ms", "sign_cert_cpu_ms",
     "parse_cert_cpu_ms", "key_export_cpu_ms", "phase_cpu_total_ms",
     "phase_cpu_verify",
+    *[f"{phase}_wall_ms" for phase in PHASES],
+    *[
+        f"{phase}_thread_{bucket}_cpu_percent"
+        for bucket in PHASE_THREAD_BUCKETS
+        for phase in PHASES
+    ],
+    *[f"{phase}_heap_current_bytes" for phase in PHASES],
+    *[f"{phase}_heap_peak_bytes" for phase in PHASES],
     "keygen_lsu_cycles", "make_cert_lsu_cycles", "sign_cert_lsu_cycles",
     "parse_cert_lsu_cycles", "key_export_lsu_cycles",
     "phase_lsu_total_cycles", "keygen_cpi_cycles",
@@ -89,6 +99,15 @@ SUMMARY_FIELDS = [
     "mean_keygen_cpu_ms", "mean_make_cert_cpu_ms",
     "mean_sign_cert_cpu_ms", "mean_parse_cert_cpu_ms",
     "mean_key_export_cpu_ms", "mean_phase_cpu_total_ms",
+    *[f"mean_{phase}_wall_ms" for phase in PHASES],
+    *[
+        f"mean_{phase}_thread_{bucket}_cpu_percent"
+        for bucket in PHASE_THREAD_BUCKETS
+        for phase in PHASES
+    ],
+    *[f"max_{phase}_heap_peak_bytes" for phase in PHASES],
+    *[f"mean_{phase}_lsu_cycles" for phase in PHASES],
+    *[f"mean_{phase}_cpi_cycles" for phase in PHASES],
     "phase_cpu_verify", "mean_phase_lsu_total_cycles",
     "mean_phase_cpi_total_cycles", "max_phase_dwt_samples",
     "dwt_counters_supported", "dwt_wrap_risk",
@@ -621,6 +640,29 @@ def summarize(rows: list[dict[str, object]]) -> list[dict[str, object]]:
         parse_cert_cpu = numbers(success, "parse_cert_cpu_ms")
         key_export_cpu = numbers(success, "key_export_cpu_ms")
         phase_cpu_total = numbers(success, "phase_cpu_total_ms")
+        phase_wall = {
+            phase: numbers(success, f"{phase}_wall_ms")
+            for phase in PHASES
+        }
+        phase_thread_cpu = {
+            (phase, bucket): numbers(
+                success, f"{phase}_thread_{bucket}_cpu_percent"
+            )
+            for phase in PHASES
+            for bucket in PHASE_THREAD_BUCKETS
+        }
+        phase_heap_peak = {
+            phase: numbers(success, f"{phase}_heap_peak_bytes")
+            for phase in PHASES
+        }
+        phase_lsu = {
+            phase: numbers(success, f"{phase}_lsu_cycles")
+            for phase in PHASES
+        }
+        phase_cpi = {
+            phase: numbers(success, f"{phase}_cpi_cycles")
+            for phase in PHASES
+        }
         phase_lsu_total = numbers(success, "phase_lsu_total_cycles")
         phase_cpi_total = numbers(success, "phase_cpi_total_cycles")
         phase_dwt_samples = numbers(success, "phase_dwt_samples")
@@ -648,7 +690,7 @@ def summarize(rows: list[dict[str, object]]) -> list[dict[str, object]]:
         ]
         client_heap_peak = numbers(success, "client_heap_peak_bytes")
         thread_stack_peak = numbers(success, "thread_stack_peak_percent")
-        summaries.append({
+        summary = {
             "component": base["component"],
             "owner": base["owner"],
             "cert_sig_alg": base["cert_sig_alg"],
@@ -772,7 +814,33 @@ def summarize(rows: list[dict[str, object]]) -> list[dict[str, object]]:
             "client_key_der_bytes": (
                 success[0].get("client_key_der_bytes", "") if success else ""
             ),
-        })
+        }
+        for phase in PHASES:
+            wall_values = phase_wall[phase]
+            heap_values = phase_heap_peak[phase]
+            summary[f"mean_{phase}_wall_ms"] = (
+                f"{sum(wall_values) / len(wall_values):.3f}"
+                if wall_values else ""
+            )
+            summary[f"max_{phase}_heap_peak_bytes"] = (
+                f"{max(heap_values):.0f}" if heap_values else ""
+            )
+            lsu_values = phase_lsu[phase]
+            cpi_values = phase_cpi[phase]
+            summary[f"mean_{phase}_lsu_cycles"] = (
+                f"{sum(lsu_values) / len(lsu_values):.3f}"
+                if lsu_values else ""
+            )
+            summary[f"mean_{phase}_cpi_cycles"] = (
+                f"{sum(cpi_values) / len(cpi_values):.3f}"
+                if cpi_values else ""
+            )
+            for bucket in PHASE_THREAD_BUCKETS:
+                values = phase_thread_cpu[(phase, bucket)]
+                summary[f"mean_{phase}_thread_{bucket}_cpu_percent"] = (
+                    f"{sum(values) / len(values):.3f}" if values else ""
+                )
+        summaries.append(summary)
     return summaries
 
 

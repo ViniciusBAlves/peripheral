@@ -312,13 +312,18 @@ static void benchmark_cpu_delta(
         end->non_idle_cycles - start->non_idle_cycles, system_cycles);
 }
 
-#ifdef BENCH_CLIENT_CERTGEN
 struct benchmark_cpu_phase {
     struct benchmark_cpu_snapshot start;
+    struct benchmark_thread_cpu_snapshot thread_start;
+    struct benchmark_thread_cpu_delta thread_delta;
+    int64_t wall_start_ms;
+    int64_t wall_ms;
     uint64_t cycles;
     uint64_t us;
     uint64_t dwt_lsu_cycles;
     uint64_t dwt_cpi_cycles;
+    uint32_t heap_current_bytes;
+    uint32_t heap_peak_bytes;
     uint32_t dwt_samples;
     bool dwt_supported;
     bool dwt_wrap_risk;
@@ -405,11 +410,20 @@ K_TIMER_DEFINE(certgen_dwt_timer, benchmark_dwt_sampler_timer, NULL);
 
 static void benchmark_cpu_phase_begin(struct benchmark_cpu_phase *phase)
 {
+    struct sys_memory_stats stats = {0};
+
+    (void)sys_heap_runtime_stats_reset_max(&wolfssl_heap.heap);
+    (void)sys_heap_runtime_stats_get(&wolfssl_heap.heap, &stats);
+    phase->thread_start = benchmark_thread_cpu_snapshot_get();
     phase->start = benchmark_cpu_snapshot_get();
+    phase->wall_start_ms = k_uptime_get();
+    phase->wall_ms = 0;
     phase->cycles = 0;
     phase->us = 0;
     phase->dwt_lsu_cycles = 0;
     phase->dwt_cpi_cycles = 0;
+    phase->heap_current_bytes = (uint32_t)stats.allocated_bytes;
+    phase->heap_peak_bytes = (uint32_t)stats.max_allocated_bytes;
     phase->dwt_samples = 0;
     phase->dwt_supported = false;
     phase->dwt_wrap_risk = false;
@@ -435,6 +449,16 @@ static void benchmark_cpu_phase_begin(struct benchmark_cpu_phase *phase)
 static void benchmark_cpu_phase_end(struct benchmark_cpu_phase *phase)
 {
     struct benchmark_cpu_snapshot end = benchmark_cpu_snapshot_get();
+    struct benchmark_thread_cpu_snapshot thread_end;
+    struct sys_memory_stats stats = {0};
+
+    phase->wall_ms = k_uptime_get() - phase->wall_start_ms;
+    thread_end = benchmark_thread_cpu_snapshot_get();
+    phase->thread_delta = benchmark_thread_cpu_delta_get(
+        &phase->thread_start, &thread_end);
+    (void)sys_heap_runtime_stats_get(&wolfssl_heap.heap, &stats);
+    phase->heap_current_bytes = (uint32_t)stats.allocated_bytes;
+    phase->heap_peak_bytes = (uint32_t)stats.max_allocated_bytes;
 
 #if defined(CONFIG_CPU_CORTEX_M_HAS_DWT)
     if (certgen_dwt_sampler.phase == phase) {
@@ -455,7 +479,6 @@ static void benchmark_cpu_phase_end(struct benchmark_cpu_phase *phase)
     phase->cycles = end.thread_cycles - phase->start.thread_cycles;
     phase->us = k_cyc_to_us_floor64(phase->cycles);
 }
-#endif
 
 static void benchmark_stack_analyzer_cb(struct thread_analyzer_info *info)
 {
@@ -1142,6 +1165,33 @@ static void benchmark_client_certgen(void)
         "sign_cert_cpu_us=%llu parse_cert_cpu_us=%llu "
         "key_export_cpu_us=%llu phase_cpu_total_us=%llu "
         "phase_cpu_verify=%s "
+        "keygen_wall_ms=%lld make_cert_wall_ms=%lld "
+        "sign_cert_wall_ms=%lld parse_cert_wall_ms=%lld "
+        "key_export_wall_ms=%lld "
+        "keygen_thread_main_cpu_bp=%u make_cert_thread_main_cpu_bp=%u "
+        "sign_cert_thread_main_cpu_bp=%u parse_cert_thread_main_cpu_bp=%u "
+        "key_export_thread_main_cpu_bp=%u "
+        "keygen_thread_idle_cpu_bp=%u make_cert_thread_idle_cpu_bp=%u "
+        "sign_cert_thread_idle_cpu_bp=%u parse_cert_thread_idle_cpu_bp=%u "
+        "key_export_thread_idle_cpu_bp=%u "
+        "keygen_thread_other_cpu_bp=%u make_cert_thread_other_cpu_bp=%u "
+        "sign_cert_thread_other_cpu_bp=%u parse_cert_thread_other_cpu_bp=%u "
+        "key_export_thread_other_cpu_bp=%u "
+        "keygen_thread_sysworkq_cpu_bp=%u make_cert_thread_sysworkq_cpu_bp=%u "
+        "sign_cert_thread_sysworkq_cpu_bp=%u parse_cert_thread_sysworkq_cpu_bp=%u "
+        "key_export_thread_sysworkq_cpu_bp=%u "
+        "keygen_thread_bt_rx_cpu_bp=%u make_cert_thread_bt_rx_cpu_bp=%u "
+        "sign_cert_thread_bt_rx_cpu_bp=%u parse_cert_thread_bt_rx_cpu_bp=%u "
+        "key_export_thread_bt_rx_cpu_bp=%u "
+        "keygen_thread_bt_tx_cpu_bp=%u make_cert_thread_bt_tx_cpu_bp=%u "
+        "sign_cert_thread_bt_tx_cpu_bp=%u parse_cert_thread_bt_tx_cpu_bp=%u "
+        "key_export_thread_bt_tx_cpu_bp=%u "
+        "keygen_heap_current_bytes=%u make_cert_heap_current_bytes=%u "
+        "sign_cert_heap_current_bytes=%u parse_cert_heap_current_bytes=%u "
+        "key_export_heap_current_bytes=%u "
+        "keygen_heap_peak_bytes=%u make_cert_heap_peak_bytes=%u "
+        "sign_cert_heap_peak_bytes=%u parse_cert_heap_peak_bytes=%u "
+        "key_export_heap_peak_bytes=%u "
         "keygen_lsu_cycles=%llu make_cert_lsu_cycles=%llu "
         "sign_cert_lsu_cycles=%llu parse_cert_lsu_cycles=%llu "
         "key_export_lsu_cycles=%llu phase_lsu_total_cycles=%llu "
@@ -1165,6 +1215,34 @@ static void benchmark_client_certgen(void)
         keygen_phase.us, make_cert_phase.us, sign_cert_phase.us,
         parse_cert_phase.us, key_export_phase.us, phase_cpu_total_us,
         phase_cpu_total_us <= client_cpu_us ? "pass" : "fail",
+        keygen_phase.wall_ms, make_cert_phase.wall_ms, sign_cert_phase.wall_ms,
+        parse_cert_phase.wall_ms, key_export_phase.wall_ms,
+        keygen_phase.thread_delta.main_bp, make_cert_phase.thread_delta.main_bp,
+        sign_cert_phase.thread_delta.main_bp, parse_cert_phase.thread_delta.main_bp,
+        key_export_phase.thread_delta.main_bp,
+        keygen_phase.thread_delta.idle_bp, make_cert_phase.thread_delta.idle_bp,
+        sign_cert_phase.thread_delta.idle_bp, parse_cert_phase.thread_delta.idle_bp,
+        key_export_phase.thread_delta.idle_bp,
+        keygen_phase.thread_delta.other_bp, make_cert_phase.thread_delta.other_bp,
+        sign_cert_phase.thread_delta.other_bp, parse_cert_phase.thread_delta.other_bp,
+        key_export_phase.thread_delta.other_bp,
+        keygen_phase.thread_delta.sysworkq_bp,
+        make_cert_phase.thread_delta.sysworkq_bp,
+        sign_cert_phase.thread_delta.sysworkq_bp,
+        parse_cert_phase.thread_delta.sysworkq_bp,
+        key_export_phase.thread_delta.sysworkq_bp,
+        keygen_phase.thread_delta.bt_rx_bp, make_cert_phase.thread_delta.bt_rx_bp,
+        sign_cert_phase.thread_delta.bt_rx_bp, parse_cert_phase.thread_delta.bt_rx_bp,
+        key_export_phase.thread_delta.bt_rx_bp,
+        keygen_phase.thread_delta.bt_tx_bp, make_cert_phase.thread_delta.bt_tx_bp,
+        sign_cert_phase.thread_delta.bt_tx_bp, parse_cert_phase.thread_delta.bt_tx_bp,
+        key_export_phase.thread_delta.bt_tx_bp,
+        keygen_phase.heap_current_bytes, make_cert_phase.heap_current_bytes,
+        sign_cert_phase.heap_current_bytes, parse_cert_phase.heap_current_bytes,
+        key_export_phase.heap_current_bytes,
+        keygen_phase.heap_peak_bytes, make_cert_phase.heap_peak_bytes,
+        sign_cert_phase.heap_peak_bytes, parse_cert_phase.heap_peak_bytes,
+        key_export_phase.heap_peak_bytes,
         keygen_phase.dwt_lsu_cycles, make_cert_phase.dwt_lsu_cycles,
         sign_cert_phase.dwt_lsu_cycles, parse_cert_phase.dwt_lsu_cycles,
         key_export_phase.dwt_lsu_cycles, phase_lsu_total_cycles,
@@ -1646,9 +1724,13 @@ void start_secure_mqtt_session(struct bt_l2cap_chan *chan)
     uint32_t client_cpu_usage_bp = 0;
     uint32_t system_cpu_usage_bp = 0;
     uint32_t cpu_cycle_hz = benchmark_cpu_cycles_per_sec();
+    struct benchmark_cpu_phase tls_setup_phase;
+    struct benchmark_cpu_phase tls_handshake_phase;
+    struct benchmark_cpu_phase mqtt_connect_phase;
 
     benchmark_power_markers_reset();
     benchmark_power_total_set(true);
+    benchmark_cpu_phase_begin(&tls_setup_phase);
     ctx = wolfSSL_CTX_new(wolfTLSv1_3_client_method());
     if (!ctx) {
         BENCH_OUT("[BENCH_RESULT] status=fail stage=tls_setup error=ctx_new\n");
@@ -1732,6 +1814,7 @@ void start_secure_mqtt_session(struct bt_l2cap_chan *chan)
     wolfSSL_SetIOReadCtx(ssl, chan);
     wolfSSL_SetIOWriteCtx(ssl, chan);
     setup_done_ms = k_uptime_get();
+    benchmark_cpu_phase_end(&tls_setup_phase);
 
     (void)sys_heap_runtime_stats_reset_max(&wolfssl_heap.heap);
     benchmark_metrics_reset();
@@ -1741,6 +1824,7 @@ void start_secure_mqtt_session(struct bt_l2cap_chan *chan)
     tls_handshake_active = true;
     benchmark_power_handshake_set(true);
     struct benchmark_cpu_snapshot cpu_start = benchmark_cpu_snapshot_get();
+    benchmark_cpu_phase_begin(&tls_handshake_phase);
     do {
         ret = wolfSSL_connect(ssl);
         if (ret != WOLFSSL_SUCCESS) {
@@ -1754,6 +1838,7 @@ void start_secure_mqtt_session(struct bt_l2cap_chan *chan)
                 }
             }
             struct benchmark_cpu_snapshot cpu_end = benchmark_cpu_snapshot_get();
+            benchmark_cpu_phase_end(&tls_handshake_phase);
             benchmark_cpu_delta(
                 &cpu_start, &cpu_end, &client_cpu_cycles,
                 &client_cpu_usage_bp, &system_cpu_usage_bp);
@@ -1773,6 +1858,7 @@ void start_secure_mqtt_session(struct bt_l2cap_chan *chan)
             return;
         }
     } while (ret != WOLFSSL_SUCCESS);
+    benchmark_cpu_phase_end(&tls_handshake_phase);
     struct benchmark_cpu_snapshot cpu_end = benchmark_cpu_snapshot_get();
     benchmark_cpu_delta(
         &cpu_start, &cpu_end, &client_cpu_cycles,
@@ -1789,6 +1875,7 @@ void start_secure_mqtt_session(struct bt_l2cap_chan *chan)
         0x00, 0x08, 'n', 'r', 'f', 'b', 'e', 'n', 'c', 'h',
     };
     int64_t mqtt_start_ms = k_uptime_get();
+    benchmark_cpu_phase_begin(&mqtt_connect_phase);
     ret = wolfSSL_write(ssl, mqtt_connect, sizeof(mqtt_connect));
     if (ret != sizeof(mqtt_connect)) {
         BENCH_OUT("[BENCH_RESULT] status=fail stage=mqtt_write error=%d\n",
@@ -1804,10 +1891,15 @@ void start_secure_mqtt_session(struct bt_l2cap_chan *chan)
             int64_t mqtt_done_ms = k_uptime_get();
             struct sys_memory_stats stats = {0};
             const struct benchmark_metrics *metrics;
+            uint32_t total_heap_peak;
 
+            benchmark_cpu_phase_end(&mqtt_connect_phase);
             benchmark_metrics_stop();
             metrics = benchmark_metrics_get();
             (void)sys_heap_runtime_stats_get(&wolfssl_heap.heap, &stats);
+            total_heap_peak = MAX(tls_setup_phase.heap_peak_bytes,
+                MAX(tls_handshake_phase.heap_peak_bytes,
+                    mqtt_connect_phase.heap_peak_bytes));
             struct benchmark_stack_snapshot stacks =
                 benchmark_stack_snapshot_get();
             benchmark_power_total_set(false);
@@ -1817,6 +1909,21 @@ void start_secure_mqtt_session(struct bt_l2cap_chan *chan)
                 "end_to_end_ms=%lld client_cpu_cycles=%llu client_cpu_us=%llu "
                 "client_cycle_hz=%u client_cpu_usage_bp=%u "
                 "system_cpu_usage_bp=%u "
+                "tls_setup_cpu_us=%llu tls_handshake_cpu_us=%llu "
+                "mqtt_connect_cpu_us=%llu "
+                "tls_setup_lsu_cycles=%llu tls_handshake_lsu_cycles=%llu "
+                "mqtt_connect_lsu_cycles=%llu "
+                "tls_setup_cpi_cycles=%llu tls_handshake_cpi_cycles=%llu "
+                "mqtt_connect_cpi_cycles=%llu "
+                "tls_setup_heap_peak_bytes=%u tls_handshake_heap_peak_bytes=%u "
+                "mqtt_connect_heap_peak_bytes=%u "
+                "tls_setup_thread_main_cpu_bp=%u "
+                "tls_handshake_thread_main_cpu_bp=%u "
+                "mqtt_connect_thread_main_cpu_bp=%u "
+                "tls_setup_thread_idle_cpu_bp=%u "
+                "tls_handshake_thread_idle_cpu_bp=%u "
+                "mqtt_connect_thread_idle_cpu_bp=%u "
+                "dwt_counters_supported=%u dwt_wrap_risk=%u "
                 "client_heap_current_bytes=%u client_heap_peak_bytes=%u "
                 "client_heap_free_bytes=%u client_heap_capacity_bytes=%u "
                 "firmware_flash_used_bytes=%u firmware_flash_capacity_bytes=%u "
@@ -1844,8 +1951,31 @@ void start_secure_mqtt_session(struct bt_l2cap_chan *chan)
                 mqtt_done_ms - l2cap_connected_ms,
                 client_cpu_cycles, client_cpu_us, cpu_cycle_hz,
                 client_cpu_usage_bp, system_cpu_usage_bp,
+                tls_setup_phase.us, tls_handshake_phase.us,
+                mqtt_connect_phase.us,
+                tls_setup_phase.dwt_lsu_cycles,
+                tls_handshake_phase.dwt_lsu_cycles,
+                mqtt_connect_phase.dwt_lsu_cycles,
+                tls_setup_phase.dwt_cpi_cycles,
+                tls_handshake_phase.dwt_cpi_cycles,
+                mqtt_connect_phase.dwt_cpi_cycles,
+                tls_setup_phase.heap_peak_bytes,
+                tls_handshake_phase.heap_peak_bytes,
+                mqtt_connect_phase.heap_peak_bytes,
+                tls_setup_phase.thread_delta.main_bp,
+                tls_handshake_phase.thread_delta.main_bp,
+                mqtt_connect_phase.thread_delta.main_bp,
+                tls_setup_phase.thread_delta.idle_bp,
+                tls_handshake_phase.thread_delta.idle_bp,
+                mqtt_connect_phase.thread_delta.idle_bp,
+                (tls_setup_phase.dwt_supported ||
+                 tls_handshake_phase.dwt_supported ||
+                 mqtt_connect_phase.dwt_supported) ? 1U : 0U,
+                (tls_setup_phase.dwt_wrap_risk ||
+                 tls_handshake_phase.dwt_wrap_risk ||
+                 mqtt_connect_phase.dwt_wrap_risk) ? 1U : 0U,
                 (unsigned int)stats.allocated_bytes,
-                (unsigned int)stats.max_allocated_bytes,
+                (unsigned int)total_heap_peak,
                 (unsigned int)stats.free_bytes, WOLFSSL_HEAP_SIZE,
                 (unsigned int)(uintptr_t)_flash_used,
                 (unsigned int)(CONFIG_FLASH_SIZE * 1024U),

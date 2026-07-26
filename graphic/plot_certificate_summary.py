@@ -69,11 +69,13 @@ def load_summary(run_dir: Path, include_failed: bool) -> list[dict[str, str]]:
 def row_label(row: dict[str, str]) -> str:
     component = row.get("component", "")
     signature = row.get("cert_sig_alg", "")
+    level = row.get("sig_nist_level", "")
+    level_suffix = f" (L{level})" if level else ""
     if component == "client_identity":
-        return "Client key + CSR"
+        return "Board key + CSR"
     if component == "client_certificate":
-        return f"Client cert: {signature} (board)"
-    return signature
+        return f"Board: {signature}{level_suffix}"
+    return f"{signature}{level_suffix}"
 
 
 def row_color(row: dict[str, str]) -> str:
@@ -145,6 +147,46 @@ THREAD_CPU_FIELDS = [
     ("mean_thread_other_cpu_percent", "other", "#9333ea"),
 ]
 
+PHASE_WALL_FIELDS = [
+    ("mean_keygen_wall_ms", "Keygen", "#2563eb"),
+    ("mean_make_cert_wall_ms", "Make cert", "#64748b"),
+    ("mean_sign_cert_wall_ms", "Sign cert", "#dc2626"),
+    ("mean_parse_cert_wall_ms", "Parse verify", "#0f766e"),
+    ("mean_key_export_wall_ms", "Key export", "#9333ea"),
+]
+
+PHASE_LSU_FIELDS = [
+    ("mean_keygen_lsu_cycles", "Keygen", "#2563eb"),
+    ("mean_make_cert_lsu_cycles", "Make cert", "#64748b"),
+    ("mean_sign_cert_lsu_cycles", "Sign cert", "#dc2626"),
+    ("mean_parse_cert_lsu_cycles", "Parse verify", "#0f766e"),
+    ("mean_key_export_lsu_cycles", "Key export", "#9333ea"),
+]
+
+PHASE_CPI_FIELDS = [
+    ("mean_keygen_cpi_cycles", "Keygen", "#2563eb"),
+    ("mean_make_cert_cpi_cycles", "Make cert", "#64748b"),
+    ("mean_sign_cert_cpi_cycles", "Sign cert", "#dc2626"),
+    ("mean_parse_cert_cpi_cycles", "Parse verify", "#0f766e"),
+    ("mean_key_export_cpi_cycles", "Key export", "#9333ea"),
+]
+
+PHASE_HEAP_FIELDS = [
+    ("max_keygen_heap_peak_bytes", "Keygen", "#2563eb"),
+    ("max_make_cert_heap_peak_bytes", "Make cert", "#64748b"),
+    ("max_sign_cert_heap_peak_bytes", "Sign cert", "#dc2626"),
+    ("max_parse_cert_heap_peak_bytes", "Parse verify", "#0f766e"),
+    ("max_key_export_heap_peak_bytes", "Key export", "#9333ea"),
+]
+
+PHASE_MAIN_THREAD_FIELDS = [
+    ("mean_keygen_thread_main_cpu_percent", "Keygen", "#2563eb"),
+    ("mean_make_cert_thread_main_cpu_percent", "Make cert", "#64748b"),
+    ("mean_sign_cert_thread_main_cpu_percent", "Sign cert", "#dc2626"),
+    ("mean_parse_cert_thread_main_cpu_percent", "Parse verify", "#0f766e"),
+    ("mean_key_export_thread_main_cpu_percent", "Key export", "#9333ea"),
+]
+
 
 def phase_values(row: dict[str, str]) -> list[float]:
     return [float_or_none(row.get(field)) or 0.0 for field, _label, _color in PHASE_FIELDS]
@@ -168,12 +210,19 @@ def sort_rows(rows: list[dict[str, str]]) -> list[dict[str, str]]:
     )
 
 
-def annotate_bars(ax, bars, values: list[float], *, suffix: str = "") -> None:
+def annotate_bars(
+    ax,
+    bars,
+    values: list[float],
+    *,
+    suffix: str = "",
+    decimals: int = 0,
+) -> None:
     for bar, value in zip(bars, values):
         if value <= 0:
             continue
         ax.annotate(
-            f"{value:,.0f}{suffix}",
+            f"{value:,.{decimals}f}{suffix}",
             xy=(value, bar.get_y() + bar.get_height() / 2),
             xytext=(4, 0),
             textcoords="offset points",
@@ -257,7 +306,7 @@ def plot_summary(
         ax.invert_yaxis()
 
     legend_handles = [
-        plt.Rectangle((0, 0), 1, 1, color="#2563eb", label="Client/wolfSSL"),
+        plt.Rectangle((0, 0), 1, 1, color="#2563eb", label="Board/wolfSSL"),
         plt.Rectangle((0, 0), 1, 1, color="#64748b", label="Classic/OpenSSL"),
         plt.Rectangle((0, 0), 1, 1, color="#0f766e", label="PQC/OpenSSL"),
         plt.Rectangle((0, 0), 1, 1, color="#7c3aed", label="HBS/wolfSSL"),
@@ -283,29 +332,36 @@ def plot_phase_breakdown(
         return False
 
     labels = [row_label(row) for row in rows]
-    positions = np.arange(len(rows))
-    height = max(7.0, len(rows) * 0.46)
-    fig, ax = plt.subplots(figsize=(12, height), constrained_layout=True)
+    positions = np.arange(len(rows), dtype=float)
+    height = max(7.0, len(rows) * 0.68)
+    fig, ax = plt.subplots(figsize=(13, height), constrained_layout=True)
     fig.suptitle(f"Certificate CPU phase breakdown - {run_id}", fontsize=15)
 
-    left = np.zeros(len(rows))
+    bar_height = min(0.13, 0.72 / len(PHASE_FIELDS))
+    offsets = (
+        np.arange(len(PHASE_FIELDS), dtype=float) - (len(PHASE_FIELDS) - 1) / 2.0
+    ) * bar_height
+    all_values: list[float] = []
     for field, label, color in PHASE_FIELDS:
+        idx = [item[0] for item in PHASE_FIELDS].index(field)
         values = np.array(numeric(rows, field))
+        positive = values > 0
+        all_values.extend(float(value) for value in values if value > 0)
         ax.barh(
-            positions, values, left=left, label=label, color=color,
+            positions[positive] + offsets[idx], values[positive],
+            height=bar_height, label=label, color=color,
             edgecolor="#111827", linewidth=0.25
         )
-        left += values
 
     totals = [phase_total(row) for row in rows]
-    annotate_bars(ax, ax.barh(positions, [0] * len(rows), left=left), totals, suffix=" ms")
-    ax.set_xlabel("Mean phase CPU time (ms)")
+    ax.set_xlabel("Mean phase CPU time (ms, log scale)")
+    ax.set_xscale("log")
     ax.set_yticks(positions)
     ax.set_yticklabels(labels, fontsize=9)
     ax.grid(axis="x", linestyle=":", alpha=0.35)
     ax.legend(loc="lower right", fontsize=8)
     ax.invert_yaxis()
-    pad_x_axis(ax, totals, log_scale=False)
+    pad_x_axis(ax, all_values or totals, log_scale=True)
 
     output.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(output, dpi=180)
@@ -365,6 +421,7 @@ def plot_cpu_efficiency(
     rows: list[dict[str, str]],
     output: Path,
     run_id: str,
+    title_suffix: str = "",
 ) -> bool:
     rows = sort_rows([
         row for row in rows
@@ -387,7 +444,10 @@ def plot_cpu_efficiency(
         figsize=(16, height),
         constrained_layout=True,
     )
-    fig.suptitle(f"Certificate CPU cost normalized by output - {run_id}", fontsize=15)
+    title = "Certificate CPU cost normalized by output"
+    if title_suffix:
+        title = f"{title} ({title_suffix})"
+    fig.suptitle(f"{title} - {run_id}", fontsize=15)
 
     bars = axes[0].barh(
         positions, cpu_per_kb, color=colors, edgecolor="#111827", linewidth=0.35
@@ -398,7 +458,7 @@ def plot_cpu_efficiency(
     axes[0].grid(axis="x", linestyle=":", alpha=0.35)
     axes[0].set_xscale("log")
     pad_x_axis(axes[0], cpu_per_kb, log_scale=True)
-    annotate_bars(axes[0], bars, cpu_per_kb)
+    annotate_bars(axes[0], bars, cpu_per_kb, decimals=2)
 
     scatter_sizes = [
         max(30.0, min(260.0, memory_kb(row) / 2.0))
@@ -434,6 +494,32 @@ def plot_cpu_efficiency(
     fig.savefig(output, dpi=180)
     plt.close(fig)
     return True
+
+
+def plot_board_cpu_efficiency(
+    rows: list[dict[str, str]],
+    output: Path,
+    run_id: str,
+) -> bool:
+    board_rows = [
+        row for row in rows
+        if row.get("component") in {"client_certificate", "client_identity"}
+        or row.get("builder") == "wolfssl_board"
+    ]
+    return plot_cpu_efficiency(board_rows, output, run_id, "board")
+
+
+def plot_server_cpu_efficiency(
+    rows: list[dict[str, str]],
+    output: Path,
+    run_id: str,
+) -> bool:
+    server_rows = [
+        row for row in rows
+        if row.get("component") == "server_chain"
+        or row.get("owner") == "server"
+    ]
+    return plot_cpu_efficiency(server_rows, output, run_id, "server")
 
 
 def plot_resource_pressure(
@@ -534,6 +620,204 @@ def plot_thread_cpu_breakdown(
     return True
 
 
+def plot_total_cpi(
+    rows: list[dict[str, str]],
+    output: Path,
+    run_id: str,
+) -> bool:
+    rows = sort_rows(positive_rows(rows, ["mean_phase_cpi_total_cycles"]))
+    if not rows:
+        return False
+
+    labels = [row_label(row) for row in rows]
+    colors = [row_color(row) for row in rows]
+    positions = np.arange(len(rows))
+    values = numeric(rows, "mean_phase_cpi_total_cycles")
+    height = max(7.0, len(rows) * 0.46)
+    fig, ax = plt.subplots(figsize=(12, height), constrained_layout=True)
+    fig.suptitle(f"Board certgen total CPICNT - {run_id}", fontsize=15)
+
+    bars = ax.barh(
+        positions, values, color=colors, edgecolor="#111827", linewidth=0.35
+    )
+    ax.set_xlabel("Total CPICNT delta across measured phases (log scale)")
+    ax.set_xscale("log")
+    ax.set_yticks(positions)
+    ax.set_yticklabels(labels, fontsize=9)
+    ax.grid(axis="x", linestyle=":", alpha=0.35)
+    pad_x_axis(ax, values, log_scale=True)
+    annotate_bars(ax, bars, values)
+    ax.invert_yaxis()
+
+    output.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(output, dpi=180)
+    plt.close(fig)
+    return True
+
+
+def plot_stacked_absolute(
+    rows: list[dict[str, str]],
+    output: Path,
+    run_id: str,
+    fields: list[tuple[str, str, str]],
+    title: str,
+    xlabel: str,
+    *,
+    divide_by: float = 1.0,
+    log_scale: bool = False,
+) -> bool:
+    rows = sort_rows(positive_rows(rows, [field for field, _label, _color in fields]))
+    if not rows:
+        return False
+
+    labels = [row_label(row) for row in rows]
+    positions = np.arange(len(rows))
+    height = max(7.0, len(rows) * 0.46)
+    fig, ax = plt.subplots(figsize=(12, height), constrained_layout=True)
+    fig.suptitle(f"{title} - {run_id}", fontsize=15)
+
+    left = np.zeros(len(rows))
+    for field, label, color in fields:
+        values = np.array(numeric(rows, field)) / divide_by
+        ax.barh(
+            positions, values, left=left, label=label, color=color,
+            edgecolor="#111827", linewidth=0.25
+        )
+        left += values
+
+    ax.set_xlabel(xlabel)
+    ax.set_yticks(positions)
+    ax.set_yticklabels(labels, fontsize=9)
+    ax.grid(axis="x", linestyle=":", alpha=0.35)
+    if log_scale:
+        ax.set_xscale("log")
+    pad_x_axis(ax, list(left), log_scale=log_scale)
+    ax.legend(loc="lower right", fontsize=8)
+    ax.invert_yaxis()
+
+    output.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(output, dpi=180)
+    plt.close(fig)
+    return True
+
+
+def plot_stacked_share(
+    rows: list[dict[str, str]],
+    output: Path,
+    run_id: str,
+    fields: list[tuple[str, str, str]],
+    title: str,
+    xlabel: str,
+) -> bool:
+    rows = sort_rows(positive_rows(rows, [field for field, _label, _color in fields]))
+    if not rows:
+        return False
+
+    labels = [row_label(row) for row in rows]
+    positions = np.arange(len(rows))
+    height = max(7.0, len(rows) * 0.46)
+    fig, ax = plt.subplots(figsize=(12, height), constrained_layout=True)
+    fig.suptitle(f"{title} - {run_id}", fontsize=15)
+
+    totals = np.array([
+        sum(float_or_none(row.get(field)) or 0.0 for field, _label, _color in fields)
+        for row in rows
+    ])
+    left = np.zeros(len(rows))
+    for field, label, color in fields:
+        values = np.array(numeric(rows, field))
+        shares = np.divide(
+            values * 100.0,
+            totals,
+            out=np.zeros_like(values),
+            where=totals > 0,
+        )
+        ax.barh(
+            positions, shares, left=left, label=label, color=color,
+            edgecolor="#111827", linewidth=0.25
+        )
+        left += shares
+
+    ax.set_xlabel(xlabel)
+    ax.set_xlim(0, 100)
+    ax.set_yticks(positions)
+    ax.set_yticklabels(labels, fontsize=9)
+    ax.grid(axis="x", linestyle=":", alpha=0.35)
+    ax.legend(loc="lower right", fontsize=8)
+    ax.invert_yaxis()
+
+    output.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(output, dpi=180)
+    plt.close(fig)
+    return True
+
+
+def plot_phase_heap_peak(
+    rows: list[dict[str, str]],
+    output: Path,
+    run_id: str,
+) -> bool:
+    return plot_stacked_absolute(
+        rows,
+        output,
+        run_id,
+        PHASE_HEAP_FIELDS,
+        "Board certgen phase heap peaks",
+        "Per-phase wolfSSL heap peak (KB)",
+        divide_by=1024.0,
+        log_scale=False,
+    )
+
+
+def plot_phase_main_thread_cpu(
+    rows: list[dict[str, str]],
+    output: Path,
+    run_id: str,
+) -> bool:
+    rows = sort_rows(positive_rows(
+        rows, [field for field, _label, _color in PHASE_MAIN_THREAD_FIELDS]
+    ))
+    if not rows:
+        return False
+
+    labels = [row_label(row) for row in rows]
+    positions = np.arange(len(rows), dtype=float)
+    height = max(7.0, len(rows) * 0.68)
+    fig, ax = plt.subplots(figsize=(13, height), constrained_layout=True)
+    fig.suptitle(f"Board certgen main-thread CPU by phase - {run_id}", fontsize=15)
+
+    bar_height = min(0.13, 0.72 / len(PHASE_MAIN_THREAD_FIELDS))
+    offsets = (
+        np.arange(len(PHASE_MAIN_THREAD_FIELDS), dtype=float)
+        - (len(PHASE_MAIN_THREAD_FIELDS) - 1) / 2.0
+    ) * bar_height
+    for idx, (field, label, color) in enumerate(PHASE_MAIN_THREAD_FIELDS):
+        values = np.array(numeric(rows, field))
+        positive = values > 0
+        ax.barh(
+            positions[positive] + offsets[idx],
+            values[positive],
+            height=bar_height,
+            label=label,
+            color=color,
+            edgecolor="#111827",
+            linewidth=0.25,
+        )
+
+    ax.set_xlabel("Main thread CPU share during phase (%)")
+    ax.set_xlim(0, 100)
+    ax.set_yticks(positions)
+    ax.set_yticklabels(labels, fontsize=9)
+    ax.grid(axis="x", linestyle=":", alpha=0.35)
+    ax.legend(loc="lower right", fontsize=8)
+    ax.invert_yaxis()
+
+    output.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(output, dpi=180)
+    plt.close(fig)
+    return True
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -586,8 +870,12 @@ def main() -> int:
             out_dir / f"certificate_cpu_phase_share.{extension}",
         ),
         (
-            plot_cpu_efficiency,
-            out_dir / f"certificate_cpu_efficiency.{extension}",
+            plot_board_cpu_efficiency,
+            out_dir / f"certificate_board_cpu_efficiency.{extension}",
+        ),
+        (
+            plot_server_cpu_efficiency,
+            out_dir / f"certificate_server_cpu_efficiency.{extension}",
         ),
         (
             plot_resource_pressure,
@@ -596,6 +884,52 @@ def main() -> int:
         (
             plot_thread_cpu_breakdown,
             out_dir / f"certificate_thread_cpu_breakdown.{extension}",
+        ),
+        (
+            plot_total_cpi,
+            out_dir / f"certificate_total_cpi_log.{extension}",
+        ),
+        (
+            lambda rows, path, run_id: plot_stacked_absolute(
+                rows,
+                path,
+                run_id,
+                PHASE_WALL_FIELDS,
+                "Board certgen phase wall time",
+                "Mean phase wall time (ms)",
+                log_scale=True,
+            ),
+            out_dir / f"certificate_phase_wall_absolute.{extension}",
+        ),
+        (
+            lambda rows, path, run_id: plot_stacked_share(
+                rows,
+                path,
+                run_id,
+                PHASE_LSU_FIELDS,
+                "Board certgen LSUCNT phase share",
+                "Share of phase LSUCNT delta (%)",
+            ),
+            out_dir / f"certificate_phase_lsu_share.{extension}",
+        ),
+        (
+            lambda rows, path, run_id: plot_stacked_share(
+                rows,
+                path,
+                run_id,
+                PHASE_CPI_FIELDS,
+                "Board certgen CPICNT phase share",
+                "Share of phase CPICNT delta (%)",
+            ),
+            out_dir / f"certificate_phase_cpi_share.{extension}",
+        ),
+        (
+            plot_phase_heap_peak,
+            out_dir / f"certificate_phase_heap_peak.{extension}",
+        ),
+        (
+            plot_phase_main_thread_cpu,
+            out_dir / f"certificate_phase_main_thread_cpu.{extension}",
         ),
     ]
     for plotter, path in optional_plots:

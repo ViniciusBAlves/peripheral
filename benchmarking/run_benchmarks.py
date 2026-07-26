@@ -60,6 +60,7 @@ POWER_ATTEMPT_FIELDS = [
     f"{window}_{metric}"
     for window in POWER_WINDOWS for metric in POWER_METRICS
 ]
+TLS_PHASES = ("tls_setup", "tls_handshake", "mqtt_connect")
 FATAL_SERVER_LOG_PATTERNS = (
     r"unknown ca",
     r"certificate verify failed",
@@ -85,6 +86,13 @@ ATTEMPT_FIELDS = [
     "l2cap_tx_retries", "l2cap_tx_wait_ms", "l2cap_rx_overflows",
     "client_cpu_cycles", "client_cycle_hz", "client_cpu_ms",
     "client_cpu_usage_percent", "system_cpu_usage_percent",
+    *[f"{phase}_cpu_ms" for phase in TLS_PHASES],
+    *[f"{phase}_lsu_cycles" for phase in TLS_PHASES],
+    *[f"{phase}_cpi_cycles" for phase in TLS_PHASES],
+    *[f"{phase}_heap_peak_bytes" for phase in TLS_PHASES],
+    *[f"{phase}_thread_main_cpu_percent" for phase in TLS_PHASES],
+    *[f"{phase}_thread_idle_cpu_percent" for phase in TLS_PHASES],
+    "dwt_counters_supported", "dwt_wrap_risk",
     "client_icache_hits", "client_icache_misses", "client_icache_requests",
     "client_icache_hit_percent", "client_icache_miss_percent",
     "client_memory_access_counters_supported",
@@ -118,6 +126,13 @@ SUMMARY_FIELDS = [
     "handshake_throughput_hps", "mean_mqtt_connect_ms", "mean_full_connect_ms",
     "mean_end_to_end_ms", "connections_per_second", "mean_client_cpu_ms",
     "mean_client_cpu_usage_percent", "mean_system_cpu_usage_percent",
+    *[f"mean_{phase}_cpu_ms" for phase in TLS_PHASES],
+    *[f"mean_{phase}_lsu_cycles" for phase in TLS_PHASES],
+    *[f"mean_{phase}_cpi_cycles" for phase in TLS_PHASES],
+    *[f"max_{phase}_heap_peak_bytes" for phase in TLS_PHASES],
+    *[f"mean_{phase}_thread_main_cpu_percent" for phase in TLS_PHASES],
+    *[f"mean_{phase}_thread_idle_cpu_percent" for phase in TLS_PHASES],
+    "dwt_counters_supported", "dwt_wrap_risk",
     "mean_client_icache_hits", "mean_client_icache_misses",
     "mean_client_icache_requests", "mean_client_icache_hit_percent",
     "mean_client_icache_miss_percent",
@@ -581,7 +596,7 @@ def run_job(
         if icache_hits is not None and icache_misses is not None else None
     )
     status = final.get("status", "fail").lower()
-    return {
+    row = {
         "attempt_index": attempt_index,
         "schedule_index": job.sequence,
         "session": job.session,
@@ -722,6 +737,26 @@ def run_job(
         "_fatal": final.get("fatal", ""),
         "_fatal_message": final.get("fatal_message", ""),
     }
+    for phase in TLS_PHASES:
+        row[f"{phase}_cpu_ms"] = microseconds_as_milliseconds(
+            final, f"{phase}_cpu_us"
+        )
+        row[f"{phase}_lsu_cycles"] = final.get(f"{phase}_lsu_cycles", "")
+        row[f"{phase}_cpi_cycles"] = final.get(f"{phase}_cpi_cycles", "")
+        row[f"{phase}_heap_peak_bytes"] = final.get(
+            f"{phase}_heap_peak_bytes", ""
+        )
+        main_bp = number(final, f"{phase}_thread_main_cpu_bp")
+        idle_bp = number(final, f"{phase}_thread_idle_cpu_bp")
+        row[f"{phase}_thread_main_cpu_percent"] = (
+            f"{main_bp / 100.0:.2f}" if main_bp is not None else ""
+        )
+        row[f"{phase}_thread_idle_cpu_percent"] = (
+            f"{idle_bp / 100.0:.2f}" if idle_bp is not None else ""
+        )
+    row["dwt_counters_supported"] = final.get("dwt_counters_supported", "")
+    row["dwt_wrap_risk"] = final.get("dwt_wrap_risk", "")
+    return row
 
 
 def summarize(case: dict[str, str], attempts: list[dict[str, object]]) -> dict[str, object]:
@@ -773,6 +808,20 @@ def summarize(case: dict[str, str], attempts: list[dict[str, object]]) -> dict[s
     heap_peak_percent = successful_numbers("client_heap_peak_usage_percent")
     rx_ring_peak = successful_numbers("l2cap_rx_ring_peak_bytes")
     rx_ring_percent = successful_numbers("l2cap_rx_ring_peak_percent")
+    tls_phase_summary: dict[str, str] = {}
+    for phase in TLS_PHASES:
+        for metric in ("cpu_ms", "lsu_cycles", "cpi_cycles",
+                       "thread_main_cpu_percent", "thread_idle_cpu_percent"):
+            values = successful_numbers(f"{phase}_{metric}")
+            tls_phase_summary[f"mean_{phase}_{metric}"] = (
+                f"{sum(values) / len(values):.3f}" if values else ""
+            )
+        values = successful_numbers(f"{phase}_heap_peak_bytes")
+        tls_phase_summary[f"max_{phase}_heap_peak_bytes"] = (
+            f"{max(values):.0f}" if values else ""
+        )
+    dwt_supported = [str(row.get("dwt_counters_supported", "")) for row in success]
+    dwt_wrap = [str(row.get("dwt_wrap_risk", "")) for row in success]
 
     def first_successful(field: str) -> object:
         return success[0][field] if success and success[0][field] != "" else ""
@@ -838,6 +887,13 @@ def summarize(case: dict[str, str], attempts: list[dict[str, object]]) -> dict[s
         "mean_system_cpu_usage_percent": (
             f"{sum(system_cpu_usage) / len(system_cpu_usage):.3f}"
             if system_cpu_usage else ""
+        ),
+        **tls_phase_summary,
+        "dwt_counters_supported": (
+            "1" if "1" in dwt_supported else "0" if any(dwt_supported) else ""
+        ),
+        "dwt_wrap_risk": (
+            "1" if "1" in dwt_wrap else "0" if any(dwt_wrap) else ""
         ),
         "mean_client_icache_hits": (
             f"{sum(icache_hits) / len(icache_hits):.3f}" if icache_hits else ""
@@ -1442,22 +1498,6 @@ def main() -> int:
         pqm4_dir = WORK / "pqm4"
         print(f"[firmware] Preparing pinned pqm4 sources in {pqm4_dir}...", flush=True)
         ensure_pqm4(pqm4_dir, run_dir / "build.log")
-    normal_build_ready = (build_dir / "zephyr/zephyr.hex").exists()
-    if (
-        supported
-        and not args.skip_build
-        and not (resuming and normal_build_ready)
-    ):
-        print(f"[firmware] Building universal image; log={run_dir / 'build.log'}", flush=True)
-        build_firmware(
-            firmware_dir=ROOT / "firmware", build_dir=build_dir,
-            generated_dir=normal_generated_dir, log=run_dir / "build.log",
-            nrfutil=args.nrfutil, ncs_version=args.ncs_version,
-            ncs_chdir=args.ncs_chdir, board=args.board,
-            mlkem_backend=args.mlkem_backend, pqm4_dir=pqm4_dir,
-            large_rsa=False,
-            power_markers=args.power_profiler,
-        )
     if supported and not args.skip_build:
         for profile in profiles:
             build_dir = profile_build_dirs[profile]
@@ -1477,6 +1517,7 @@ def main() -> int:
                 ncs_chdir=args.ncs_chdir, board=args.board,
                 mlkem_backend=args.mlkem_backend, pqm4_dir=pqm4_dir,
                 large_rsa=False,
+                power_markers=args.power_profiler,
             )
         print("[firmware] Build completed.", flush=True)
     first_build_dir = profile_build_dirs[profiles[0]]

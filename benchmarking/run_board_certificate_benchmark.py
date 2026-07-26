@@ -33,6 +33,8 @@ ROOT = Path(__file__).resolve().parent
 RESULTS = ROOT / "results"
 WORK = ROOT / "work"
 SLOW_SIGNATURE_TIMEOUT_SEC = 2000.0
+PHASES = ["keygen", "make_cert", "sign_cert", "parse_cert", "key_export"]
+PHASE_THREAD_BUCKETS = ["main", "sysworkq", "bt_rx", "bt_tx", "idle", "other"]
 
 ATTEMPT_FIELDS = [
     "attempt_index", "component", "owner", "cert_sig_alg", "builder",
@@ -44,6 +46,14 @@ ATTEMPT_FIELDS = [
     "thread_other_cpu_percent", "keygen_cpu_ms", "make_cert_cpu_ms",
     "sign_cert_cpu_ms", "parse_cert_cpu_ms", "key_export_cpu_ms",
     "phase_cpu_total_ms", "phase_cpu_verify",
+    *[f"{phase}_wall_ms" for phase in PHASES],
+    *[
+        f"{phase}_thread_{bucket}_cpu_percent"
+        for bucket in PHASE_THREAD_BUCKETS
+        for phase in PHASES
+    ],
+    *[f"{phase}_heap_current_bytes" for phase in PHASES],
+    *[f"{phase}_heap_peak_bytes" for phase in PHASES],
     "keygen_lsu_cycles", "make_cert_lsu_cycles", "sign_cert_lsu_cycles",
     "parse_cert_lsu_cycles", "key_export_lsu_cycles",
     "phase_lsu_total_cycles", "keygen_cpi_cycles",
@@ -69,6 +79,15 @@ SUMMARY_FIELDS = [
     "mean_thread_idle_cpu_percent", "mean_thread_other_cpu_percent",
     "mean_sign_cert_cpu_ms", "mean_parse_cert_cpu_ms",
     "mean_key_export_cpu_ms", "mean_phase_cpu_total_ms",
+    *[f"mean_{phase}_wall_ms" for phase in PHASES],
+    *[
+        f"mean_{phase}_thread_{bucket}_cpu_percent"
+        for bucket in PHASE_THREAD_BUCKETS
+        for phase in PHASES
+    ],
+    *[f"max_{phase}_heap_peak_bytes" for phase in PHASES],
+    *[f"mean_{phase}_lsu_cycles" for phase in PHASES],
+    *[f"mean_{phase}_cpi_cycles" for phase in PHASES],
     "phase_cpu_verify", "mean_phase_lsu_total_cycles",
     "mean_phase_cpi_total_cycles", "max_phase_dwt_samples",
     "dwt_counters_supported", "dwt_wrap_risk", "max_client_heap_peak_bytes",
@@ -137,7 +156,7 @@ def wait_for_certgen_result(
 
 def attempt_row(values: dict[str, str]) -> dict[str, object]:
     status = values.get("status", "fail")
-    return {
+    row = {
         "attempt_index": 1,
         "component": "client_certificate",
         "owner": "client",
@@ -204,6 +223,17 @@ def attempt_row(values: dict[str, str]) -> dict[str, object]:
         "error_code": values.get("error", ""),
         "message": "" if status == "success" else values.get("stage", ""),
     }
+    for phase in PHASES:
+        row[f"{phase}_wall_ms"] = values.get(f"{phase}_wall_ms", "")
+        row[f"{phase}_heap_current_bytes"] = values.get(
+            f"{phase}_heap_current_bytes", ""
+        )
+        row[f"{phase}_heap_peak_bytes"] = values.get(f"{phase}_heap_peak_bytes", "")
+        for bucket in PHASE_THREAD_BUCKETS:
+            row[f"{phase}_thread_{bucket}_cpu_percent"] = bp_to_percent(
+                values.get(f"{phase}_thread_{bucket}_cpu_bp")
+            )
+    return row
 
 
 def unsupported_row(signature: str, message: str) -> dict[str, object]:
@@ -230,7 +260,7 @@ def serial_timeout_for(signature: str, requested: float) -> float:
 
 def summarize(row: dict[str, object]) -> list[dict[str, object]]:
     success = row["status"] == "success"
-    return [{
+    summary = {
         "component": row["component"],
         "owner": row["owner"],
         "cert_sig_alg": row["cert_sig_alg"],
@@ -281,7 +311,23 @@ def summarize(row: dict[str, object]) -> list[dict[str, object]]:
         ),
         "client_cert_der_bytes": row["client_cert_der_bytes"] if success else "",
         "client_key_der_bytes": row["client_key_der_bytes"] if success else "",
-    }]
+    }
+    for phase in PHASES:
+        summary[f"mean_{phase}_wall_ms"] = row[f"{phase}_wall_ms"] if success else ""
+        summary[f"max_{phase}_heap_peak_bytes"] = (
+            row[f"{phase}_heap_peak_bytes"] if success else ""
+        )
+        summary[f"mean_{phase}_lsu_cycles"] = (
+            row[f"{phase}_lsu_cycles"] if success else ""
+        )
+        summary[f"mean_{phase}_cpi_cycles"] = (
+            row[f"{phase}_cpi_cycles"] if success else ""
+        )
+        for bucket in PHASE_THREAD_BUCKETS:
+            summary[f"mean_{phase}_thread_{bucket}_cpu_percent"] = (
+                row[f"{phase}_thread_{bucket}_cpu_percent"] if success else ""
+            )
+    return [summary]
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
