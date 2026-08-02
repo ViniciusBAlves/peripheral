@@ -84,8 +84,8 @@ struct config {
     bool reset_adapter;
     bool disable_wifi;
     bool wifi_disabled;
-    bool mtls_mode;
-    const char *client_identity;
+    const char *root_signature;
+    const char *leaf_signature;
 };
 
 struct command_result {
@@ -161,11 +161,13 @@ static int handle_control_frame(struct control_state *state,
 
     if (flags & CONTROL_FLAG_END) {
         if (memmem(state->pending, state->pending_len,
-                   "[BENCH_IDENTITY] status=ready", 29) != NULL) {
+                   "[BENCH_PKI] status=ready",
+                   sizeof("[BENCH_PKI] status=ready") - 1) != NULL) {
             state->identity_ready = true;
         }
         if (memmem(state->pending, state->pending_len,
-                   "[BENCH_IDENTITY] status=error", 29) != NULL) {
+                   "[BENCH_PKI] status=error",
+                   sizeof("[BENCH_PKI] status=error") - 1) != NULL) {
             state->identity_error = true;
         }
         fwrite(state->pending, 1, state->pending_len, stdout);
@@ -203,8 +205,8 @@ static void usage(const char *program)
             "  --no-acl-prime               Skip bluetoothctl connect before L2CAP\n"
             "  --reset-adapter              Power-cycle the adapter before scanning\n"
             "  --disable-wifi               Disable Pi Wi-Fi while BLE bridge runs\n"
-            "  --mtls                       Select a client identity for mTLS\n"
-            "  --client-identity NAME       Benchmark certificate identity\n",
+            "  --root-signature NAME        Trusted root selected for this case\n"
+            "  --leaf-signature NAME        Expected TLS CertificateVerify leaf\n",
             program);
 }
 
@@ -236,8 +238,8 @@ static int parse_args(int argc, char **argv, struct config *cfg)
         .reset_adapter = false,
         .disable_wifi = false,
         .wifi_disabled = false,
-        .mtls_mode = false,
-        .client_identity = NULL,
+        .root_signature = NULL,
+        .leaf_signature = NULL,
     };
 
     for (int i = 1; i < argc; i++) {
@@ -284,10 +286,10 @@ static int parse_args(int argc, char **argv, struct config *cfg)
             cfg->reset_adapter = true;
         } else if (!strcmp(argv[i], "--disable-wifi")) {
             cfg->disable_wifi = true;
-        } else if (!strcmp(argv[i], "--mtls")) {
-            cfg->mtls_mode = true;
-        } else if (!strcmp(argv[i], "--client-identity") && i + 1 < argc) {
-            cfg->client_identity = argv[++i];
+        } else if (!strcmp(argv[i], "--root-signature") && i + 1 < argc) {
+            cfg->root_signature = argv[++i];
+        } else if (!strcmp(argv[i], "--leaf-signature") && i + 1 < argc) {
+            cfg->leaf_signature = argv[++i];
         } else if (!strcmp(argv[i], "--help")) {
             usage(argv[0]);
             exit(0);
@@ -707,25 +709,25 @@ static int send_l2cap_sdu(int fd, const uint8_t *data, size_t length)
     return -1;
 }
 
-static int select_client_identity(int ble_fd, const struct config *cfg)
+static int select_pki_profile(int ble_fd, const struct config *cfg)
 {
     uint8_t frame[256] = {'B', 'C', 'T', 'L', '1',
                           CONTROL_FLAG_START | CONTROL_FLAG_END, 1, 0};
     uint8_t received[BRIDGE_RECV_BUFFER_SIZE];
     struct control_state control = {0};
-    const char *identity = cfg->client_identity;
+    const char *root = cfg->root_signature;
+    const char *leaf = cfg->leaf_signature;
     int payload_len;
     double deadline;
 
-    if (identity == NULL || identity[0] == '\0') {
-        fprintf(stderr, "[-] --client-identity is required\n");
+    if (root == NULL || root[0] == '\0' || leaf == NULL || leaf[0] == '\0') {
+        fprintf(stderr, "[-] --root-signature and --leaf-signature are required\n");
         return -1;
     }
     payload_len = snprintf(
         (char *)frame + CONTROL_HEADER_SIZE,
         sizeof(frame) - CONTROL_HEADER_SIZE,
-        "[BENCH_SELECT] mtls=%d identity=%s",
-        cfg->mtls_mode ? 1 : 0, identity);
+        "[BENCH_SELECT] root=%s leaf=%s", root, leaf);
     if (payload_len <= 0 ||
         (size_t)payload_len >= sizeof(frame) - CONTROL_HEADER_SIZE ||
         send_l2cap_sdu(
@@ -760,7 +762,7 @@ static int select_client_identity(int ble_fd, const struct config *cfg)
         }
     }
     free(control.pending);
-    fprintf(stderr, "[-] Client identity selection was not acknowledged\n");
+    fprintf(stderr, "[-] PKI profile selection was not acknowledged\n");
     return -1;
 }
 
@@ -1078,7 +1080,7 @@ int main(int argc, char **argv)
     printf("[BENCH_GATEWAY] ble_l2cap_connect_ms=%.3f\n",
            monotonic_ms() - l2cap_start_ms);
 
-    if (select_client_identity(ble_fd, &cfg) != 0) {
+    if (select_pki_profile(ble_fd, &cfg) != 0) {
         close(ble_fd);
         if (cfg.wifi_disabled) {
             set_wifi_enabled(true);

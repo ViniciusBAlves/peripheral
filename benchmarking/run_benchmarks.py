@@ -11,6 +11,7 @@ import os
 import random
 import re
 import shutil
+import subprocess
 import sys
 import time
 from collections import defaultdict
@@ -19,11 +20,14 @@ from pathlib import Path
 
 from benchmarklib.algorithms import (
     KEMS_BY_NAME,
+    PKI_CHAINS_BY_ID,
     SIGNATURES_BY_NAME,
     normalize_signature_scheme,
+    slug,
 )
 from benchmarklib.certificates import (
     ensure_image,
+    generate_client_identity,
     generate_server_case,
     generate_universal_header,
     write_case_configs,
@@ -31,6 +35,8 @@ from benchmarklib.certificates import (
 from benchmarklib.firmware import build as build_firmware
 from benchmarklib.firmware import ensure_pqm4
 from benchmarklib.firmware import flash as flash_firmware
+from benchmarklib.firmware import flash_usage
+from benchmarklib.firmware import reset as reset_firmware
 from benchmarklib.gateway import PiGateway
 from benchmarklib.metrics import aggregate, number, parse_bench_line
 from benchmarklib.power_profiler import (
@@ -69,6 +75,9 @@ FATAL_SERVER_LOG_PATTERNS = (
 ATTEMPT_FIELDS = [
     "attempt_index", "schedule_index", "session", "attempt_in_session", "warmup",
     "status", "reconnect_count", "mtls_mode", "mlkem_backend", "rsa_profile",
+    "firmware_profile", "pki_chain_id", "pki_kind", "root_sig_alg",
+    "intermediate_sig_alg", "leaf_sig_alg", "root_cert_der_bytes",
+    "intermediate_cert_der_bytes", "leaf_cert_der_bytes", "server_chain_bytes",
     "kex_group", "kex_nist_level",
     "kex_public_key_bytes", "kex_ciphertext_bytes", "kex_shared_secret_bytes",
     "cert_sig_alg", "sig_nist_level", "sig_public_key_bytes",
@@ -116,6 +125,9 @@ ATTEMPT_FIELDS = [
 
 SUMMARY_FIELDS = [
     "case_id", "mtls_mode", "mlkem_backend", "rsa_profile",
+    "firmware_profile", "pki_chain_id", "pki_kind", "root_sig_alg",
+    "intermediate_sig_alg", "leaf_sig_alg", "root_cert_der_bytes",
+    "intermediate_cert_der_bytes", "leaf_cert_der_bytes", "server_chain_bytes",
     "kex_group", "kex_nist_level",
     "kex_public_key_bytes",
     "kex_ciphertext_bytes", "kex_shared_secret_bytes", "cert_sig_alg",
@@ -179,10 +191,39 @@ def write_csv(path: Path, fields: list[str], rows: list[dict[str, object]]) -> N
         writer.writerows(rows)
 
 
+def normalize_case_pki(row: dict[str, str]) -> dict[str, str]:
+    """Upgrade a legacy row to homogeneous three-tier PKI metadata."""
+    case_id = row["case_id"]
+    leaf = row.get("leaf_sig_alg") or row["cert_sig_alg"]
+    root = row.get("root_sig_alg") or leaf
+    intermediate = row.get("intermediate_sig_alg") or leaf
+    if root not in SIGNATURES_BY_NAME or leaf not in SIGNATURES_BY_NAME:
+        raise ValueError(f"{case_id}: unknown PKI signature")
+    if intermediate != leaf:
+        raise ValueError(f"{case_id}: intermediate and leaf algorithms must match")
+    row["root_sig_alg"] = root
+    row["intermediate_sig_alg"] = intermediate
+    row["leaf_sig_alg"] = leaf
+    row["pki_kind"] = row.get("pki_kind") or (
+        "homogeneous" if root == leaf else "heavy_root"
+    )
+    row["pki_chain_id"] = row.get("pki_chain_id") or (
+        f"homogeneous_{slug(leaf)}" if root == leaf else
+        f"root_{slug(root)}__leaf_{slug(leaf)}"
+    )
+    if row["cert_sig_alg"] != leaf:
+        raise ValueError(f"{case_id}: cert_sig_alg must describe the leaf")
+    return row
+
+
 def read_cases(path: Path) -> list[dict[str, str]]:
     with path.open(newline="") as stream:
         reader = csv.DictReader(stream)
-        missing = set(INPUT_FIELDS) - set(reader.fieldnames or ())
+        pki_fields = {
+            "pki_chain_id", "pki_kind", "root_sig_alg",
+            "intermediate_sig_alg", "leaf_sig_alg",
+        }
+        missing = (set(INPUT_FIELDS) - pki_fields) - set(reader.fieldnames or ())
         if missing:
             raise ValueError(f"case CSV is missing fields: {', '.join(sorted(missing))}")
         rows = [dict(row) for row in reader if row.get("enabled", "").lower() in {"1", "true", "yes"}]
@@ -196,6 +237,7 @@ def read_cases(path: Path) -> list[dict[str, str]]:
             raise ValueError(f"{case_id}: unknown KEM {row['kex_group']}")
         if row["cert_sig_alg"] not in SIGNATURES_BY_NAME:
             raise ValueError(f"{case_id}: unknown signature {row['cert_sig_alg']}")
+        normalize_case_pki(row)
         if int(row["iterations"]) < 1 or int(row["warmup_iterations"]) < 0:
             raise ValueError(f"{case_id}: invalid iteration counts")
     if not rows:
@@ -219,7 +261,10 @@ def load_manifest_cases(run_dir: Path) -> list[dict[str, str]]:
             csv.DictReader(stream),
             key=lambda row: int(row["sequence"]),
         )
-    return [{field: row[field] for field in INPUT_FIELDS} for row in rows]
+    return [
+        normalize_case_pki({field: row.get(field, "") for field in INPUT_FIELDS})
+        for row in rows
+    ]
 
 
 def load_session_jobs(run_dir: Path) -> list[SessionJob]:
@@ -270,6 +315,7 @@ def write_checkpoint(
     execution_order: int,
     total_jobs: int,
     job: SessionJob,
+    firmware_profile: str = "",
 ) -> None:
     path = run_dir / "checkpoint.json"
     temporary = path.with_suffix(".json.tmp")
@@ -283,6 +329,7 @@ def write_checkpoint(
         "case_id": job.case_id,
         "session": job.session,
         "attempt_in_session": job.attempt_in_session,
+        "firmware_profile": firmware_profile,
         "updated_at": datetime.now().astimezone().isoformat(),
     }
     temporary.write_text(json.dumps(payload, indent=2) + "\n")
@@ -298,10 +345,55 @@ def case_metadata(case: dict[str, str]) -> dict[str, str]:
             "sig_signature_bytes",
         )
     }
+    metadata.update({
+        key: case.get(key, "") for key in (
+            "firmware_profile", "pki_chain_id", "pki_kind", "root_sig_alg",
+            "intermediate_sig_alg", "leaf_sig_alg",
+        )
+    })
     metadata["expected_certificate_verify_alg"] = normalize_signature_scheme(
         case.get("certificate_verify_alg", ""), case["cert_sig_alg"]
     )
     return metadata
+
+
+def pack_root_profiles(
+    root_sizes: dict[str, int], capacity: int,
+) -> list[set[str]]:
+    """Pack public roots largest-first while preserving the flash margin."""
+    profiles: list[tuple[int, set[str]]] = []
+    for root, size in sorted(root_sizes.items(), key=lambda item: (-item[1], item[0])):
+        for index, (used, members) in enumerate(profiles):
+            if used + size <= capacity:
+                members.add(root)
+                profiles[index] = (used + size, members)
+                break
+        else:
+            if size > capacity:
+                raise RuntimeError(
+                    f"root {root} ({size} bytes) exceeds profile capacity {capacity}"
+                )
+            profiles.append((size, {root}))
+    return [members for _used, members in profiles]
+
+
+def group_jobs_by_firmware_profile(
+    jobs: list[SessionJob], cases: dict[str, dict[str, str]], seed: int,
+) -> list[SessionJob]:
+    """Shuffle profiles and their blocks once, avoiding repeated reflashes."""
+    grouped: dict[str, list[SessionJob]] = defaultdict(list)
+    for job in jobs:
+        grouped[cases[job.case_id]["firmware_profile"]].append(job)
+    if len(grouped) == 1:
+        return jobs
+    rng = random.Random(seed)
+    profile_names = sorted(grouped)
+    rng.shuffle(profile_names)
+    ordered: list[SessionJob] = []
+    for profile in profile_names:
+        rng.shuffle(grouped[profile])
+        ordered.extend(grouped[profile])
+    return ordered
 
 
 def needs_large_rsa_firmware(case: dict[str, str]) -> bool:
@@ -309,7 +401,10 @@ def needs_large_rsa_firmware(case: dict[str, str]) -> bool:
 
 
 def is_rsa_pss_case(case: dict[str, str]) -> bool:
-    return bool(re.fullmatch(r"RSA-PSS-\d+", case["cert_sig_alg"]))
+    return any(
+        re.fullmatch(r"RSA-PSS-\d+", case.get(key, ""))
+        for key in ("root_sig_alg", "cert_sig_alg")
+    )
 
 
 def parse_gateway_metrics(path: Path) -> dict[str, str]:
@@ -466,7 +561,8 @@ def wait_for_board_ready(serial_port, board_log: Path, timeout: float) -> None:
 def timeout_for_case(case: dict[str, str], override: float | None) -> float:
     if override is not None:
         return override
-    signature = case["cert_sig_alg"]
+    signatures = (case.get("root_sig_alg") or case["cert_sig_alg"], case["cert_sig_alg"])
+    signature = max(signatures, key=lambda item: SIGNATURES_BY_NAME[item].signature_bytes)
     if signature.startswith("SLH-DSA-SHAKE-256"):
         timeout = 180.0
     elif signature.startswith("SLH-DSA-SHAKE-192"):
@@ -569,12 +665,13 @@ def run_job(
                 server_backend=server_backend,
                 wolfssl_group=KEMS_BY_NAME[case["kex_group"]].wolfssl_group,
                 control_telemetry=getattr(args, "power_profiler", False),
-                mtls_mode=getattr(args, "mtls_mode", False),
-                client_identity=case["cert_sig_alg"],
+                root_signature=case.get("root_sig_alg") or case["cert_sig_alg"],
+                leaf_signature=case.get("leaf_sig_alg") or case["cert_sig_alg"],
                 signature_scheme=SIGNATURES_BY_NAME[
                     case["cert_sig_alg"]
                 ].tls_signature_scheme,
                 tls_timeout_sec=attempt_timeout,
+                mtls_mode=getattr(args, "mtls_mode", False),
                 )
                 remote_broker_log = f"{gateway.workdir}/logs/{case['case_id']}.broker.log"
                 fatal_detector = lambda: gateway.remote_file_contains(
@@ -617,6 +714,23 @@ def run_job(
                                 "stage": "board_rearm",
                                 "error": "timeout",
                             }
+
+            if (
+                final.get("stage") == "ble_l2cap_ready_timeout"
+                and serial_port is not None
+                and retry < args.reconnect_retries
+            ):
+                try:
+                    reset_firmware(
+                        log=case_dir / "reset.log", nrfutil=args.nrfutil
+                    )
+                    serial_port.reset_input_buffer()
+                    wait_for_board_ready(
+                        serial_port, board_log, args.board_ready_timeout_sec
+                    )
+                except (OSError, subprocess.CalledProcessError, TimeoutError) as error:
+                    with (case_dir / "reset.log").open("a") as stream:
+                        stream.write(f"[recovery] board reset failed: {error}\n")
         finally:
             if power_capture is not None and retry_trace is not None:
                 power_values = power_capture.stop(retry_trace)
@@ -650,14 +764,15 @@ def run_job(
     )
     observed_scheme = final.get("certificate_verify_alg", "")
     client_scheme = final.get("client_certificate_verify_alg", "")
-    scheme_match = (
-        observed_scheme == expected_scheme and
-        (not getattr(args, "mtls_mode", False) or client_scheme == observed_scheme)
-    )
+    scheme_match = observed_scheme == expected_scheme
     if status == "success" and not scheme_match:
         status = "fail"
         final["stage"] = "certificate_verify_mismatch"
         final["error"] = "certificate_verify_mismatch"
+    def generated_size(name: str) -> int | str:
+        path = case_dir / "generated" / name
+        return path.stat().st_size if path.exists() else ""
+
     return {
         "attempt_index": attempt_index,
         "schedule_index": job.sequence,
@@ -667,7 +782,17 @@ def run_job(
         "status": status,
         "reconnect_count": reconnect_count,
         "mtls_mode": int(getattr(args, "mtls_mode", False)),
+        "firmware_profile": case.get("firmware_profile", "universal"),
         **case_metadata(case),
+        "root_cert_der_bytes": generated_size("server_root.der"),
+        "intermediate_cert_der_bytes": generated_size("server_intermediate.der"),
+        "leaf_cert_der_bytes": generated_size("server.der"),
+        "server_chain_bytes": (
+            int(generated_size("server.der")) +
+            int(generated_size("server_intermediate.der"))
+            if generated_size("server.der") != "" and
+            generated_size("server_intermediate.der") != "" else ""
+        ),
         "certificate_verify_alg": observed_scheme,
         "certificate_verify_scheme_id":
             final.get("certificate_verify_scheme_id", ""),
@@ -917,6 +1042,12 @@ def summarize(case: dict[str, str], attempts: list[dict[str, object]]) -> dict[s
             attempts[0].get("mtls_mode", "") if attempts else ""
         ),
         **case_metadata(case),
+        "root_cert_der_bytes": first_successful("root_cert_der_bytes"),
+        "intermediate_cert_der_bytes": first_successful(
+            "intermediate_cert_der_bytes"
+        ),
+        "leaf_cert_der_bytes": first_successful("leaf_cert_der_bytes"),
+        "server_chain_bytes": first_successful("server_chain_bytes"),
         "certificate_verify_alg": first_successful(
             "certificate_verify_alg"
         ),
@@ -1228,6 +1359,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--skip-build", action="store_true")
     parser.add_argument("--skip-flash", action="store_true")
+    parser.add_argument(
+        "--mtls-mode",
+        action="store_true",
+        help="require and verify the board's fixed ECDSA P-256 client certificate",
+    )
     parser.add_argument("--sessions-per-case", type=int, default=2)
     parser.add_argument("--reconnect-retries", type=int, default=3)
     parser.add_argument("--reconnect-delay-sec", type=float, default=5.0)
@@ -1280,7 +1416,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--disable-pi-wifi",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="disable Raspberry Pi Wi-Fi while each BLE bridge session runs",
+        help="keep Raspberry Pi Wi-Fi disabled for the complete benchmark run",
     )
     parser.add_argument("--nrfutil", default=default_nrfutil())
     parser.add_argument("--ncs-version", default=DEFAULT_NCS_VERSION)
@@ -1297,11 +1433,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         choices=SERVER_BACKEND_CHOICES,
         default="auto",
         help="server TLS backend selection",
-    )
-    parser.add_argument(
-        "--mtls-mode",
-        action="store_true",
-        help="require and verify the board client certificate during TLS",
     )
     args = parser.parse_args(argv)
     if args.power_profiler:
@@ -1367,7 +1498,7 @@ def main() -> int:
             saved_config = json.loads(saved_config_path.read_text())
             args.mlkem_backend = saved_config["mlkem_backend"]
             args.server_backend = saved_config["server_backend"]
-            args.mtls_mode = saved_config.get("mtls_mode", False)
+            args.mtls_mode = bool(saved_config.get("mtls_mode", False))
             args.power_profiler = saved_config.get("power_profiler", False)
             if args.power_profiler:
                 raise ValueError(
@@ -1406,6 +1537,8 @@ def main() -> int:
             cases = cases[:args.limit]
         if not cases:
             raise ValueError("no cases selected")
+        for case in cases:
+            case["firmware_profile"] = "universal"
         run_id = args.run_id or f"{datetime.now():%Y%m%d_%H%M%S}_{seed}"
         run_dir = RESULTS / run_id
         if run_dir.exists():
@@ -1418,12 +1551,22 @@ def main() -> int:
             "mlkem_backend": args.mlkem_backend,
             "server_backend": args.server_backend,
             "mtls_mode": args.mtls_mode,
+            "pki_layout": "three-tier-v1",
             "power_profiler": args.power_profiler,
             "power_profiler_mode": "source" if args.power_profiler else "disabled",
             "power_profiler_serial_device": args.power_profiler_serial_device,
             "power_profiler_vdd_mv": args.power_profiler_vdd_mv,
             "power_profiler_output_samples_per_second":
                 args.power_profiler_output_samples_per_second,
+            "firmware_profiles": {
+                "roots": {"universal": sorted({
+                    case["root_sig_alg"] for case in cases
+                })},
+                "case_to_profile": {
+                    case["case_id"]: "universal" for case in cases
+                },
+            },
+            "firmware_profiles_planned": False,
         }, indent=2) + "\n")
         shutil.copy2(args.cases, run_dir / "input_cases.csv")
         manifest = [
@@ -1447,6 +1590,7 @@ def main() -> int:
                 "attempt_in_session": job.attempt_in_session,
                 "warmup": job.warmup,
                 "measured_index": job.measured_index,
+                "firmware_profile": "universal",
                 "seed": seed,
             }
             for order, job in enumerate(jobs, 1)
@@ -1454,7 +1598,8 @@ def main() -> int:
         write_csv(
             run_dir / "session_manifest.csv",
             ["execution_order", "source_sequence", "case_id", "session",
-             "attempt_in_session", "warmup", "measured_index", "seed"],
+             "attempt_in_session", "warmup", "measured_index",
+             "firmware_profile", "seed"],
             session_rows,
         )
         (run_dir / "checkpoint.json").write_text(json.dumps({
@@ -1465,6 +1610,7 @@ def main() -> int:
             "case_id": None,
             "session": None,
             "attempt_in_session": None,
+            "firmware_profile": None,
             "updated_at": datetime.now().astimezone().isoformat(),
         }, indent=2) + "\n")
         last_completed_execution_order = 0
@@ -1517,29 +1663,43 @@ def main() -> int:
     print(f"[setup] Checking Docker OpenSSL/OQS image; log={docker_log}", flush=True)
     ensure_image(ROOT / "docker" / "Dockerfile.pqc", docker_log)
     generated_root = WORK / "generated" / run_id
-    client_dir = run_dir / "generated-client"
-    client_dir.mkdir(parents=True, exist_ok=True)
-    print("[setup] Preparing one direct-root PKI per signature...", flush=True)
+    client_dir = generated_root / "client-identity" if args.mtls_mode else None
+    if client_dir is not None:
+        print("[setup] Preparing fixed ECDSA P-256 client identity for mTLS...", flush=True)
+        generate_client_identity(client_dir, docker_log)
+    selected_chain_ids = list(dict.fromkeys(case["pki_chain_id"] for case in cases))
+    print(
+        f"[setup] Preparing {len(selected_chain_ids)} selected three-tier PKI chains...",
+        flush=True,
+    )
     supported: list[dict[str, str]] = []
     unsupported: dict[str, str] = {}
     server_backends: dict[str, str] = {}
-    signature_templates: dict[str, Path] = {}
-    for signature_name in SIGNATURES_BY_NAME:
-        template = generated_root / "identities" / signature_name
+    chain_templates: dict[str, Path] = {}
+    for chain_id in selected_chain_ids:
+        chain = PKI_CHAINS_BY_ID.get(chain_id)
+        if chain is None:
+            raise ValueError(f"unknown PKI chain: {chain_id}")
+        template = generated_root / "chains" / chain_id
         print(
-            f"[certificates] Preparing universal identity for {signature_name}...",
+            f"[certificates] Preparing chain {chain_id}...",
             flush=True,
         )
         generate_server_case(
             {
                 "kex_group": "ECDHE-P-256",
-                "cert_sig_alg": signature_name,
+                "pki_chain_id": chain.id,
+                "pki_kind": chain.kind,
+                "root_sig_alg": chain.root_sig_alg,
+                "intermediate_sig_alg": chain.intermediate_sig_alg,
+                "leaf_sig_alg": chain.leaf_sig_alg,
+                "cert_sig_alg": chain.leaf_sig_alg,
             },
             template,
-            client_dir,
             run_dir / "build.log",
+            client_dir=client_dir,
         )
-        signature_templates[signature_name] = template
+        chain_templates[chain_id] = template
 
     for case in cases:
         server_backend = server_backend_for_case(case, args.server_backend)
@@ -1551,7 +1711,7 @@ def main() -> int:
         server_backends[case["case_id"]] = server_backend
         try:
             generated = case_dirs[case["case_id"]] / "generated"
-            template = signature_templates[case["cert_sig_alg"]]
+            template = chain_templates[case["pki_chain_id"]]
             shutil.copytree(template, generated, dirs_exist_ok=True)
             write_case_configs(case, generated)
             supported.append(case)
@@ -1560,39 +1720,138 @@ def main() -> int:
 
     if not supported:
         raise RuntimeError("none of the selected cases passed certificate preparation")
-    normal_generated_dir = generated_root / "fast-math"
-    generate_universal_header(
-        client_dir,
-        [
-            (signature_name, template)
-            for signature_name, template in signature_templates.items()
-        ],
-        normal_generated_dir / "benchmark_credentials.h",
-    )
-    build_dir = WORK / "firmware-build" / run_id
+    chain_directory_list = list(chain_templates.items())
+    root_sizes = {
+        PKI_CHAINS_BY_ID[chain_id].root_sig_alg:
+            (chain_templates[chain_id] / "server_root.der").stat().st_size
+        for chain_id in selected_chain_ids
+    }
+    all_roots = set(root_sizes)
+    profile_roots: dict[str, set[str]] = {"universal": all_roots}
+    profile_build_dirs: dict[str, Path] = {}
     pqm4_dir = None
     if args.mlkem_backend.startswith("pqm4-"):
         pqm4_dir = WORK / "pqm4"
         print(f"[firmware] Preparing pinned pqm4 sources in {pqm4_dir}...", flush=True)
         ensure_pqm4(pqm4_dir, run_dir / "build.log")
-    normal_build_ready = (build_dir / "zephyr/zephyr.hex").exists()
-    if (
-        supported
-        and not args.skip_build
-        and not (resuming and normal_build_ready)
-    ):
-        print(f"[firmware] Building universal image; log={run_dir / 'build.log'}", flush=True)
-        build_firmware(
-            firmware_dir=ROOT / "firmware", build_dir=build_dir,
-            generated_dir=normal_generated_dir, log=run_dir / "build.log",
-            nrfutil=args.nrfutil, ncs_version=args.ncs_version,
-            ncs_chdir=args.ncs_chdir, board=args.board,
-            mlkem_backend=args.mlkem_backend, pqm4_dir=pqm4_dir,
-            large_rsa=False,
-            power_markers=False,
-            ble_telemetry=False,
+    saved_profiles = None
+    config_path = run_dir / "run_config.json"
+    if resuming and config_path.exists():
+        saved_config = json.loads(config_path.read_text())
+        if saved_config.get("firmware_profiles_planned", False):
+            saved_profiles = saved_config.get("firmware_profiles")
+    if saved_profiles:
+        profile_roots = {
+            name: set(values) for name, values in saved_profiles["roots"].items()
+        }
+
+    def build_profile(profile: str, roots: set[str]) -> Path:
+        generated_dir = generated_root / "firmware-profiles" / profile
+        generate_universal_header(
+            chain_directory_list,
+            generated_dir / "benchmark_credentials.h",
+            root_algorithms=roots,
+            client_dir=client_dir,
         )
-        print("[firmware] Build completed.", flush=True)
+        directory = WORK / "firmware-build" / run_id / profile
+        profile_build_dirs[profile] = directory
+        ready = any((directory / path).exists() for path in (
+            "zephyr/zephyr.hex", "firmware/zephyr/zephyr.hex", "merged.hex",
+        ))
+        if not args.skip_build and not (resuming and ready):
+            print(f"[firmware] Building profile {profile}; roots={len(roots)}", flush=True)
+            build_firmware(
+                firmware_dir=ROOT / "firmware", build_dir=directory,
+                generated_dir=generated_dir, log=run_dir / "build.log",
+                nrfutil=args.nrfutil, ncs_version=args.ncs_version,
+                ncs_chdir=args.ncs_chdir, board=args.board,
+                mlkem_backend=args.mlkem_backend, pqm4_dir=pqm4_dir,
+                large_rsa=False, power_markers=False, ble_telemetry=False,
+                mtls_mode=args.mtls_mode,
+            )
+        return directory
+
+    if not saved_profiles:
+        universal_dir = None
+        universal_error = None
+        try:
+            universal_dir = build_profile("universal", all_roots)
+            used, capacity = flash_usage(universal_dir)
+        except (subprocess.CalledProcessError, ValueError) as error:
+            universal_error = error
+            used = capacity = 0
+        if universal_dir is not None and capacity - used >= 32 * 1024:
+            print(
+                f"[firmware] Universal image uses {used}/{capacity} bytes; "
+                f"margin={capacity - used} bytes.", flush=True,
+            )
+        else:
+            probe_root = min(root_sizes, key=root_sizes.get)
+            probe_dir = build_profile("profile-probe", {probe_root})
+            probe_used, capacity = flash_usage(probe_dir)
+            base_used = probe_used - root_sizes[probe_root]
+            root_capacity = capacity - base_used - 32 * 1024
+            packed = pack_root_profiles(root_sizes, root_capacity)
+            profile_roots = {
+                f"profile-{index:02d}": roots
+                for index, roots in enumerate(packed, 1)
+            }
+            profile_build_dirs.clear()
+            for profile, roots in profile_roots.items():
+                build_profile(profile, roots)
+            print(
+                f"[firmware] Universal image lacked the 32 KiB margin; "
+                f"using {len(profile_roots)} profiles."
+                + (f" Initial build error: {universal_error}" if universal_error else ""),
+                flush=True,
+            )
+    else:
+        for profile, roots in profile_roots.items():
+            build_profile(profile, roots)
+
+    root_to_profile = {
+        root: profile for profile, roots in profile_roots.items() for root in roots
+    }
+    for case in cases:
+        case["firmware_profile"] = root_to_profile[case["root_sig_alg"]]
+    if len(profile_roots) > 1 and args.skip_flash:
+        raise ValueError("--skip-flash is unsafe when the trust bundle needs multiple profiles")
+    can_replan_schedule = not resuming or last_completed_execution_order == 0
+    if can_replan_schedule:
+        jobs = group_jobs_by_firmware_profile(jobs, case_by_id, seed)
+    scheduled_jobs = [
+        (order, job) for order, job in enumerate(jobs, 1)
+        if order > last_completed_execution_order
+    ]
+    if can_replan_schedule:
+        write_csv(
+            run_dir / "session_manifest.csv",
+            ["execution_order", "source_sequence", "case_id", "session",
+             "attempt_in_session", "warmup", "measured_index", "firmware_profile", "seed"],
+            [
+                {
+                    "execution_order": order, "source_sequence": job.sequence,
+                    "case_id": job.case_id, "session": job.session,
+                    "attempt_in_session": job.attempt_in_session,
+                    "warmup": job.warmup, "measured_index": job.measured_index,
+                    "firmware_profile": case_by_id[job.case_id]["firmware_profile"],
+                    "seed": seed,
+                }
+                for order, job in enumerate(jobs, 1)
+            ],
+        )
+    config = json.loads(config_path.read_text())
+    config["firmware_profiles"] = {
+        "roots": {name: sorted(roots) for name, roots in profile_roots.items()},
+        "case_to_profile": {
+            case["case_id"]: case["firmware_profile"] for case in cases
+        },
+    }
+    config["firmware_profiles_planned"] = True
+    config_path.write_text(json.dumps(config, indent=2) + "\n")
+
+    first_profile = case_by_id[scheduled_jobs[0][1].case_id]["firmware_profile"]
+    build_dir = profile_build_dirs[first_profile]
     if not args.skip_flash:
         print(
             f"[firmware] Flashing nRF5340 application and network cores; "
@@ -1673,9 +1932,13 @@ def main() -> int:
         )
         for case in supported
     }
+    if args.disable_pi_wifi:
+        print("[gateway] Disabling Raspberry Pi Wi-Fi for the complete run.", flush=True)
+        gateway.set_wifi_enabled(False, run_dir / "gateway.log")
 
     interrupted = False
     serial_port = None
+    active_profile = first_profile
     try:
         if not args.power_profiler:
             try:
@@ -1709,6 +1972,29 @@ def main() -> int:
         try:
             for execution_order, job in scheduled_jobs:
                 case = case_by_id[job.case_id]
+                required_profile = case["firmware_profile"]
+                if required_profile != active_profile:
+                    gateway.stop_session(run_dir / "gateway.log")
+                    if serial_port is not None and serial_port.is_open:
+                        serial_port.close()
+                    print(
+                        f"[firmware] Switching trust bundle {active_profile} -> "
+                        f"{required_profile}", flush=True,
+                    )
+                    flash_firmware(
+                        build_dir=profile_build_dirs[required_profile],
+                        log=run_dir / "flash.log", nrfutil=args.nrfutil,
+                        ncs_version=args.ncs_version, ncs_chdir=args.ncs_chdir,
+                    )
+                    serial_port = serial.Serial(
+                        args.serial_device, args.serial_baud, timeout=0.25
+                    )
+                    serial_port.reset_input_buffer()
+                    wait_for_board_ready(
+                        serial_port, run_dir / "board.log",
+                        args.board_ready_timeout_sec,
+                    )
+                    active_profile = required_profile
                 timeout = timeout_for_case(case, args.attempt_timeout_sec)
                 print(
                     f"[{execution_order}/{len(jobs)}] {job.case_id} "
@@ -1725,6 +2011,7 @@ def main() -> int:
                         "warmup": job.warmup,
                         "status": "unsupported",
                         "reconnect_count": 0,
+                        "mtls_mode": int(args.mtls_mode),
                         **case_metadata(case),
                         "message": unsupported[job.case_id],
                     }
@@ -1738,6 +2025,7 @@ def main() -> int:
                     )
                 row["mlkem_backend"] = args.mlkem_backend
                 row["rsa_profile"] = "fast-math"
+                row["firmware_profile"] = required_profile
                 attempts[job.case_id].append(row)
                 write_csv(
                     case_dirs[job.case_id] / "attempts.csv",
@@ -1748,6 +2036,7 @@ def main() -> int:
                     execution_order=execution_order,
                     total_jobs=len(jobs),
                     job=job,
+                    firmware_profile=required_profile,
                 )
         finally:
             if serial_port is not None and serial_port.is_open:
@@ -1758,6 +2047,8 @@ def main() -> int:
               flush=True)
     finally:
         gateway.stop_session(run_dir / "gateway.log")
+        if args.disable_pi_wifi:
+            gateway.set_wifi_enabled(True, run_dir / "gateway.log")
         if power_profiler_session is not None:
             power_profiler_session.close()
 

@@ -6,15 +6,16 @@ import shlex
 import shutil
 import subprocess
 import hashlib
+import json
 from pathlib import Path
 
 from .algorithms import KEMS_BY_NAME, SIGNATURES_BY_NAME, Signature, slug
 from .server_backends import HASH_BASED_SIGNATURES
 
 
-IMAGE = "peripheral-pqc-openssl:3.6"
+IMAGE = "peripheral-pqc-openssl:3.8"
 ROOT = Path(__file__).resolve().parents[1]
-CERT_CACHE = ROOT / "work" / "certificate-cache" / "v4-direct-root-mtls"
+CERT_CACHE = ROOT / "work" / "certificate-cache" / "v5-three-tier"
 LEGACY_CERT_CACHES = (ROOT / "work" / "certificate-cache" / "v1",)
 MIN_CACHE_VALID_SECONDS = 7 * 24 * 60 * 60
 CERT_NOT_BEFORE = "20200101000000Z"
@@ -126,35 +127,6 @@ def _copy_files(source: Path, destination: Path, names: tuple[str, ...]) -> None
         shutil.copy2(source / name, destination / name)
 
 
-def _shared_client_key(signature: Signature, log: Path) -> Path:
-    cache = (
-        CERT_CACHE / "client-keys" /
-        slug(signature.tls_signature_scheme)
-    )
-    required = ("client.key", "client_key.der")
-    if _all_present(cache, required):
-        return cache
-    shutil.rmtree(cache, ignore_errors=True)
-    cache.mkdir(parents=True, exist_ok=True)
-    key_args = _key_args(signature.leaf_key_type)
-    hash_arg = _hash_arg(signature.leaf_key_type)
-    _append_log(
-        log,
-        f"[cert-cache] Generating shared {signature.tls_signature_scheme} "
-        f"client key into {cache}",
-    )
-    _docker_script(
-        cache,
-        f"""
-openssl req -new {key_args} -keyout /out/client.key \
-  -out /out/client-key-only.csr -nodes -subj /CN=shared-client-key {hash_arg}
-openssl pkey -in /out/client.key -outform DER -out /out/client_key.der
-""",
-        log,
-    )
-    return cache
-
-
 def _cert_is_valid(path: Path, *, min_valid_seconds: int = MIN_CACHE_VALID_SECONDS) -> bool:
     if not path.exists():
         return False
@@ -185,7 +157,7 @@ def _digest_file(path: Path) -> str:
 
 
 def generate_client_identity(output: Path, log: Path) -> None:
-    """Generate the legacy host-only certificate benchmark trust anchor."""
+    """Generate the fixed ECDSA P-256 identity used by optional mTLS runs."""
     required = (
         "client_ca.crt", "client.crt", "client.key", "client_ca.der",
         "client_cert.der", "client_key.der", "server_root.crt",
@@ -223,109 +195,132 @@ openssl x509 -in /out/server_root.crt -outform DER -out /out/server_root.der
     _docker_script(output, script, log)
 
 
-def generate_server_case(case: dict[str, str], output: Path, client_dir: Path, log: Path) -> None:
-    signature: Signature = SIGNATURES_BY_NAME[case["cert_sig_alg"]]
-    cached_required = (
-        "server_root.crt", "server_root.der", "server.crt", "server.key",
-        "server_chain.crt", "client_ca.crt", "client_ca.der", "client.crt",
-        "client.key", "client_cert.der", "client_key.der",
+def c_array(name: str, data: bytes) -> str:
+    rows = []
+    values = [f"0x{value:02x}" for value in data]
+    for offset in range(0, len(values), 12):
+        rows.append("    " + ", ".join(values[offset:offset + 12]))
+    return f"static const unsigned char {name}[] = {{\n" + ",\n".join(rows) + "\n};\n"
+
+
+# The normal server PKI remains independent from the optional fixed mTLS
+# client identity generated above.
+PUBLIC_CHAIN_FILES = (
+    "server_root.crt", "server_root.der", "server_intermediate.crt",
+    "server_intermediate.der", "server.crt", "server.der", "server.key",
+    "server_chain.crt",
+)
+
+
+def _case_algorithms(
+    case: dict[str, str],
+) -> tuple[Signature, Signature, Signature]:
+    root_name = case.get("root_sig_alg") or case["cert_sig_alg"]
+    intermediate_name = case.get("intermediate_sig_alg") or case["cert_sig_alg"]
+    leaf_name = case.get("leaf_sig_alg") or case["cert_sig_alg"]
+    return (
+        SIGNATURES_BY_NAME[root_name],
+        SIGNATURES_BY_NAME[intermediate_name],
+        SIGNATURES_BY_NAME[leaf_name],
     )
-    output_required = (
-        *cached_required, "client_ca.crt", "client_ca.der",
-        "openssl.cnf", "mosquitto.conf", "mosquitto-mtls.conf",
-    )
-    if (
-        _all_present(output, output_required)
-        and _cert_is_valid(output / "server_root.crt")
-        and _cert_is_valid(output / "server.crt")
-        and _cert_is_valid(output / "client.crt")
-    ):
-        write_case_configs(case, output)
+
+
+def _generate_openssl_root(signature: Signature, output: Path, log: Path) -> None:
+    required = ("server_root.crt", "server_root.der", "server_root.key")
+    if _all_present(output, required) and _cert_is_valid(output / "server_root.crt"):
         return
-    cache = CERT_CACHE / "identity" / slug(signature.name)
-    if (
-        _all_present(cache, cached_required)
-        and _cert_is_valid(cache / "server_root.crt")
-        and _cert_is_valid(cache / "server.crt")
-        and _cert_is_valid(cache / "client.crt")
-    ):
-        _append_log(log, f"[cert-cache] Reusing {signature.name} direct-root PKI from {cache}")
-        _copy_files(cache, output, cached_required)
-        write_case_configs(case, output)
-        return
-    _append_log(log, f"[cert-cache] Generating {signature.name} direct-root PKI into {cache}")
-    shutil.rmtree(cache, ignore_errors=True)
-    cache.mkdir(parents=True, exist_ok=True)
-    shared_key = _shared_client_key(signature, log)
-    shutil.copy2(shared_key / "client.key", cache / "client.key")
-    shutil.copy2(shared_key / "client_key.der", cache / "client_key.der")
-    issuer_args = _key_args(signature.issuer_key_type)
-    leaf_args = _key_args(signature.leaf_key_type)
-    issuer_hash = _hash_arg(signature.issuer_key_type)
-    leaf_hash = _hash_arg(signature.leaf_key_type)
-    issuer_sigopts = _signature_options(signature.issuer_key_type)
-    if signature.name in HASH_BASED_SIGNATURES:
-        generate_hash_based_server_case(signature.name, cache, client_dir, log)
-        _copy_files(cache, output, cached_required)
-        write_case_configs(case, output)
-        return
-    script = f"""
-printf 'basicConstraints=critical,CA:FALSE\\nkeyUsage=critical,digitalSignature,keyEncipherment\\nextendedKeyUsage=critical,serverAuth\\nsubjectAltName=DNS:localhost,IP:127.0.0.1\\nsubjectKeyIdentifier=hash\\nauthorityKeyIdentifier=keyid,issuer\\n' \
-  > /out/server.ext
-printf 'basicConstraints=critical,CA:FALSE\\nkeyUsage=critical,digitalSignature\\nextendedKeyUsage=critical,clientAuth\\nsubjectKeyIdentifier=hash\\nauthorityKeyIdentifier=keyid,issuer\\n' \
-  > /out/client.ext
-openssl req -x509 -new {issuer_args} -keyout /out/server_root.key \
-  -out /out/server_root.crt -nodes -subj /CN={signature.name}_Root \
+    shutil.rmtree(output, ignore_errors=True)
+    output.mkdir(parents=True, exist_ok=True)
+    _docker_script(output, f"""
+openssl req -x509 -new {_key_args(signature.issuer_key_type)} \
+  -keyout /out/server_root.key -out /out/server_root.crt -nodes \
+  -subj /CN={signature.name}_Root \
   -not_before {CERT_NOT_BEFORE} -not_after {CERT_NOT_AFTER} \
   -addext basicConstraints=critical,CA:TRUE \
-  -addext keyUsage=critical,keyCertSign,cRLSign {issuer_hash} {issuer_sigopts}
+  -addext keyUsage=critical,keyCertSign,cRLSign \
+  {_hash_arg(signature.issuer_key_type)} {_signature_options(signature.issuer_key_type)}
+openssl x509 -in /out/server_root.crt -outform DER -out /out/server_root.der
+""", log)
+
+
+def _generate_openssl_three_tier(
+    root: Signature,
+    intermediate: Signature,
+    leaf: Signature,
+    output: Path,
+    root_cache: Path,
+    log: Path,
+) -> None:
+    """Create root -> subordinate CA -> server leaf with no root in the chain."""
+    _generate_openssl_root(root, root_cache, log)
+    output.mkdir(parents=True, exist_ok=True)
+    for name in ("server_root.crt", "server_root.der", "server_root.key"):
+        shutil.copy2(root_cache / name, output / name)
+    intermediate_args = _key_args(intermediate.issuer_key_type)
+    intermediate_hash = _hash_arg(intermediate.issuer_key_type)
+    leaf_args = _key_args(leaf.leaf_key_type)
+    leaf_hash = _hash_arg(leaf.leaf_key_type)
+    _docker_script(output, f"""
+printf 'basicConstraints=critical,CA:TRUE\\nkeyUsage=critical,keyCertSign,cRLSign\\nsubjectKeyIdentifier=hash\\nauthorityKeyIdentifier=keyid,issuer\\n' > /out/intermediate.ext
+printf 'basicConstraints=critical,CA:FALSE\\nkeyUsage=critical,digitalSignature\\nextendedKeyUsage=critical,serverAuth\\nsubjectAltName=DNS:localhost,IP:127.0.0.1\\nsubjectKeyIdentifier=hash\\nauthorityKeyIdentifier=keyid,issuer\\n' > /out/server.ext
+openssl req -new {intermediate_args} -keyout /out/server_intermediate.key \
+  -out /out/server_intermediate.csr -nodes \
+  -subj /CN={intermediate.name}_Intermediate {intermediate_hash}
+openssl x509 -req -in /out/server_intermediate.csr -CA /out/server_root.crt \
+  -CAkey /out/server_root.key -CAcreateserial -out /out/server_intermediate.crt \
+  -not_before {CERT_NOT_BEFORE} -not_after {CERT_NOT_AFTER} \
+  -extfile /out/intermediate.ext {_hash_arg(root.issuer_key_type)} \
+  {_signature_options(root.issuer_key_type)}
 openssl req -new {leaf_args} -keyout /out/server.key -out /out/server.csr \
   -nodes -subj /CN=localhost {leaf_hash}
-openssl x509 -req -in /out/server.csr -CA /out/server_root.crt \
-  -CAkey /out/server_root.key -CAcreateserial -out /out/server.crt \
+openssl x509 -req -in /out/server.csr -CA /out/server_intermediate.crt \
+  -CAkey /out/server_intermediate.key -CAcreateserial -out /out/server.crt \
   -not_before {CERT_NOT_BEFORE} -not_after {CERT_NOT_AFTER} \
-  -extfile /out/server.ext {issuer_hash} {issuer_sigopts}
-openssl req -new -key /out/client.key -out /out/client.csr \
-  -subj /CN=nrf5340-benchmark {leaf_hash}
-openssl x509 -req -in /out/client.csr -CA /out/server_root.crt \
-  -CAkey /out/server_root.key -CAcreateserial -out /out/client.crt \
-  -not_before {CERT_NOT_BEFORE} -not_after {CERT_NOT_AFTER} \
-  -extfile /out/client.ext {issuer_hash} {issuer_sigopts}
-cat /out/server.crt /out/server_root.crt > /out/server_chain.crt
-cp /out/server_root.crt /out/client_ca.crt
-openssl x509 -in /out/server_root.crt -outform DER -out /out/server_root.der
-cp /out/server_root.der /out/client_ca.der
-openssl x509 -in /out/client.crt -outform DER -out /out/client_cert.der
-openssl pkey -in /out/client.key -outform DER -out /out/client_key.der
-openssl verify -purpose sslserver -CAfile /out/server_root.crt /out/server.crt
-openssl verify -purpose sslclient -CAfile /out/server_root.crt /out/client.crt
-"""
-    _docker_script(cache, script, log)
-    _copy_files(cache, output, cached_required)
-    write_case_configs(case, output)
+  -extfile /out/server.ext {intermediate_hash} \
+  {_signature_options(intermediate.issuer_key_type)}
+cat /out/server.crt /out/server_intermediate.crt > /out/server_chain.crt
+openssl x509 -in /out/server_intermediate.crt -outform DER -out /out/server_intermediate.der
+openssl x509 -in /out/server.crt -outform DER -out /out/server.der
+openssl verify -purpose sslserver -CAfile /out/server_root.crt \
+  -untrusted /out/server_intermediate.crt /out/server.crt
+""", log)
 
 
 def generate_hash_based_server_case(
-    signature: str,
+    root_signature: str,
+    intermediate_signature: str,
+    leaf_signature: str,
     output: Path,
-    client_dir: Path,
+    root_cache: Path,
     log: Path,
 ) -> None:
+    """Use wolfSSL for stateful LMS/XMSS X.509 issuers."""
     output.mkdir(parents=True, exist_ok=True)
-    _docker_script(output, f"hbs_certgen {shlex.quote(signature)} /out", log)
-    shutil.copy2(output / "server_root.crt", output / "client_ca.crt")
-    shutil.copy2(output / "server_root.der", output / "client_ca.der")
+    root_cache.mkdir(parents=True, exist_ok=True)
+    run([
+        "docker", "run", "--rm", "--user", f"{os.getuid()}:{os.getgid()}",
+        "-v", f"{output.resolve()}:/out",
+        "-v", f"{root_cache.resolve()}:/root-cache",
+        IMAGE, "hbs_certgen", root_signature, intermediate_signature,
+        leaf_signature,
+        "/root-cache", "/out",
+    ], log=log)
 
 
 def write_case_configs(case: dict[str, str], output: Path) -> None:
     kem = KEMS_BY_NAME[case["kex_group"]]
-    signature = SIGNATURES_BY_NAME[case["cert_sig_alg"]]
-    (output / "client_identity.txt").write_text(f"{signature.name}\n")
+    root, _intermediate, leaf = _case_algorithms(case)
     max_send_fragment = (
         "MaxSendFragment = 2048\n"
-        if case.get("cert_sig_alg", "").startswith("SLH-DSA-SHAKE-")
-        else ""
+        if root.name.startswith("SLH-DSA-SHAKE-") else ""
     )
+    (output / "pki_metadata.json").write_text(json.dumps({
+        "pki_chain_id": case.get("pki_chain_id", f"homogeneous_{slug(leaf.name)}"),
+        "pki_kind": case.get("pki_kind", "homogeneous"),
+        "root_sig_alg": root.name,
+        "intermediate_sig_alg": case.get("intermediate_sig_alg") or leaf.name,
+        "leaf_sig_alg": leaf.name,
+    }, indent=2) + "\n")
     (output / "openssl.cnf").write_text(
         "openssl_conf = openssl_init\n\n"
         "[openssl_init]\nproviders = provider_sect\nssl_conf = ssl_sect\n\n"
@@ -336,127 +331,134 @@ def write_case_configs(case: dict[str, str], output: Path) -> None:
         "[ssl_sect]\nsystem_default = system_default_sect\n\n"
         "[system_default_sect]\nMinProtocol = TLSv1.3\n"
         "Options = -SessionTicket\n"
-        f"Groups = {kem.openssl_group}\n"
-        f"{max_send_fragment}"
-        f"SignatureAlgorithms = {signature.tls_signature_scheme}\n"
-        f"ClientSignatureAlgorithms = {signature.tls_signature_scheme}\n"
+        f"Groups = {kem.openssl_group}\n{max_send_fragment}"
+        f"SignatureAlgorithms = {leaf.tls_signature_scheme}\n"
     )
     (output / "mosquitto.conf").write_text(
-        "listener 8883\n"
-        "allow_anonymous true\n"
+        "listener 8883\nallow_anonymous true\n"
         "certfile __REMOTE_CASE_DIR__/server_chain.crt\n"
         "keyfile __REMOTE_CASE_DIR__/server.key\n"
         "require_certificate false\n"
     )
-    (output / "mosquitto-mtls.conf").write_text(
-        "listener 8883\n"
-        "allow_anonymous true\n"
-        "cafile __REMOTE_CASE_DIR__/client_ca.crt\n"
-        "certfile __REMOTE_CASE_DIR__/server_chain.crt\n"
-        "keyfile __REMOTE_CASE_DIR__/server.key\n"
-        "require_certificate true\n"
-        "use_identity_as_username true\n"
+    if (output / "client_ca.crt").exists():
+        mtls_openssl = (output / "openssl.cnf").read_text().replace(
+            f"SignatureAlgorithms = {leaf.tls_signature_scheme}\n",
+            f"SignatureAlgorithms = {leaf.tls_signature_scheme}\n"
+            "ClientSignatureAlgorithms = ecdsa_secp256r1_sha256\n",
+        )
+        (output / "openssl-mtls.cnf").write_text(mtls_openssl)
+        (output / "mosquitto-mtls.conf").write_text(
+            "listener 8883\nallow_anonymous true\n"
+            "cafile __REMOTE_CASE_DIR__/client_ca.crt\n"
+            "certfile __REMOTE_CASE_DIR__/server_chain.crt\n"
+            "keyfile __REMOTE_CASE_DIR__/server.key\n"
+            "require_certificate true\n"
+            "use_identity_as_username true\n"
+        )
+
+
+def generate_server_case(
+    case: dict[str, str], output: Path, log: Path, *, client_dir: Path | None = None,
+) -> None:
+    """Create a cached root -> intermediate -> leaf server PKI for one chain."""
+    root, intermediate, leaf = _case_algorithms(case)
+    chain_id = case.get("pki_chain_id") or f"homogeneous_{slug(leaf.name)}"
+    cache = CERT_CACHE / "chains" / chain_id
+    root_cache = CERT_CACHE / "roots" / slug(root.name)
+    valid = (
+        _all_present(cache, PUBLIC_CHAIN_FILES)
+        and _cert_is_valid(cache / "server_root.crt")
+        and _cert_is_valid(cache / "server_intermediate.crt")
+        and _cert_is_valid(cache / "server.crt")
     )
-
-
-def c_array(name: str, data: bytes) -> str:
-    rows = []
-    values = [f"0x{value:02x}" for value in data]
-    for offset in range(0, len(values), 12):
-        rows.append("    " + ", ".join(values[offset:offset + 12]))
-    return f"static const unsigned char {name}[] = {{\n" + ",\n".join(rows) + "\n};\n"
+    if not valid:
+        shutil.rmtree(cache, ignore_errors=True)
+        _append_log(log, f"[cert-cache] Generating three-tier PKI {chain_id}")
+        if root.name in HASH_BASED_SIGNATURES:
+            generate_hash_based_server_case(
+                root.name, intermediate.name, leaf.name, cache, root_cache, log,
+            )
+        else:
+            _generate_openssl_three_tier(
+                root, intermediate, leaf, cache, root_cache, log,
+            )
+    else:
+        _append_log(log, f"[cert-cache] Reusing three-tier PKI {chain_id}")
+    _copy_files(cache, output, PUBLIC_CHAIN_FILES)
+    if client_dir is not None:
+        for name in ("client_ca.crt", "client_ca.der"):
+            shutil.copy2(client_dir / name, output / name)
+    write_case_configs(case, output)
 
 
 def generate_universal_header(
-    client_dir: Path,
     case_dirs: list[tuple[str, Path]],
     output: Path,
+    *,
+    root_algorithms: set[str] | None = None,
+    client_dir: Path | None = None,
 ) -> None:
-    roots: list[tuple[str, bytes]] = []
-    identities: list[tuple[Signature, str, str]] = []
+    """Embed selected roots and, only for mTLS builds, the client identity."""
+    roots: list[tuple[str, str, bytes]] = []
+    profiles: list[Signature] = []
     seen_roots: set[bytes] = set()
-    seen_identities: set[str] = set()
-    key_arrays: dict[bytes, str] = {}
+    seen_profiles: set[str] = set()
     parts = [
         "#ifndef BENCHMARK_CREDENTIALS_H\n#define BENCHMARK_CREDENTIALS_H\n\n",
         "#include <stddef.h>\n#include <stdint.h>\n\n",
     ]
-    for case_id, case_dir in case_dirs:
-        identity_file = case_dir / "client_identity.txt"
-        if identity_file.exists():
-            signature = SIGNATURES_BY_NAME.get(identity_file.read_text().strip())
-        else:
-            signature_name = case_id.split("__", 1)[-1]
-            signature = next(
-                (
-                    item for item in SIGNATURES_BY_NAME.values()
-                    if slug(item.name) == signature_name
-                ),
-                None,
-            )
-        if signature is None:
+    if client_dir is not None:
+        parts.extend([
+            "#define BENCHMARK_HAS_CLIENT_IDENTITY 1\n",
+            c_array(
+                "benchmark_client_cert",
+                (client_dir / "client_cert.der").read_bytes(),
+            ),
+            c_array(
+                "benchmark_client_key",
+                (client_dir / "client_key.der").read_bytes(),
+            ),
+        ])
+    else:
+        parts.append("#define BENCHMARK_HAS_CLIENT_IDENTITY 0\n")
+    for _case_id, case_dir in case_dirs:
+        metadata_path = case_dir / "pki_metadata.json"
+        root_path = case_dir / "server_root.der"
+        if not metadata_path.exists() or not root_path.exists():
             continue
-        root = case_dir / "server_root.der"
-        cert = case_dir / "client_cert.der"
-        key = case_dir / "client_key.der"
-        if not root.exists() or not cert.exists() or not key.exists():
-            continue
-        root_data = root.read_bytes()
-        if root_data not in seen_roots:
-            root_name = f"benchmark_server_root_{len(roots)}"
+        metadata = json.loads(metadata_path.read_text())
+        root_id = metadata["root_sig_alg"]
+        root_data = root_path.read_bytes()
+        if (
+            (root_algorithms is None or root_id in root_algorithms)
+            and root_data not in seen_roots
+        ):
+            array_name = f"benchmark_server_root_{len(roots)}"
+            roots.append((root_id, array_name, root_data))
             seen_roots.add(root_data)
-            roots.append((root_name, root_data))
-        if signature.name not in seen_identities:
-            index = len(identities)
-            cert_name = f"benchmark_client_cert_{index}"
-            key_data = key.read_bytes()
-            key_name = key_arrays.get(key_data, "")
-            parts.append(c_array(cert_name, cert.read_bytes()))
-            if not key_name:
-                key_name = f"benchmark_client_key_{len(key_arrays)}"
-                parts.append(c_array(key_name, key_data))
-                key_arrays[key_data] = key_name
-            identities.append((signature, cert_name, key_name))
-            seen_identities.add(signature.name)
-
-    parts.extend(c_array(name, data) for name, data in roots)
-    parts.extend(
-        [
-            "\nstruct benchmark_ca_entry { const unsigned char *data; size_t length; };\n",
-            "static const struct benchmark_ca_entry benchmark_ca_bundle[] = {\n",
-            ",\n".join(
-                f"    {{ {name}, sizeof({name}) }}"
-                for name, _data in roots
-            ),
-            "\n};\n",
-            "#define BENCHMARK_CA_COUNT "
-            "(sizeof(benchmark_ca_bundle) / sizeof(benchmark_ca_bundle[0]))\n",
-            "\nstruct benchmark_identity_entry {\n"
-            "    const char *id;\n"
-            "    const char *signature_scheme;\n"
-            "    uint16_t signature_scheme_id;\n"
-            "    const unsigned char *certificate;\n"
-            "    size_t certificate_length;\n"
-            "    const unsigned char *private_key;\n"
-            "    size_t private_key_length;\n"
-            "};\n",
-            "static const struct benchmark_identity_entry "
-            "benchmark_client_identities[] = {\n",
-            ",\n".join(
-                "    { "
-                f"\"{signature.name}\", \"{signature.tls_signature_scheme}\", "
-                f"0x{signature.tls_signature_scheme_id:04x}, "
-                f"{cert_name}, sizeof({cert_name}), "
-                f"{key_name}, sizeof({key_name}) "
-                "}"
-                for signature, cert_name, key_name in identities
-            ),
-            "\n};\n",
-            "#define BENCHMARK_IDENTITY_COUNT "
-            "(sizeof(benchmark_client_identities) / "
-            "sizeof(benchmark_client_identities[0]))\n",
-            "#endif\n",
-        ]
-    )
+        leaf = SIGNATURES_BY_NAME[metadata["leaf_sig_alg"]]
+        if leaf.name not in seen_profiles:
+            profiles.append(leaf)
+            seen_profiles.add(leaf.name)
+    parts.extend(c_array(name, data) for _root_id, name, data in roots)
+    parts.extend([
+        "\nstruct benchmark_ca_entry { const char *id; const unsigned char *data; size_t length; };\n",
+        "static const struct benchmark_ca_entry benchmark_ca_bundle[] = {\n",
+        ",\n".join(
+            f"    {{ \"{root_id}\", {name}, sizeof({name}) }}"
+            for root_id, name, _data in roots
+        ),
+        "\n};\n#define BENCHMARK_CA_COUNT "
+        "(sizeof(benchmark_ca_bundle) / sizeof(benchmark_ca_bundle[0]))\n",
+        "\nstruct benchmark_signature_profile { const char *id; const char *signature_scheme; uint16_t signature_scheme_id; };\n",
+        "static const struct benchmark_signature_profile benchmark_signature_profiles[] = {\n",
+        ",\n".join(
+            f"    {{ \"{item.name}\", \"{item.tls_signature_scheme}\", "
+            f"0x{item.tls_signature_scheme_id:04x} }}" for item in profiles
+        ),
+        "\n};\n#define BENCHMARK_SIGNATURE_PROFILE_COUNT "
+        "(sizeof(benchmark_signature_profiles) / sizeof(benchmark_signature_profiles[0]))\n",
+        "#endif\n",
+    ])
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text("".join(parts))

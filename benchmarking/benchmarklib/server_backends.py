@@ -14,19 +14,22 @@ def server_backend_for_case(
     requested: str,
 ) -> str | None:
     signature = case["cert_sig_alg"]
+    root_signature = case.get("root_sig_alg", signature)
     if requested == AUTO:
         return (
             WOLFSSL
-            if signature in HASH_BASED_SIGNATURES | LONG_RSA_SIGNATURES
+            if root_signature in HASH_BASED_SIGNATURES or
+            signature in HASH_BASED_SIGNATURES | LONG_RSA_SIGNATURES
             else OPENSSL_MOSQUITTO
         )
-    if requested == OPENSSL_MOSQUITTO and signature in HASH_BASED_SIGNATURES:
+    if requested == OPENSSL_MOSQUITTO and root_signature in HASH_BASED_SIGNATURES:
         return None
     return requested
 
 
 def unsupported_backend_reason(case: dict[str, str], requested: str) -> str:
+    signature = case.get("root_sig_alg") or case["cert_sig_alg"]
     return (
-        f"{requested} cannot load or verify {case['cert_sig_alg']} certificate "
+        f"{requested} cannot load or verify {signature} certificate "
         "chains; use --server-backend auto or --server-backend wolfssl"
     )

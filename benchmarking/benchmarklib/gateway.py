@@ -49,6 +49,17 @@ class PiGateway:
     def stop_master(self) -> None:
         subprocess.run([*self.ssh_base(), "-O", "exit", self.host], capture_output=True)
 
+    def set_wifi_enabled(self, enabled: bool, log: Path) -> None:
+        """Keep the Pi radio state stable across all benchmark sessions."""
+        state = "on" if enabled else "off"
+        link_state = "up" if enabled else "down"
+        self.command(
+            f"sudo -n nmcli radio wifi {state} >/dev/null 2>&1 || "
+            f"sudo -n ip link set wlan0 {link_state} >/dev/null 2>&1 || true",
+            log,
+            check=False,
+        )
+
     def _local(self, command: list[str], log: Path) -> None:
         log.parent.mkdir(parents=True, exist_ok=True)
         with log.open("a") as stream:
@@ -188,7 +199,10 @@ class PiGateway:
         )
         self.command(
             f"sed -i 's|__REMOTE_CASE_DIR__|{remote}|g' "
-            f"{remote}/mosquitto.conf {remote}/mosquitto-mtls.conf",
+            f"{remote}/mosquitto.conf; "
+            f"if [ -f {remote}/mosquitto-mtls.conf ]; then "
+            f"sed -i 's|__REMOTE_CASE_DIR__|{remote}|g' "
+            f"{remote}/mosquitto-mtls.conf; fi",
             log,
         )
         return remote
@@ -269,12 +283,13 @@ class PiGateway:
         server_backend: str = "openssl-mosquitto",
         wolfssl_group: str = "",
         control_telemetry: bool = False,
-        mtls_mode: bool = False,
-        client_identity: str = "",
+        root_signature: str = "",
+        leaf_signature: str = "",
         signature_scheme: str = "",
         tls_timeout_sec: float = 60.0,
+        mtls_mode: bool = False,
     ) -> None:
-        self.stop_session(log, reset_adapter=disable_wifi)
+        self.stop_session(log, reset_adapter=False)
         self.ble_addr = ble_addr
         supervision_timeout_path = (
             f"/sys/kernel/debug/bluetooth/{adapter}/supervision_timeout"
@@ -293,9 +308,8 @@ class PiGateway:
             f"{address} --addr-type {shlex.quote(ble_addr_type)} "
             f"--psm {shlex.quote(psm)} --tcp-host 127.0.0.1 --tcp-port 8883 "
             f"--mtu {mtu} --scan-timeout 5 "
-            f"--client-identity {shlex.quote(client_identity)} "
-            f"{'--mtls ' if mtls_mode else ''}"
-            f"{'--disable-wifi ' if disable_wifi else ''}"
+            f"--root-signature {shlex.quote(root_signature)} "
+            f"--leaf-signature {shlex.quote(leaf_signature)} "
             f"> {gateway_log} 2>&1 < /dev/null & "
             f"echo $! > {self.workdir}/bridge.pid"
         )
@@ -313,13 +327,12 @@ class PiGateway:
                 f"echo $! > {self.workdir}/broker.pid"
             )
         else:
-            mosquitto_config = (
-                "mosquitto-mtls.conf" if mtls_mode else "mosquitto.conf"
-            )
             server_command = (
-                f"setsid env OPENSSL_CONF={remote_case_dir}/openssl.cnf "
+                f"setsid env OPENSSL_CONF={remote_case_dir}/"
+                f"{'openssl-mtls.cnf' if mtls_mode else 'openssl.cnf'} "
                 f"/usr/sbin/mosquitto -c "
-                f"{remote_case_dir}/{mosquitto_config} -v "
+                f"{remote_case_dir}/"
+                f"{'mosquitto-mtls.conf' if mtls_mode else 'mosquitto.conf'} -v "
                 f"> {broker_log} 2>&1 < /dev/null & "
                 f"echo $! > {self.workdir}/broker.pid"
             )
@@ -328,7 +341,7 @@ class PiGateway:
             f"LD_PRELOAD={self.workdir}/bin/server_crypto_metrics.so "
             f"{server_command}; "
             "sleep 1; "
-            f"kill -0 $(cat {self.workdir}/broker.pid) 2>/dev/null; "
+            f"kill -0 $(cat {self.workdir}/broker.pid) 2>/dev/null && "
             f"{bridge_command}"
         )
         self.command(script, log)

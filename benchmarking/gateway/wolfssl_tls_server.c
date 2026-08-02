@@ -25,8 +25,8 @@ struct config {
     const char* group;
     const char* sigalg;
     int port;
-    bool mtls;
     int timeout_sec;
+    bool mtls;
 };
 
 static void on_signal(int signo)
@@ -97,6 +97,11 @@ static const char* wolfssl_signature_list(const char* name)
         return "RSA-PSS+SHA384";
     if (strcmp(name, "rsa_pss_rsae_sha512") == 0)
         return "RSA-PSS+SHA512";
+    /* This wolfSSL revision negotiates ML-DSA from the loaded key and the
+     * peer's TLS 1.3 offer, but its OpenSSL-compatible text parser does not
+     * accept ML-DSA names in wolfSSL_CTX_set1_sigalgs_list(). */
+    if (strncmp(name, "mldsa", 5) == 0)
+        return "";
     return NULL;
 }
 
@@ -112,11 +117,10 @@ static int join_path(char* out, size_t out_len, const char* dir, const char* nam
 
 static unsigned char* read_file(const char* path, long* size_out)
 {
-    FILE* file;
+    FILE* file = fopen(path, "rb");
     unsigned char* data;
     long size;
 
-    file = fopen(path, "rb");
     if (file == NULL)
         return NULL;
     if (fseek(file, 0, SEEK_END) != 0) {
@@ -124,20 +128,12 @@ static unsigned char* read_file(const char* path, long* size_out)
         return NULL;
     }
     size = ftell(file);
-    if (size <= 0) {
-        fclose(file);
-        return NULL;
-    }
-    if (fseek(file, 0, SEEK_SET) != 0) {
+    if (size <= 0 || fseek(file, 0, SEEK_SET) != 0) {
         fclose(file);
         return NULL;
     }
     data = (unsigned char*)malloc((size_t)size);
-    if (data == NULL) {
-        fclose(file);
-        return NULL;
-    }
-    if (fread(data, 1, (size_t)size, file) != (size_t)size) {
+    if (data == NULL || fread(data, 1, (size_t)size, file) != (size_t)size) {
         free(data);
         fclose(file);
         return NULL;
@@ -156,11 +152,8 @@ static void print_wolfssl_errors(const char* context)
 static int verify_callback(int preverify, WOLFSSL_X509_STORE_CTX* store)
 {
     if (!preverify &&
-        (store->error == ASN_BEFORE_DATE_E || store->error == ASN_AFTER_DATE_E)) {
-        fprintf(stderr, "[wolfssl-server] ignoring peer certificate date error: %d\n",
-            store->error);
+        (store->error == ASN_BEFORE_DATE_E || store->error == ASN_AFTER_DATE_E))
         return 1;
-    }
     return preverify;
 }
 
@@ -168,7 +161,7 @@ static void usage(const char* program)
 {
     fprintf(stderr,
         "usage: %s --case-dir DIR --group WOLFSSL_GROUP --sigalg NAME [--port PORT] "
-        "[--mtls] [--timeout SECONDS]\n",
+        "[--timeout SECONDS] [--mtls]\n",
         program);
 }
 
@@ -179,8 +172,8 @@ static int parse_args(int argc, char** argv, struct config* cfg)
         { "group", required_argument, NULL, 'g' },
         { "sigalg", required_argument, NULL, 's' },
         { "port", required_argument, NULL, 'p' },
-        { "mtls", no_argument, NULL, 'm' },
         { "timeout", required_argument, NULL, 't' },
+        { "mtls", no_argument, NULL, 'm' },
         { "help", no_argument, NULL, 'h' },
         { NULL, 0, NULL, 0 },
     };
@@ -189,11 +182,11 @@ static int parse_args(int argc, char** argv, struct config* cfg)
     cfg->group = NULL;
     cfg->sigalg = NULL;
     cfg->port = DEFAULT_PORT;
-    cfg->mtls = false;
     cfg->timeout_sec = 60;
+    cfg->mtls = false;
 
     for (;;) {
-        int opt = getopt_long(argc, argv, "c:g:s:p:mt:h", options, NULL);
+        int opt = getopt_long(argc, argv, "c:g:s:p:t:mh", options, NULL);
         if (opt == -1)
             break;
         switch (opt) {
@@ -209,11 +202,11 @@ static int parse_args(int argc, char** argv, struct config* cfg)
         case 'p':
             cfg->port = atoi(optarg);
             break;
-        case 'm':
-            cfg->mtls = true;
-            break;
         case 't':
             cfg->timeout_sec = atoi(optarg);
+            break;
+        case 'm':
+            cfg->mtls = true;
             break;
         case 'h':
             usage(argv[0]);
@@ -279,16 +272,15 @@ static int make_listener(int port)
 
 static int configure_context(WOLFSSL_CTX* ctx, const struct config* cfg)
 {
-    char ca_file[1024];
     char ca_der_file[1024];
     char cert_file[1024];
     char key_file[1024];
     unsigned char* ca_der = NULL;
     long ca_der_size = 0;
+    char combined_sigalgs[96];
     int groups[1];
 
-    if (join_path(ca_file, sizeof(ca_file), cfg->case_dir, "client_ca.crt") != 0 ||
-        join_path(ca_der_file, sizeof(ca_der_file), cfg->case_dir,
+    if (join_path(ca_der_file, sizeof(ca_der_file), cfg->case_dir,
             "client_ca.der") != 0 ||
         join_path(cert_file, sizeof(cert_file), cfg->case_dir,
             "server_chain.crt") != 0 ||
@@ -299,27 +291,19 @@ static int configure_context(WOLFSSL_CTX* ctx, const struct config* cfg)
         wolfSSL_CTX_set_verify(
             ctx, WOLFSSL_VERIFY_PEER | WOLFSSL_VERIFY_FAIL_IF_NO_PEER_CERT,
             verify_callback);
-
         ca_der = read_file(ca_der_file, &ca_der_size);
-        if (ca_der != NULL) {
-            if (wolfSSL_CTX_load_verify_buffer_ex(
-                    ctx, ca_der, ca_der_size, WOLFSSL_FILETYPE_ASN1, 0,
-                    WOLFSSL_LOAD_FLAG_DATE_ERR_OKAY) != WOLFSSL_SUCCESS) {
-                free(ca_der);
-                print_wolfssl_errors("failed to load DER client CA");
-                return -1;
-            }
+        if (ca_der == NULL || wolfSSL_CTX_load_verify_buffer_ex(
+                ctx, ca_der, ca_der_size, WOLFSSL_FILETYPE_ASN1, 0,
+                WOLFSSL_LOAD_FLAG_DATE_ERR_OKAY) != WOLFSSL_SUCCESS) {
             free(ca_der);
-        }
-        else if (wolfSSL_CTX_load_verify_locations(
-                     ctx, ca_file, NULL) != WOLFSSL_SUCCESS) {
-            print_wolfssl_errors("failed to load PEM client CA");
-            fprintf(stderr, "client CA path: %s\n", ca_file);
+            print_wolfssl_errors("failed to load DER client CA");
             return -1;
         }
+        free(ca_der);
     }
-    else
+    else {
         wolfSSL_CTX_set_verify(ctx, WOLFSSL_VERIFY_NONE, NULL);
+    }
     if (wolfSSL_CTX_use_certificate_chain_file(ctx, cert_file) != WOLFSSL_SUCCESS) {
         print_wolfssl_errors("failed to load server certificate chain");
         fprintf(stderr, "server certificate chain path: %s\n", cert_file);
@@ -343,10 +327,22 @@ static int configure_context(WOLFSSL_CTX* ctx, const struct config* cfg)
      * continue instead of leaving the bridge with no listener on port 8883. */
     (void)wolfSSL_CTX_no_ticket_TLSv13(ctx);
     const char* sigalg_list = wolfssl_signature_list(cfg->sigalg);
-    if (sigalg_list == NULL ||
-        wolfSSL_CTX_set1_sigalgs_list(ctx, sigalg_list) != WOLFSSL_SUCCESS) {
+    if (sigalg_list == NULL) {
         print_wolfssl_errors("failed to configure wolfSSL signature scheme");
         return -1;
+    }
+    if (sigalg_list[0] != '\0') {
+        const char* configured_sigalgs = sigalg_list;
+        if (cfg->mtls && strcmp(sigalg_list, "ECDSA+SHA256") != 0) {
+            snprintf(combined_sigalgs, sizeof(combined_sigalgs),
+                "%s:ECDSA+SHA256", sigalg_list);
+            configured_sigalgs = combined_sigalgs;
+        }
+        if (wolfSSL_CTX_set1_sigalgs_list(
+                ctx, configured_sigalgs) != WOLFSSL_SUCCESS) {
+            print_wolfssl_errors("failed to configure wolfSSL signature scheme");
+            return -1;
+        }
     }
     return 0;
 }
@@ -441,8 +437,7 @@ int main(int argc, char** argv)
 
     fprintf(stderr,
         "[wolfssl-server] listening on 127.0.0.1:%d group=%s sigalg=%s auth=%s\n",
-        cfg.port, cfg.group, cfg.sigalg,
-        cfg.mtls ? "mutual" : "server-only");
+        cfg.port, cfg.group, cfg.sigalg, cfg.mtls ? "mutual" : "server-only");
     fflush(stderr);
 
     while (keep_running) {

@@ -33,6 +33,15 @@ class Signature:
     notes: str = ""
 
 
+@dataclass(frozen=True)
+class PkiChain:
+    id: str
+    kind: str
+    root_sig_alg: str
+    intermediate_sig_alg: str
+    leaf_sig_alg: str
+
+
 KEMS = (
     Kem("ECDHE-P-256", 1, 65, 65, 32, "classic", "WOLFSSL_ECC_SECP256R1", "P-256"),
     Kem("ECDHE-P-384", 3, 97, 97, 48, "classic", "WOLFSSL_ECC_SECP384R1", "P-384"),
@@ -117,6 +126,67 @@ SIGNATURES_BY_NAME = {item.name: item for item in SIGNATURES}
 
 def slug(value: str) -> str:
     return re.sub(r"_+", "_", re.sub(r"[^a-z0-9]+", "_", value.lower())).strip("_")
+
+
+LIGHT_SIGNATURES_BY_LEVEL = {
+    1: ("ECDSA-P-256", "ML-DSA-44"),
+    3: ("ECDSA-P-384", "ML-DSA-65"),
+    5: ("ECDSA-P-521", "ML-DSA-87"),
+}
+
+HEAVY_ROOTS_BY_LEVEL = {
+    1: ("SLH-DSA-SHAKE-128s", "SLH-DSA-SHAKE-128f", "RSA-PSS-3072"),
+    3: ("SLH-DSA-SHAKE-192s", "SLH-DSA-SHAKE-192f", "RSA-PSS-7680"),
+    5: (
+        "SLH-DSA-SHAKE-256s", "SLH-DSA-SHAKE-256f", "RSA-PSS-15360",
+        "LMS-HSS-L2-H10-W4", "XMSS-SHA2_20_256",
+    ),
+}
+
+
+def _pki_chains() -> tuple[PkiChain, ...]:
+    chains: list[PkiChain] = []
+    for signatures in LIGHT_SIGNATURES_BY_LEVEL.values():
+        for signature in signatures:
+            chains.append(PkiChain(
+                id=f"homogeneous_{slug(signature)}",
+                kind="homogeneous",
+                root_sig_alg=signature,
+                intermediate_sig_alg=signature,
+                leaf_sig_alg=signature,
+            ))
+    for level, roots in HEAVY_ROOTS_BY_LEVEL.items():
+        for root in roots:
+            for leaf in LIGHT_SIGNATURES_BY_LEVEL[level]:
+                chains.append(PkiChain(
+                    id=f"root_{slug(root)}__leaf_{slug(leaf)}",
+                    kind="heavy_root",
+                    root_sig_alg=root,
+                    intermediate_sig_alg=leaf,
+                    leaf_sig_alg=leaf,
+                ))
+    return tuple(chains)
+
+
+PKI_CHAINS = _pki_chains()
+
+# These opt-in profiles use one algorithm for every X.509 signature in the
+# chain. SLH-DSA, LMS and XMSS still use an ECDSA leaf public key because the
+# installed TLS stacks do not expose those algorithms as CertificateVerify
+# SignatureSchemes. RSA-PSS is homogeneous for both X.509 and TLS.
+HEAVY_HOMOGENEOUS_CHAINS = tuple(
+    PkiChain(
+        id=f"homogeneous_{slug(signature)}",
+        kind="homogeneous_x509",
+        root_sig_alg=signature,
+        intermediate_sig_alg=signature,
+        leaf_sig_alg=signature,
+    )
+    for signatures in HEAVY_ROOTS_BY_LEVEL.values()
+    for signature in signatures
+)
+ALL_PKI_CHAINS = PKI_CHAINS + HEAVY_HOMOGENEOUS_CHAINS
+PKI_CHAINS_BY_ID = {item.id: item for item in ALL_PKI_CHAINS}
 
 
 SIGNATURE_SCHEME_NAMES = {

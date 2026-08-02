@@ -17,32 +17,39 @@ The Bluetooth controller runs on the nRF5340 network core using Zephyr's
 `hci_ipc` child image. The runner therefore builds and flashes the application
 and network cores together with sysbuild.
 
-The firmware contains every supported TLS key-exchange group and a trust bundle
-for the server CAs in the selected run. The server offers one group and one
-certificate per case. By default, only the server is authenticated. With
-`--mtls-mode`, the server also requires a client identity selected from the
-universal firmware before TLS starts. The client uses the same TLS 1.3
-`SignatureScheme` as the server's observed `CertificateVerify`.
+The firmware contains every supported TLS key-exchange group and all 17 public
+roots used by the suite. Each PKI is `root -> intermediate -> leaf`.
+The root remains on the nRF5340 and Raspberry Pi; the TLS server transmits only
+`leaf + intermediate`. Authentication is server-only by default. The optional
+`--mtls-mode` build additionally embeds one fixed ECDSA P-256 client identity
+and makes the selected server backend require its certificate.
 
-Each signature case has one root that directly signs both the server and device
-leaf certificates; there is no intermediate CA. The server sends leaf plus
-root, while the device sends only its leaf. SLH-DSA signs those X.509
-certificates, but its TLS `CertificateVerify` uses the corresponding ECDSA
-P-256/P-384/P-521 identity. LMS/HSS and XMSS use ECDSA P-256 for
-`CertificateVerify`.
+The generator creates six homogeneous chains (ECDSA P-256/384/521 and ML-DSA
+44/65/87) and 22 heterogeneous chains. In heterogeneous chains a heavier
+SLH-DSA, RSA-PSS, LMS, or XMSS root signs a lighter intermediate, and that
+intermediate signs a leaf using the same light algorithm. `cert_sig_alg`
+therefore always describes the leaf and the real TLS 1.3 `CertificateVerify`.
 
-LMS/HSS and XMSS also sign the server certificate chain while keeping an ECDSA
-TLS leaf key. OpenSSL/Mosquitto cannot load those chains for TLS, so the runner
-uses wolfSSL for those cases when `--server-backend auto` is selected.
+By default, LMS/HSS and XMSS act only as roots; their intermediate and leaf use
+either ECDSA P-521 or ML-DSA-87. OpenSSL/Mosquitto cannot load chains rooted in
+these stateful algorithms, so the runner uses wolfSSL for those cases when
+`--server-backend auto` is selected.
+
+Pass `--include-heavy-homogeneous` to add 11 opt-in homogeneous X.509 chains:
+all six SLH-DSA-SHAKE variants, all three RSA-PSS sizes, LMS, and XMSS. In
+these profiles one algorithm signs the root, intermediate, and leaf
+certificates. RSA-PSS also supplies the TLS leaf key and `CertificateVerify`.
+SLH-DSA, LMS, and XMSS keep an ECDSA TLS leaf key because the installed TLS
+stacks do not expose those algorithms as TLS 1.3 `SignatureScheme` values.
 
 RSA-PSS-3072, RSA-PSS-7680, and RSA-PSS-15360 all run in the normal wolfSSL
 `USE_FAST_MATH` firmware profile. RSA-PSS-15360 is not silently substituted
 with RSA-PSS-7680.
 
-In automatic server mode, RSA-PSS-7680 and RSA-PSS-15360 use the benchmark
-wolfSSL server. Their client-side private operations can exceed Mosquitto's
-fixed pre-CONNECT timeout, so the wolfSSL server receives the adaptive case
-timeout while retaining the exact TLS signature scheme and mutual-auth root.
+The runner first tries one universal root bundle and requires 32 KiB of free
+flash. If needed, it packs roots largest-first into the minimum practical set
+of firmware profiles and executes each profile contiguously to minimize
+reflashing.
 
 ## Connection Configuration
 
@@ -102,7 +109,7 @@ runner advances to the next algorithm.
 
 This mode measures a fresh key pair and a self-signed CA certificate whose
 X.509 signature uses the selected algorithm. It does not reproduce the normal
-benchmark's fixed ECDSA P-256 client identity or its complete server chain.
+benchmark's three-level server chain.
 ML-DSA signing uses randomized FIPS 204 signing and rejection sampling, so its
 signing distribution is expected to be wider than ECDSA. The summary includes
 median, p95, and standard deviation for `certificate_sign_ms`.
@@ -164,11 +171,16 @@ python benchmarking/generate_cases.py \
   --seed 123 \
   --iterations 5 \
   --warmup-iterations 1 \
+  --include-heavy-homogeneous \
   --separate-pqc-classic
 ```
 
 The generator refuses to overwrite an existing CSV. The printed path is used
-as `--cases` below.
+as `--cases` below. A full generation contains 28 PKI chains crossed with nine
+KEM groups, for 252 unique cases. The CSV records `pki_chain_id`, root,
+intermediate, leaf, PKI kind, and the expected leaf `CertificateVerify` scheme.
+With `--include-heavy-homogeneous`, the output contains 39 PKI chains and 351
+cases before `--separate-pqc-classic` filtering.
 
 ## Schedule-Only Dry Run
 
@@ -198,6 +210,19 @@ python benchmarking/run_benchmarks.py \
   --limit 2
 ```
 
+Add mutual client authentication without changing the case CSV:
+
+```bash
+python benchmarking/run_benchmarks.py \
+  --cases benchmarking/cases/<cases>.csv \
+  --seed 123 \
+  --mtls-mode
+```
+
+The flag produces a distinct firmware build containing the fixed client
+identity. Do not reuse a server-only image with `--skip-build` or
+`--skip-flash` for the first mTLS run.
+
 ## Server Backend
 
 The runner supports three server backend modes:
@@ -211,21 +236,9 @@ The runner supports three server backend modes:
 
 The wolfSSL server is not a full MQTT broker. It accepts one TLS connection
 through the existing BLE bridge, reads the benchmark firmware's MQTT CONNECT
-packet, sends CONNACK, and closes cleanly. Add `--mtls-mode` to require and
-verify the board certificate with either server backend:
-
-```bash
-python benchmarking/run_benchmarks.py \
-  --cases benchmarking/cases/<cases>.csv \
-  --seed 123 \
-  --mtls-mode
-```
-
-The authentication mode is saved in `run_config.json`, `attempts.csv`, and
-`summary.csv`. The attempts output also records the raw two-byte scheme ID,
-the observed server scheme, the expected scheme, the selected client identity,
-and whether all three matched. A mismatch is a benchmark failure rather than a
-silent fallback.
+packet, sends CONNACK, and closes cleanly. The attempts output records the raw
+two-byte scheme ID, observed server scheme, expected leaf scheme, and whether
+they matched. A mismatch is a benchmark failure rather than a silent fallback.
 
 ## Hardware Run
 
@@ -345,7 +358,7 @@ smaller stack demand leaves more headroom for the TLS call chain.
 ## Measurements
 
 `raw_handshake_ms` covers only `wolfSSL_connect()`. `tls_setup_ms` includes
-context, CA, client certificate, key, group, and `WOLFSSL` object setup.
+context, selected root, group, and `WOLFSSL` object setup.
 `mqtt_connect_ms` ends at MQTT CONNACK. `full_connect_ms` starts at TLS setup,
 while `end_to_end_ms` starts when the firmware L2CAP channel becomes ready.
 Gateway-side BLE and TCP setup durations are recorded separately.
@@ -389,13 +402,17 @@ The firmware also records the following per-attempt values:
 - `x509_chain_signature_verify_ms` measures wolfSSL `ConfirmSignature()` calls
   while validating the server certificate chain. The legacy
   `certificate_signature_verify_ms` column contains the same value.
+- `root_cert_der_bytes`, `intermediate_cert_der_bytes`, and
+  `leaf_cert_der_bytes` are the individual DER sizes. `server_chain_bytes` is
+  the transmitted DER payload size, computed as leaf plus intermediate; the
+  root is excluded from the TLS chain.
 - `tls_certificate_verify_signature_verify_ms` measures processing and
   cryptographic verification of the server TLS 1.3 `CertificateVerify`.
-- `mtls_signature_generate_ms` measures the signature primitive used by the
-  nRF5340 to produce its client-authentication `CertificateVerify`.
-  It remains zero when `--mtls-mode` is not enabled.
-  `client_signature_total_ms` is the sum of X.509 verification, server
-  `CertificateVerify` verification, and client mTLS signing.
+- By default the benchmark authenticates only the server. Add `--mtls-mode`
+  to make the server require a fixed ECDSA P-256 client certificate signed by
+  the benchmark client CA. In that mode, `mtls_signature_generate_ms` measures
+  the client's TLS 1.3 `CertificateVerify` signature and
+  `client_signature_total_ms` also includes that operation.
 - `server_kem_encapsulation_ms` and `server_certificate_verify_sign_ms` are
   measured inside the Raspberry Pi OpenSSL EVP calls. The runner preloads
   `server_crypto_metrics.so` into Mosquitto, so these values exclude BLE/TCP

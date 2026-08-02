@@ -25,6 +25,18 @@
 #endif
 #include "benchmark_credentials.h"
 
+#if BENCH_MTLS_MODE && !BENCHMARK_HAS_CLIENT_IDENTITY
+#error "BENCH_MTLS_MODE requires an embedded client identity"
+#endif
+
+#if BENCH_MTLS_MODE
+#define BENCH_CLIENT_SIG_SCHEME "ecdsa_secp256r1_sha256"
+#define BENCH_CLIENT_IDENTITY_ID "fixed-ecdsa-p256"
+#else
+#define BENCH_CLIENT_SIG_SCHEME ""
+#define BENCH_CLIENT_IDENTITY_ID ""
+#endif
+
 #ifndef BENCHMARK_VERBOSE_LOGS
 #define BENCHMARK_VERBOSE_LOGS 0
 #endif
@@ -75,10 +87,10 @@ static volatile bool suppress_l2cap_rx_log;
 static volatile bool tls_handshake_active;
 static volatile int64_t tls_handshake_start_ms;
 static volatile int64_t l2cap_connected_ms;
-static const struct benchmark_identity_entry *selected_identity;
-static bool selected_mtls;
+static const struct benchmark_ca_entry *selected_root;
+static const struct benchmark_signature_profile *selected_signature;
 static uint16_t benchmark_control_message_id;
-K_SEM_DEFINE(identity_selected_sem, 0, 1);
+K_SEM_DEFINE(pki_profile_selected_sem, 0, 1);
 
 static int benchmark_control_send(const char *message, size_t length);
 
@@ -313,7 +325,7 @@ static volatile bool acl_peer_disconnected = true;
 static volatile bool disconnect_requested;
 static struct bt_conn *active_conn;
 static const struct bt_le_conn_param benchmark_conn_params =
-    BT_LE_CONN_PARAM_INIT(9, 12, 0, 3200);
+    BT_LE_CONN_PARAM_INIT(12, 12, 0, 3200);
 
 static void bt_connected(struct bt_conn *conn, uint8_t err)
 {
@@ -380,31 +392,32 @@ static int l2cap_recv(struct bt_l2cap_chan *chan, struct net_buf *buf) {
     if (buf->len >= BENCH_CONTROL_HEADER_SIZE &&
         memcmp(buf->data, "BCTL1", 5) == 0) {
         char payload[160];
-        char identity_name[96];
-        int mtls_value;
+        char root_name[96];
+        char leaf_name[96];
         size_t length = MIN(
             (size_t)buf->len - BENCH_CONTROL_HEADER_SIZE,
             sizeof(payload) - 1);
 
         memcpy(payload, buf->data + BENCH_CONTROL_HEADER_SIZE, length);
         payload[length] = '\0';
-        if (sscanf(payload, "[BENCH_SELECT] mtls=%d identity=%95s",
-                   &mtls_value, identity_name) == 2) {
-            selected_mtls = mtls_value != 0;
-            selected_identity = NULL;
-            for (size_t i = 0; i < BENCHMARK_IDENTITY_COUNT; i++) {
-                if (strcmp(
-                        benchmark_client_identities[i].id,
-                        identity_name) == 0) {
-                    selected_identity = &benchmark_client_identities[i];
+        /* Resolve the public trust anchor and expected server scheme before TLS. */
+        if (sscanf(payload, "[BENCH_SELECT] root=%95s leaf=%95s",
+                   root_name, leaf_name) == 2) {
+            selected_root = NULL;
+            selected_signature = NULL;
+            for (size_t i = 0; i < BENCHMARK_CA_COUNT; i++) {
+                if (strcmp(benchmark_ca_bundle[i].id, root_name) == 0) {
+                    selected_root = &benchmark_ca_bundle[i];
                     break;
                 }
             }
-            if (selected_identity != NULL) {
-                k_sem_give(&identity_selected_sem);
-            } else {
-                k_sem_give(&identity_selected_sem);
+            for (size_t i = 0; i < BENCHMARK_SIGNATURE_PROFILE_COUNT; i++) {
+                if (strcmp(benchmark_signature_profiles[i].id, leaf_name) == 0) {
+                    selected_signature = &benchmark_signature_profiles[i];
+                    break;
+                }
             }
+            k_sem_give(&pki_profile_selected_sem);
         }
         return 0;
     }
@@ -816,17 +829,20 @@ void start_secure_mqtt_session(struct bt_l2cap_chan *chan)
 #endif
     wolfSSL_CTX_set_verify(ctx, WOLFSSL_VERIFY_PEER, NULL);
 
-    for (size_t i = 0; i < BENCHMARK_CA_COUNT; i++) {
-        ret = wolfSSL_CTX_load_verify_buffer(
-            ctx, benchmark_ca_bundle[i].data, benchmark_ca_bundle[i].length,
-            WOLFSSL_FILETYPE_ASN1);
-        if (ret != WOLFSSL_SUCCESS) {
-            BENCH_RESULT_OUT("[BENCH_RESULT] status=fail stage=ca_load error=%d ca_index=%u\n",
-                      ret, (unsigned int)i);
-            wolfSSL_CTX_free(ctx);
-            benchmark_power_markers_reset();
-            return;
-        }
+    if (selected_root == NULL || selected_signature == NULL) {
+        BENCH_RESULT_OUT("[BENCH_RESULT] status=fail stage=pki_selection error=missing_profile\n");
+        wolfSSL_CTX_free(ctx);
+        benchmark_power_markers_reset();
+        return;
+    }
+    ret = wolfSSL_CTX_load_verify_buffer(
+        ctx, selected_root->data, selected_root->length, WOLFSSL_FILETYPE_ASN1);
+    if (ret != WOLFSSL_SUCCESS) {
+        BENCH_RESULT_OUT("[BENCH_RESULT] status=fail stage=ca_load error=%d root=%s\n",
+                  ret, selected_root->id);
+        wolfSSL_CTX_free(ctx);
+        benchmark_power_markers_reset();
+        return;
     }
 
     int groups[] = {
@@ -848,6 +864,27 @@ void start_secure_mqtt_session(struct bt_l2cap_chan *chan)
         return;
     }
 
+#if BENCH_MTLS_MODE
+    ret = wolfSSL_CTX_use_certificate_buffer(
+        ctx, benchmark_client_cert, sizeof(benchmark_client_cert),
+        WOLFSSL_FILETYPE_ASN1);
+    if (ret != WOLFSSL_SUCCESS) {
+        BENCH_RESULT_OUT("[BENCH_RESULT] status=fail stage=client_cert error=%d\n", ret);
+        wolfSSL_CTX_free(ctx);
+        benchmark_power_markers_reset();
+        return;
+    }
+    ret = wolfSSL_CTX_use_PrivateKey_buffer(
+        ctx, benchmark_client_key, sizeof(benchmark_client_key),
+        WOLFSSL_FILETYPE_ASN1);
+    if (ret != WOLFSSL_SUCCESS) {
+        BENCH_RESULT_OUT("[BENCH_RESULT] status=fail stage=client_key error=%d\n", ret);
+        wolfSSL_CTX_free(ctx);
+        benchmark_power_markers_reset();
+        return;
+    }
+#endif
+
     wolfSSL_CTX_SetIOSend(ctx, l2cap_wolfssl_send);
     wolfSSL_CTX_SetIORecv(ctx, l2cap_wolfssl_recv);
     ssl = wolfSSL_new(ctx);
@@ -859,14 +896,6 @@ void start_secure_mqtt_session(struct bt_l2cap_chan *chan)
     }
     wolfSSL_SetIOReadCtx(ssl, chan);
     wolfSSL_SetIOWriteCtx(ssl, chan);
-    if (selected_identity == NULL) {
-        BENCH_RESULT_OUT(
-            "[BENCH_RESULT] status=fail stage=identity_selection "
-            "error=missing_identity\n");
-        wolfSSL_free(ssl);
-        wolfSSL_CTX_free(ctx);
-        return;
-    }
     if (AllocateSuites(ssl) != 0) {
         BENCH_RESULT_OUT(
             "[BENCH_RESULT] status=fail stage=signature_scheme "
@@ -876,32 +905,17 @@ void start_secure_mqtt_session(struct bt_l2cap_chan *chan)
         return;
     }
     ssl->suites->hashSigAlgo[0] =
-        (byte)(selected_identity->signature_scheme_id >> 8);
+        (byte)(selected_signature->signature_scheme_id >> 8);
     ssl->suites->hashSigAlgo[1] =
-        (byte)selected_identity->signature_scheme_id;
+        (byte)selected_signature->signature_scheme_id;
     ssl->suites->hashSigAlgoSz = 2;
-    if (selected_mtls) {
-        ret = wolfSSL_use_certificate_buffer(
-            ssl, selected_identity->certificate,
-            selected_identity->certificate_length, WOLFSSL_FILETYPE_ASN1);
-        if (ret != WOLFSSL_SUCCESS) {
-            BENCH_RESULT_OUT(
-                "[BENCH_RESULT] status=fail stage=client_cert error=%d\n", ret);
-            wolfSSL_free(ssl);
-            wolfSSL_CTX_free(ctx);
-            return;
-        }
-        ret = wolfSSL_use_PrivateKey_buffer(
-            ssl, selected_identity->private_key,
-            selected_identity->private_key_length, WOLFSSL_FILETYPE_ASN1);
-        if (ret != WOLFSSL_SUCCESS) {
-            BENCH_RESULT_OUT(
-                "[BENCH_RESULT] status=fail stage=client_key error=%d\n", ret);
-            wolfSSL_free(ssl);
-            wolfSSL_CTX_free(ctx);
-            return;
-        }
+#if BENCH_MTLS_MODE
+    if (selected_signature->signature_scheme_id != 0x0403) {
+        ssl->suites->hashSigAlgo[2] = 0x04;
+        ssl->suites->hashSigAlgo[3] = 0x03;
+        ssl->suites->hashSigAlgoSz = 4;
     }
+#endif
     setup_done_ms = k_uptime_get();
 
     (void)sys_heap_runtime_stats_reset_max(&wolfssl_heap.heap);
@@ -952,13 +966,13 @@ void start_secure_mqtt_session(struct bt_l2cap_chan *chan)
                             server_certificate_verify_scheme)
                     : "",
                 benchmark_metrics_get()->server_certificate_verify_scheme,
-                selected_identity->signature_scheme,
-                selected_mtls ? selected_identity->signature_scheme : "",
-                selected_identity->id,
+                selected_signature->signature_scheme,
+                BENCH_CLIENT_SIG_SCHEME,
+                BENCH_CLIENT_IDENTITY_ID,
                 benchmark_metrics_get()->server_certificate_verify_scheme_seen &&
                     benchmark_metrics_get()->
                         server_certificate_verify_scheme ==
-                    selected_identity->signature_scheme_id,
+                    selected_signature->signature_scheme_id,
                 BENCHMARK_DWT_VALUES(dwt));
             wolfSSL_free(ssl);
             wolfSSL_CTX_free(ctx);
@@ -1012,7 +1026,7 @@ void start_secure_mqtt_session(struct bt_l2cap_chan *chan)
             benchmark_power_total_set(false);
             if (!metrics->server_certificate_verify_scheme_seen ||
                 metrics->server_certificate_verify_scheme !=
-                    selected_identity->signature_scheme_id) {
+                    selected_signature->signature_scheme_id) {
                 BENCH_RESULT_OUT(
                     "[BENCH_RESULT] status=fail "
                     "stage=certificate_verify_mismatch "
@@ -1026,9 +1040,8 @@ void start_secure_mqtt_session(struct bt_l2cap_chan *chan)
                             metrics->server_certificate_verify_scheme)
                         : "",
                     metrics->server_certificate_verify_scheme,
-                    selected_identity->signature_scheme,
-                    selected_mtls ? selected_identity->signature_scheme : "",
-                    selected_identity->id);
+                    selected_signature->signature_scheme,
+                    BENCH_CLIENT_SIG_SCHEME, BENCH_CLIENT_IDENTITY_ID);
                 goto cleanup;
             }
             BENCH_RESULT_OUT(
@@ -1098,9 +1111,8 @@ void start_secure_mqtt_session(struct bt_l2cap_chan *chan)
                 benchmark_signature_scheme_name(
                     metrics->server_certificate_verify_scheme),
                 metrics->server_certificate_verify_scheme,
-                selected_identity->signature_scheme,
-                selected_mtls ? selected_identity->signature_scheme : "",
-                selected_identity->id,
+                selected_signature->signature_scheme,
+                BENCH_CLIENT_SIG_SCHEME, BENCH_CLIENT_IDENTITY_ID,
                 BENCHMARK_DWT_VALUES(dwt));
             goto cleanup;
         }
@@ -1217,9 +1229,9 @@ int main(void) {
         k_sem_reset(&rx_sem);
         k_sem_reset(&l2cap_connected_sem);
         k_sem_reset(&conn_params_ready_sem);
-        k_sem_reset(&identity_selected_sem);
-        selected_identity = NULL;
-        selected_mtls = false;
+        k_sem_reset(&pki_profile_selected_sem);
+        selected_root = NULL;
+        selected_signature = NULL;
         l2cap_peer_disconnected = false;
         l2cap_rx_overflow = false;
         disconnect_requested = false;
@@ -1257,16 +1269,16 @@ int main(void) {
                   l2cap_server.psm, L2CAP_SDU_MTU,
                   (unsigned int)BENCHMARK_CA_COUNT,
                   BENCH_MLKEM_BACKEND_NAME, BENCH_RSA_PROFILE_NAME);
-        if (k_sem_take(&identity_selected_sem, K_SECONDS(10)) != 0) {
+        if (k_sem_take(&pki_profile_selected_sem, K_SECONDS(10)) != 0) {
             BENCH_RESULT_OUT(
-                "[BENCH_RESULT] status=fail stage=identity_selection "
+                "[BENCH_RESULT] status=fail stage=pki_selection "
                 "error=timeout\n");
             (void)bt_l2cap_chan_disconnect(&l2cap_chan.chan);
             continue;
         }
-        if (selected_identity == NULL) {
+        if (selected_root == NULL || selected_signature == NULL) {
             static const char response[] =
-                "[BENCH_IDENTITY] status=error error=unknown_identity\n";
+                "[BENCH_PKI] status=error error=unknown_profile\n";
             (void)benchmark_control_send(response, sizeof(response) - 1);
             (void)bt_l2cap_chan_disconnect(&l2cap_chan.chan);
             continue;
@@ -1274,10 +1286,10 @@ int main(void) {
             char response[192];
             int response_len = snprintk(
                 response, sizeof(response),
-                "[BENCH_IDENTITY] status=ready identity=%s "
-                "client_certificate_verify_alg=%s\n",
-                selected_identity->id,
-                selected_identity->signature_scheme);
+                "[BENCH_PKI] status=ready root=%s leaf=%s "
+                "certificate_verify_alg=%s\n",
+                selected_root->id, selected_signature->id,
+                selected_signature->signature_scheme);
             if (response_len <= 0 ||
                 benchmark_control_send(
                     response, (size_t)response_len) != 0) {

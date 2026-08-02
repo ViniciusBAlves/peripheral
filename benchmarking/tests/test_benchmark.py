@@ -11,10 +11,13 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from benchmarklib.metrics import parse_bench_line
-from benchmarklib.algorithms import SIGNATURES_BY_NAME, normalize_signature_scheme
+from benchmarklib.algorithms import (
+    PKI_CHAINS, SIGNATURES_BY_NAME, normalize_signature_scheme, slug,
+)
 from benchmarklib.power_profiler import PowerProfilerCapture, PowerProfilerSession
 from benchmarklib.certificates import generate_universal_header, write_case_configs
 from benchmarklib.gateway import PiGateway
+from benchmarklib.firmware import flash_usage
 from benchmarklib.scheduler import build_jobs
 from benchmarklib.server_backends import server_backend_for_case
 from generate_cases import build_cases
@@ -24,6 +27,8 @@ from run_benchmarks import (
     classify_gateway_start_failure,
     load_config,
     normalize_ble_addr,
+    group_jobs_by_firmware_profile,
+    pack_root_profiles,
     parse_args,
     needs_large_rsa_firmware,
     resolve_pi_workdir,
@@ -113,29 +118,79 @@ class BenchmarkTests(unittest.TestCase):
                 list(range(min(positions), max(positions) + 1)),
             )
 
-    def test_hash_based_signatures_are_generated_as_cases(self) -> None:
+    def test_hash_based_roots_are_generated_as_three_tier_cases(self) -> None:
         cases = build_cases(1, 0, True)
         signatures = {
-            case["cert_sig_alg"]: case
+            case["root_sig_alg"]: case
             for case in cases
-            if case["cert_sig_alg"] in {"LMS-HSS-L2-H10-W4", "XMSS-SHA2_20_256"}
+            if case["root_sig_alg"] in {"LMS-HSS-L2-H10-W4", "XMSS-SHA2_20_256"}
         }
         self.assertEqual(set(signatures), {"LMS-HSS-L2-H10-W4", "XMSS-SHA2_20_256"})
         self.assertTrue(all(
             case["expected_support"] == "required"
             for case in signatures.values()
         ))
-        self.assertTrue(all(
-            "CertificateVerify uses ECDSA" in case["notes"]
-            for case in signatures.values()
-        ))
+        self.assertTrue(all(case["intermediate_sig_alg"] == case["leaf_sig_alg"]
+                            for case in signatures.values()))
+
+    def test_generator_has_28_chains_and_252_cases(self) -> None:
+        self.assertEqual(len(PKI_CHAINS), 28)
+        self.assertEqual(len(build_cases(1, 0, False)), 252)
+
+    def test_generator_can_add_heavy_homogeneous_x509_chains(self) -> None:
+        cases = build_cases(1, 0, False, True)
+        chains = {
+            case["pki_chain_id"]: case
+            for case in cases
+            if case["kex_group"] == "ECDHE-P-256"
+        }
+        self.assertEqual(len(chains), 39)
+        for name in (
+            "SLH-DSA-SHAKE-128s", "SLH-DSA-SHAKE-128f",
+            "SLH-DSA-SHAKE-192s", "SLH-DSA-SHAKE-192f",
+            "SLH-DSA-SHAKE-256s", "SLH-DSA-SHAKE-256f",
+            "RSA-PSS-3072", "RSA-PSS-7680", "RSA-PSS-15360",
+            "LMS-HSS-L2-H10-W4", "XMSS-SHA2_20_256",
+        ):
+            case = chains[f"homogeneous_{slug(name)}"]
+            self.assertEqual(case["pki_kind"], "homogeneous_x509")
+            self.assertEqual(case["root_sig_alg"], name)
+            self.assertEqual(case["intermediate_sig_alg"], name)
+            self.assertEqual(case["leaf_sig_alg"], name)
+
+    def test_root_profiles_are_packed_largest_first(self) -> None:
+        profiles = pack_root_profiles({"large": 8, "medium": 6, "small": 4}, 10)
+        self.assertEqual(profiles, [{"large"}, {"medium", "small"}])
+
+    def test_multiple_firmware_profiles_are_contiguous_and_seeded(self) -> None:
+        cases = build_cases(1, 0, False)[:4]
+        case_map = {case["case_id"]: case for case in cases}
+        for index, case in enumerate(cases):
+            case["firmware_profile"] = f"profile-{index % 2}"
+        jobs = build_jobs(cases, seed=123, sessions_per_case=2)
+        first = group_jobs_by_firmware_profile(jobs, case_map, 123)
+        second = group_jobs_by_firmware_profile(jobs, case_map, 123)
+        self.assertEqual(first, second)
+        profiles = [case_map[job.case_id]["firmware_profile"] for job in first]
+        transitions = sum(a != b for a, b in zip(profiles, profiles[1:]))
+        self.assertEqual(transitions, 1)
+
+    def test_flash_usage_reads_zephyr_map_symbols(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            map_path = Path(tmpdir) / "zephyr" / "zephyr.map"
+            map_path.parent.mkdir()
+            map_path.write_text(
+                "FLASH 0x00000000 0x00100000 xr\n"
+                " 0x000f0000 _flash_used = expression\n"
+            )
+            self.assertEqual(flash_usage(Path(tmpdir)), (0xF0000, 0x100000))
 
     def test_slh_dsa_fast_variants_are_generated_as_cases(self) -> None:
         cases = build_cases(1, 0, False)
         variants = {
-            case["cert_sig_alg"]
+            case["root_sig_alg"]
             for case in cases
-            if case["cert_sig_alg"].endswith("f")
+            if case["root_sig_alg"].endswith("f")
         }
         self.assertEqual(
             variants,
@@ -157,7 +212,6 @@ class BenchmarkTests(unittest.TestCase):
         self.assertEqual(args.ble_addr, normalize_ble_addr(config["ble-addr"]))
         self.assertEqual(args.mlkem_backend, "pqm4-m4fstack")
         self.assertEqual(args.server_backend, "auto")
-        self.assertFalse(args.mtls_mode)
         self.assertFalse(args.power_profiler)
         self.assertEqual(
             args.power_profiler_output_samples_per_second,
@@ -166,11 +220,10 @@ class BenchmarkTests(unittest.TestCase):
 
         overridden = parse_args([
             "--cases", "cases.csv", "--serial-device", "/dev/ttyUSB9",
-            "--server-backend", "wolfssl", "--mtls-mode",
+            "--server-backend", "wolfssl",
         ])
         self.assertEqual(overridden.serial_device, "/dev/ttyUSB9")
         self.assertEqual(overridden.server_backend, "wolfssl")
-        self.assertTrue(overridden.mtls_mode)
 
     def test_old_config_gets_power_profiler_defaults(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -437,7 +490,7 @@ class BenchmarkTests(unittest.TestCase):
         self.assertEqual(row["message"], "tlsv1 alert unknown ca")
         self.assertEqual(gateway.starts, 1)
 
-    def test_openssl_server_requests_board_client_signature_algorithm(self) -> None:
+    def test_openssl_server_restricts_server_signature_algorithm(self) -> None:
         case = {
             "kex_group": "ECDHE-P-521",
             "cert_sig_alg": "ECDSA-P-521",
@@ -452,13 +505,10 @@ class BenchmarkTests(unittest.TestCase):
             "SignatureAlgorithms = ecdsa_secp521r1_sha512\n",
             openssl_config,
         )
-        self.assertIn(
-            "ClientSignatureAlgorithms = ecdsa_secp521r1_sha512\n",
-            openssl_config,
-        )
+        self.assertNotIn("ClientSignatureAlgorithms", openssl_config)
         self.assertNotIn("MaxSendFragment", openssl_config)
 
-    def test_mosquitto_has_distinct_server_only_and_mtls_configs(self) -> None:
+    def test_mosquitto_is_server_authentication_only(self) -> None:
         case = {
             "kex_group": "ECDHE-P-256",
             "cert_sig_alg": "ECDSA-P-256",
@@ -467,15 +517,31 @@ class BenchmarkTests(unittest.TestCase):
             output = Path(tmpdir)
             write_case_configs(case, output)
             server_only = (output / "mosquitto.conf").read_text()
-            mutual = (output / "mosquitto-mtls.conf").read_text()
 
         self.assertIn("require_certificate false\n", server_only)
         self.assertNotIn("cafile ", server_only)
-        self.assertIn("require_certificate true\n", mutual)
-        self.assertIn("cafile __REMOTE_CASE_DIR__/client_ca.crt\n", mutual)
-        self.assertIn("use_identity_as_username true\n", mutual)
+        self.assertFalse((output / "mosquitto-mtls.conf").exists())
 
-    def test_universal_identity_uses_explicit_case_metadata(self) -> None:
+    def test_mosquitto_mtls_requires_client_certificate(self) -> None:
+        case = {
+            "kex_group": "ECDHE-P-256",
+            "cert_sig_alg": "ECDSA-P-256",
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output = Path(tmpdir)
+            (output / "client_ca.crt").write_text("test CA")
+            write_case_configs(case, output)
+            config = (output / "mosquitto-mtls.conf").read_text()
+            openssl_config = (output / "openssl-mtls.cnf").read_text()
+
+        self.assertIn("require_certificate true\n", config)
+        self.assertIn("cafile __REMOTE_CASE_DIR__/client_ca.crt\n", config)
+        self.assertIn(
+            "ClientSignatureAlgorithms = ecdsa_secp256r1_sha256\n",
+            openssl_config,
+        )
+
+    def test_universal_bundle_uses_explicit_pki_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             case_dir = root / "custom-case-id"
@@ -488,10 +554,11 @@ class BenchmarkTests(unittest.TestCase):
                 case_dir,
             )
             (case_dir / "server_root.der").write_bytes(b"root")
-            (case_dir / "client_cert.der").write_bytes(b"cert")
-            (case_dir / "client_key.der").write_bytes(b"key")
+            (case_dir / "pki_metadata.json").write_text(
+                '{"root_sig_alg":"ECDSA-P-256","leaf_sig_alg":"ECDSA-P-256"}'
+            )
             output = root / "benchmark_credentials.h"
-            generate_universal_header(root, [("custom-case-id", case_dir)], output)
+            generate_universal_header([("custom-case-id", case_dir)], output)
             header = output.read_text()
 
         self.assertIn('"ECDSA-P-256", "ecdsa_secp256r1_sha256"', header)
@@ -500,7 +567,9 @@ class BenchmarkTests(unittest.TestCase):
     def test_slh_openssl_server_uses_smaller_tls_records(self) -> None:
         case = {
             "kex_group": "ECDHE-P-521",
-            "cert_sig_alg": "SLH-DSA-SHAKE-256s",
+            "cert_sig_alg": "ECDSA-P-521",
+            "root_sig_alg": "SLH-DSA-SHAKE-256s",
+            "leaf_sig_alg": "ECDSA-P-521",
         }
         with tempfile.TemporaryDirectory() as tmpdir:
             output = Path(tmpdir)
@@ -512,8 +581,8 @@ class BenchmarkTests(unittest.TestCase):
 
     def test_server_backend_policy_routes_hash_based_signatures(self) -> None:
         classic = {"cert_sig_alg": "ECDSA-P-256"}
-        lms = {"cert_sig_alg": "LMS-HSS-L2-H10-W4"}
-        xmss = {"cert_sig_alg": "XMSS-SHA2_20_256"}
+        lms = {"cert_sig_alg": "ECDSA-P-521", "root_sig_alg": "LMS-HSS-L2-H10-W4"}
+        xmss = {"cert_sig_alg": "ECDSA-P-521", "root_sig_alg": "XMSS-SHA2_20_256"}
         slh = {"cert_sig_alg": "SLH-DSA-SHAKE-256s"}
         rsa_7680 = {"cert_sig_alg": "RSA-PSS-7680"}
         rsa_15360 = {"cert_sig_alg": "RSA-PSS-15360"}
@@ -665,7 +734,7 @@ class BenchmarkTests(unittest.TestCase):
         launch = next(command for command in gateway.commands if "--name PQC52840" in command)
         self.assertNotIn("--forget-cache", launch)
         self.assertNotIn("--addr ", launch)
-        self.assertIn("--disable-wifi", launch)
+        self.assertNotIn("--disable-wifi", launch)
         self.assertIn("--name PQC52840", launch)
         readiness = next(
             command for command in gateway.commands
@@ -673,7 +742,10 @@ class BenchmarkTests(unittest.TestCase):
         )
         self.assertIn("BENCH_READY", readiness)
 
-    def test_gateway_selects_mtls_for_both_server_backends(self) -> None:
+        gateway.set_wifi_enabled(False, Path(tmp) / "gateway.log")
+        self.assertIn("nmcli radio wifi off", gateway.commands[-1])
+
+    def test_gateway_selects_root_and_leaf_for_both_server_backends(self) -> None:
         class FakeGateway(PiGateway):
             def __init__(self) -> None:
                 super().__init__("pi", "/remote")
@@ -695,15 +767,16 @@ class BenchmarkTests(unittest.TestCase):
             "disable_wifi": False,
             "ready_timeout": 1,
             "log": Path("/tmp/gateway.log"),
-            "mtls_mode": True,
-            "client_identity": "ECDSA-P-256",
+            "root_signature": "SLH-DSA-SHAKE-128s",
+            "leaf_signature": "ECDSA-P-256",
             "signature_scheme": "ecdsa_secp256r1_sha256",
         }
         mosquitto = FakeGateway()
         mosquitto.start_session(**common)
         self.assertTrue(any(
-            "mosquitto-mtls.conf" in command and
-            "--client-identity ECDSA-P-256" in command
+            "mosquitto.conf" in command and
+            "--root-signature SLH-DSA-SHAKE-128s" in command and
+            "--leaf-signature ECDSA-P-256" in command
             for command in mosquitto.commands
         ))
 
@@ -714,19 +787,28 @@ class BenchmarkTests(unittest.TestCase):
             wolfssl_group="WOLFSSL_ECC_SECP256R1",
         )
         self.assertTrue(any(
-            "wolfssl_tls_server" in command and "--mtls" in command and
+            "wolfssl_tls_server" in command and "--mtls" not in command and
             "--sigalg ecdsa_secp256r1_sha256" in command
             for command in wolfssl.commands
         ))
 
-    def test_wolfssl_server_mtls_is_opt_in(self) -> None:
+        mtls = FakeGateway()
+        mtls.start_session(**common, mtls_mode=True)
+        self.assertTrue(any(
+            "OPENSSL_CONF=/remote/cases/case/openssl-mtls.cnf" in command and
+            "/remote/cases/case/mosquitto-mtls.conf" in command
+            for command in mtls.commands
+        ))
+
+    def test_wolfssl_server_has_optional_mtls_path(self) -> None:
         source = (
             ROOT / "gateway" / "wolfssl_tls_server.c"
         ).read_text()
         self.assertIn('{ "mtls", no_argument', source)
-        self.assertIn("if (cfg->mtls)", source)
         self.assertIn("WOLFSSL_VERIFY_FAIL_IF_NO_PEER_CERT", source)
         self.assertIn("WOLFSSL_VERIFY_NONE", source)
+        self.assertIn('strncmp(name, "mldsa", 5)', source)
+        self.assertIn("sigalg_list[0] != '\\0'", source)
 
     def test_gateway_command_creates_log_parent(self) -> None:
         class TrueGateway(PiGateway):

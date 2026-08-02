@@ -9,6 +9,11 @@ if(BENCH_MLKEM_BACKEND STREQUAL "")
 endif()
 option(BENCH_POWER_MARKERS "Enable PPK2 GPIO timing markers" OFF)
 option(BENCH_BLE_TELEMETRY "Send structured benchmark output over BLE L2CAP" OFF)
+option(BENCH_MTLS_MODE "Load the fixed client identity for mutual TLS" OFF)
+if(DEFINED ENV{BENCH_MTLS_MODE})
+    set(BENCH_MTLS_MODE "$ENV{BENCH_MTLS_MODE}" CACHE BOOL
+        "Load the fixed client identity for mutual TLS" FORCE)
+endif()
 option(BENCH_CERTIFICATE_GEN "Build the on-device certificate benchmark" OFF)
 option(BENCH_KEM_OPERATIONS "Build the on-device KEM operation benchmark" OFF)
 set_property(CACHE BENCH_MLKEM_BACKEND PROPERTY STRINGS wolfssl pqm4-m4fstack)
@@ -161,8 +166,7 @@ if(BENCH_LARGE_RSA)
     file(WRITE "${WOLFSSL_INTEGER_C}" "${WOLFSSL_INTEGER_TEXT}")
 endif()
 
-# Instrument the classic half of ECDHE/hybrid key exchange and the client's
-# mTLS CertificateVerify signature in wolfSSL's TLS wrappers.
+# Instrument the classic half of ECDHE/hybrid key exchange and optional mTLS.
 set(WOLFSSL_INTERNAL_C "${WOLFSSL_ROOT_DIR}/src/internal.c")
 file(READ "${WOLFSSL_INTERNAL_C}" WOLFSSL_INTERNAL_TEXT)
 string(REPLACE
@@ -176,7 +180,6 @@ foreach(PAIR IN ITEMS
     "X25519SharedSecret|BENCH_CRYPTO_CLASSICAL_KEX_SHARED_SECRET"
     "X25519MakeKey|BENCH_CRYPTO_CLASSICAL_KEX_KEYGEN"
     "EccSign|BENCH_CRYPTO_MTLS_SIGN"
-    "RsaSign|BENCH_CRYPTO_MTLS_SIGN"
 )
     string(REPLACE "|" ";" PAIR_PARTS "${PAIR}")
     list(GET PAIR_PARTS 0 FUNCTION_NAME)
@@ -193,6 +196,12 @@ foreach(PAIR IN ITEMS
     )
 endforeach()
 file(WRITE "${WOLFSSL_INTERNAL_C}" "${WOLFSSL_INTERNAL_TEXT}")
+
+if(BENCH_MTLS_MODE)
+    target_compile_definitions(app PRIVATE BENCH_MTLS_MODE=1)
+else()
+    target_compile_definitions(app PRIVATE BENCH_MTLS_MODE=0)
+endif()
 
 # Measure processing of the server's TLS 1.3 CertificateVerify separately
 # from X.509 chain signature verification.
@@ -216,11 +225,6 @@ string(REPLACE
 string(REPLACE
     "                ret = DecodeTls13SigAlg(input + args->idx,"
     "                benchmark_record_server_certificate_verify_scheme(\n                    ((word16)input[args->idx] << 8) | input[args->idx + 1]);\n                ret = DecodeTls13SigAlg(input + args->idx,"
-    WOLFSSL_TLS13_TEXT "${WOLFSSL_TLS13_TEXT}"
-)
-string(REPLACE
-    "                ret = wc_MlDsaKey_SignCtx((wc_MlDsaKey*)ssl->hsKey, NULL, 0,\n                                          sigOut, &args->sigLen,\n                                          args->sigData, args->sigDataSz,\n                                          ssl->rng);\n                args->length = (word16)args->sigLen;"
-    "                benchmark_timepoint_t benchmark_mldsa_mtls_start =\n                    benchmark_crypto_metric_start(BENCH_CRYPTO_MTLS_SIGN);\n                ret = wc_MlDsaKey_SignCtx((wc_MlDsaKey*)ssl->hsKey, NULL, 0,\n                                          sigOut, &args->sigLen,\n                                          args->sigData, args->sigDataSz,\n                                          ssl->rng);\n                benchmark_metric_stop(BENCH_CRYPTO_MTLS_SIGN,\n                                      benchmark_mldsa_mtls_start);\n                args->length = (word16)args->sigLen;"
     WOLFSSL_TLS13_TEXT "${WOLFSSL_TLS13_TEXT}"
 )
 file(WRITE "${WOLFSSL_TLS13_C}" "${WOLFSSL_TLS13_TEXT}")

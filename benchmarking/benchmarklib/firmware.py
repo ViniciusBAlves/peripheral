@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 from pathlib import Path
 
@@ -136,6 +137,7 @@ def build(
     large_rsa: bool = False,
     power_markers: bool = False,
     ble_telemetry: bool = False,
+    mtls_mode: bool = False,
     certificate_gen: bool = False,
     kem_benchmark: bool = False,
 ) -> None:
@@ -146,6 +148,7 @@ def build(
         f"-DBENCH_MLKEM_BACKEND={mlkem_backend}",
         f"-DBENCH_POWER_MARKERS={'ON' if power_markers else 'OFF'}",
         f"-DBENCH_BLE_TELEMETRY={'ON' if ble_telemetry else 'OFF'}",
+        f"-DBENCH_MTLS_MODE={'ON' if mtls_mode else 'OFF'}",
         f"-DBENCH_CERTIFICATE_GEN={'ON' if certificate_gen else 'OFF'}",
         f"-DBENCH_KEM_OPERATIONS={'ON' if kem_benchmark else 'OFF'}",
     ]
@@ -162,6 +165,7 @@ def build(
     if not standalone_benchmark:
         build_env["BENCH_GENERATED_DIR"] = str(generated_dir)
     build_env["BENCH_MLKEM_BACKEND"] = mlkem_backend
+    build_env["BENCH_MTLS_MODE"] = "ON" if mtls_mode else "OFF"
     if pqm4_dir is not None:
         build_env["PQM4_ROOT"] = str(pqm4_dir)
     command, cwd, env = west_command(
@@ -200,6 +204,24 @@ def flash(
         west_args=["flash", "-d", str(build_dir), "--runner", "nrfutil"],
     )
     run_logged(command, log, cwd=cwd, env=env)
+
+
+def flash_usage(build_dir: Path) -> tuple[int, int]:
+    """Read the linked image footprint and FLASH capacity from Zephyr's map."""
+    map_paths = (
+        build_dir / "zephyr" / "zephyr.map",
+        build_dir / "firmware" / "zephyr" / "zephyr.map",
+    )
+    map_path = next((path for path in map_paths if path.exists()), map_paths[0])
+    text = map_path.read_text(errors="replace")
+    used_match = re.search(r"0x([0-9a-fA-F]+)\s+_flash_used\s*=", text)
+    region_match = re.search(
+        r"^FLASH\s+0x[0-9a-fA-F]+\s+0x([0-9a-fA-F]+)\s+", text,
+        re.MULTILINE,
+    )
+    if used_match is None or region_match is None:
+        raise ValueError(f"cannot parse FLASH usage from {map_path}")
+    return int(used_match.group(1), 16), int(region_match.group(1), 16)
 
 
 def reset(*, log: Path, nrfutil: str) -> None:
