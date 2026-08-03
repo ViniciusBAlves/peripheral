@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import json
 import shlex
 import subprocess
 import tarfile
@@ -134,6 +135,13 @@ class PiGateway:
             f"{self.workdir}/bin/server_crypto_metrics.c",
             log,
         )
+        transfer_controller = bridge_source.parent / "mqtt_transfer_controller.py"
+        if transfer_controller.exists():
+            self.deploy_file(
+                transfer_controller,
+                f"{self.workdir}/bin/mqtt_transfer_controller.py",
+                log,
+            )
         self.deploy_file(
             wolfssl_server_source,
             f"{self.workdir}/bin/wolfssl_tls_server.c",
@@ -200,9 +208,10 @@ class PiGateway:
         self.command(
             f"sed -i 's|__REMOTE_CASE_DIR__|{remote}|g' "
             f"{remote}/mosquitto.conf; "
-            f"if [ -f {remote}/mosquitto-mtls.conf ]; then "
-            f"sed -i 's|__REMOTE_CASE_DIR__|{remote}|g' "
-            f"{remote}/mosquitto-mtls.conf; fi",
+            f"for config in {remote}/mosquitto*.conf; do "
+            f"  [ ! -f \"$config\" ] || "
+            f"  sed -i 's|__REMOTE_CASE_DIR__|{remote}|g' \"$config\"; "
+            f"done",
             log,
         )
         return remote
@@ -211,6 +220,7 @@ class PiGateway:
         bridge_pattern = f"^{self.workdir}/bin/ble_mqtt_bridge( |$)"
         broker_pattern = f"^/usr/sbin/mosquitto -c {self.workdir}/cases/"
         wolfssl_pattern = f"^{self.workdir}/bin/wolfssl_tls_server( |$)"
+        controller_pattern = f"^python3 {self.workdir}/bin/mqtt_transfer_controller.py( |$)"
         reset_command = ""
         disconnect_command = ""
         if self.ble_addr:
@@ -253,12 +263,21 @@ class PiGateway:
             "  kill -KILL -- \"-$pid\" \"$pid\" 2>/dev/null || true; "
             f"  rm -f {self.workdir}/broker.pid; "
             "fi; "
+            f"if [ -f {self.workdir}/controller.pid ]; then "
+            f"  pid=$(cat {self.workdir}/controller.pid); "
+            "  kill -TERM -- \"-$pid\" \"$pid\" 2>/dev/null || true; "
+            "  sleep 0.2; "
+            "  kill -KILL -- \"-$pid\" \"$pid\" 2>/dev/null || true; "
+            f"  rm -f {self.workdir}/controller.pid; "
+            "fi; "
             f"pids=$(pgrep -f {shlex.quote(bridge_pattern)} || true); "
             "  [ -z \"$pids\" ] || kill -KILL $pids 2>/dev/null || "
             "    sudo -n kill -KILL $pids 2>/dev/null || true; "
             f"pids=$(pgrep -f {shlex.quote(broker_pattern)} || true); "
             "  [ -z \"$pids\" ] || kill -KILL $pids 2>/dev/null || true; "
             f"pids=$(pgrep -f {shlex.quote(wolfssl_pattern)} || true); "
+            "  [ -z \"$pids\" ] || kill -KILL $pids 2>/dev/null || true; "
+            f"pids=$(pgrep -f {shlex.quote(controller_pattern)} || true); "
             "  [ -z \"$pids\" ] || kill -KILL $pids 2>/dev/null || true; "
             f"{disconnect_command}"
             f"{reset_command}",
@@ -288,6 +307,7 @@ class PiGateway:
         signature_scheme: str = "",
         tls_timeout_sec: float = 60.0,
         mtls_mode: bool = False,
+        transfer_plan: dict[str, object] | None = None,
     ) -> None:
         self.stop_session(log, reset_adapter=False)
         self.ble_addr = ble_addr
@@ -300,7 +320,23 @@ class PiGateway:
             log,
         )
         broker_log = f"{self.workdir}/logs/{case_id}.broker.log"
+        controller_log = f"{self.workdir}/logs/{case_id}.transfer-server.log"
         gateway_log = f"{self.workdir}/logs/{case_id}.gateway.log"
+        transfer_json = f"{self.workdir}/logs/{case_id}.transfer.json"
+        transfer_csv = f"{self.workdir}/logs/{case_id}.transfer.csv"
+        if transfer_plan is not None:
+            operations = transfer_plan.get("operations", [])
+            csv_text = "order,direction,size,seed\n" + "".join(
+                f"{operation['order']},{operation['direction']},"
+                f"{operation['payload_bytes']},{operation['payload_seed']}\n"
+                for operation in operations
+            )
+            self.command(
+                f"printf '%s' {shlex.quote(json.dumps(transfer_plan))} > "
+                f"{shlex.quote(transfer_json)}; "
+                f"printf '%s' {shlex.quote(csv_text)} > {shlex.quote(transfer_csv)}",
+                log,
+            )
         address = f"--addr {shlex.quote(ble_addr)}" if ble_addr else ""
         bridge_command = (
             f"setsid {shlex.quote(self.workdir)}/bin/ble_mqtt_bridge "
@@ -323,25 +359,46 @@ class PiGateway:
                 f"--sigalg {shlex.quote(signature_scheme)} "
                 f"--timeout {max(1, int(tls_timeout_sec))} "
                 f"{'--mtls ' if mtls_mode else ''}"
+                f"{'--transfer-plan ' + shlex.quote(transfer_csv) + ' ' if transfer_plan else ''}"
                 f"> {broker_log} 2>&1 < /dev/null & "
                 f"echo $! > {self.workdir}/broker.pid"
             )
         else:
+            if transfer_plan is not None:
+                mosquitto_config = (
+                    "mosquitto-transfer-mtls.conf" if mtls_mode
+                    else "mosquitto-transfer.conf"
+                )
+            else:
+                mosquitto_config = (
+                    "mosquitto-mtls.conf" if mtls_mode else "mosquitto.conf"
+                )
             server_command = (
                 f"setsid env OPENSSL_CONF={remote_case_dir}/"
                 f"{'openssl-mtls.cnf' if mtls_mode else 'openssl.cnf'} "
                 f"/usr/sbin/mosquitto -c "
                 f"{remote_case_dir}/"
-                f"{'mosquitto-mtls.conf' if mtls_mode else 'mosquitto.conf'} -v "
+                f"{mosquitto_config} -v "
                 f"> {broker_log} 2>&1 < /dev/null & "
                 f"echo $! > {self.workdir}/broker.pid"
             )
+        controller_command = ""
+        if transfer_plan is not None and server_backend != "wolfssl":
+            controller_command = (
+                f"setsid python3 {self.workdir}/bin/mqtt_transfer_controller.py "
+                f"--plan {shlex.quote(transfer_json)} "
+                "--port 18884 "
+                f"--timeout {max(600, int(tls_timeout_sec))} "
+                f"> {controller_log} 2>&1 < /dev/null & "
+                f"echo $! > {self.workdir}/controller.pid; "
+            )
         script = (
-            f": > {broker_log}; : > {gateway_log}; "
+            f": > {broker_log}; : > {gateway_log}; : > {controller_log}; "
             f"LD_PRELOAD={self.workdir}/bin/server_crypto_metrics.so "
             f"{server_command}; "
             "sleep 1; "
             f"kill -0 $(cat {self.workdir}/broker.pid) 2>/dev/null && "
+            f"{controller_command}"
             f"{bridge_command}"
         )
         self.command(script, log)
@@ -370,8 +427,13 @@ class PiGateway:
         log: Path,
     ) -> None:
         remote_broker = f"{self.workdir}/logs/{case_id}.broker.log"
+        remote_controller = f"{self.workdir}/logs/{case_id}.transfer-server.log"
         remote_gateway = f"{self.workdir}/logs/{case_id}.gateway.log"
-        for remote, local in ((remote_broker, broker_log), (remote_gateway, gateway_log)):
+        for remote, local in (
+            (remote_broker, broker_log),
+            (remote_controller, broker_log),
+            (remote_gateway, gateway_log),
+        ):
             command = [*self.ssh_base(), self.host, f"cat {shlex.quote(remote)}"]
             local.parent.mkdir(parents=True, exist_ok=True)
             with local.open("a") as stream:

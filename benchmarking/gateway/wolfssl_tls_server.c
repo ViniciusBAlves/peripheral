@@ -13,6 +13,7 @@
 
 #include <wolfssl/options.h>
 #include <wolfssl/ssl.h>
+#include <wolfssl/wolfcrypt/sha256.h>
 
 #define MQTT_CONNECT_PACKET 0x10
 #define DEFAULT_PORT 8883
@@ -27,6 +28,14 @@ struct config {
     int port;
     int timeout_sec;
     bool mtls;
+    const char* transfer_plan;
+};
+
+struct transfer_operation {
+    unsigned int order;
+    char direction[24];
+    unsigned int payload_bytes;
+    unsigned int payload_seed;
 };
 
 static void on_signal(int signo)
@@ -161,7 +170,7 @@ static void usage(const char* program)
 {
     fprintf(stderr,
         "usage: %s --case-dir DIR --group WOLFSSL_GROUP --sigalg NAME [--port PORT] "
-        "[--timeout SECONDS] [--mtls]\n",
+        "[--timeout SECONDS] [--mtls] [--transfer-plan FILE]\n",
         program);
 }
 
@@ -174,6 +183,7 @@ static int parse_args(int argc, char** argv, struct config* cfg)
         { "port", required_argument, NULL, 'p' },
         { "timeout", required_argument, NULL, 't' },
         { "mtls", no_argument, NULL, 'm' },
+        { "transfer-plan", required_argument, NULL, 'x' },
         { "help", no_argument, NULL, 'h' },
         { NULL, 0, NULL, 0 },
     };
@@ -184,9 +194,10 @@ static int parse_args(int argc, char** argv, struct config* cfg)
     cfg->port = DEFAULT_PORT;
     cfg->timeout_sec = 60;
     cfg->mtls = false;
+    cfg->transfer_plan = NULL;
 
     for (;;) {
-        int opt = getopt_long(argc, argv, "c:g:s:p:t:mh", options, NULL);
+        int opt = getopt_long(argc, argv, "c:g:s:p:t:mx:h", options, NULL);
         if (opt == -1)
             break;
         switch (opt) {
@@ -207,6 +218,9 @@ static int parse_args(int argc, char** argv, struct config* cfg)
             break;
         case 'm':
             cfg->mtls = true;
+            break;
+        case 'x':
+            cfg->transfer_plan = optarg;
             break;
         case 'h':
             usage(argv[0]);
@@ -406,6 +420,306 @@ static int handle_mqtt_connect(WOLFSSL* ssl)
     return 0;
 }
 
+static int tls_read_exact(WOLFSSL* ssl, unsigned char* data, size_t size)
+{
+    size_t offset = 0;
+    while (offset < size) {
+        int ret = wolfSSL_read(ssl, data + offset, (int)(size - offset));
+        if (ret <= 0)
+            return -1;
+        offset += (size_t)ret;
+    }
+    return 0;
+}
+
+static int tls_write_all(WOLFSSL* ssl, const unsigned char* data, size_t size)
+{
+    size_t offset = 0;
+    while (offset < size) {
+        int ret = wolfSSL_write(ssl, data + offset, (int)(size - offset));
+        if (ret <= 0)
+            return -1;
+        offset += (size_t)ret;
+    }
+    return 0;
+}
+
+static size_t encode_remaining(unsigned int value, unsigned char output[4])
+{
+    size_t count = 0;
+    do {
+        unsigned char digit = value % 128U;
+        value /= 128U;
+        if (value != 0U)
+            digit |= 0x80U;
+        output[count++] = digit;
+    } while (value != 0U && count < 4);
+    return count;
+}
+
+static int read_packet(WOLFSSL* ssl, unsigned char* type,
+                       unsigned char** body, unsigned int* body_size)
+{
+    unsigned int multiplier = 1;
+    unsigned char digit;
+    *body_size = 0;
+    *body = NULL;
+    if (tls_read_exact(ssl, type, 1) != 0)
+        return -1;
+    for (int i = 0; i < 4; i++) {
+        if (tls_read_exact(ssl, &digit, 1) != 0)
+            return -1;
+        *body_size += (digit & 0x7fU) * multiplier;
+        if ((digit & 0x80U) == 0U)
+            break;
+        multiplier *= 128U;
+        if (i == 3)
+            return -1;
+    }
+    if (*body_size != 0U) {
+        *body = malloc(*body_size);
+        if (*body == NULL || tls_read_exact(ssl, *body, *body_size) != 0) {
+            free(*body);
+            *body = NULL;
+            return -1;
+        }
+    }
+    return 0;
+}
+
+static int send_puback(WOLFSSL* ssl, unsigned int packet_id)
+{
+    unsigned char packet[] = {
+        0x40, 0x02, (unsigned char)(packet_id >> 8),
+        (unsigned char)packet_id,
+    };
+    return tls_write_all(ssl, packet, sizeof(packet));
+}
+
+static int wait_puback(WOLFSSL* ssl, unsigned int packet_id)
+{
+    unsigned char type, *body = NULL;
+    unsigned int size;
+    int result = -1;
+    if (read_packet(ssl, &type, &body, &size) == 0 && type == 0x40 &&
+        size == 2 && (((unsigned int)body[0] << 8) | body[1]) == packet_id)
+        result = 0;
+    free(body);
+    return result;
+}
+
+static unsigned char pattern_byte(unsigned int seed, unsigned int offset)
+{
+    return (unsigned char)(seed + offset * 31U + (offset >> 8) * 17U);
+}
+
+static void hash_hex(const unsigned char* data, size_t size, char output[65])
+{
+    static const char digits[] = "0123456789abcdef";
+    unsigned char digest[WC_SHA256_DIGEST_SIZE];
+    wc_Sha256Hash(data, (word32)size, digest);
+    for (size_t i = 0; i < sizeof(digest); i++) {
+        output[i * 2] = digits[digest[i] >> 4];
+        output[i * 2 + 1] = digits[digest[i] & 0x0f];
+    }
+    output[64] = '\0';
+}
+
+static unsigned char* make_payload(unsigned int seed, unsigned int size)
+{
+    unsigned char* payload = malloc(size);
+    if (payload != NULL) {
+        for (unsigned int i = 0; i < size; i++)
+            payload[i] = pattern_byte(seed, i);
+    }
+    return payload;
+}
+
+static int publish(WOLFSSL* ssl, const char* topic, const unsigned char* payload,
+                   unsigned int payload_size, unsigned int* packet_id_state)
+{
+    unsigned char header[128], remaining[4];
+    unsigned int packet_id = (*packet_id_state)++;
+    size_t topic_size = strlen(topic), offset = 0;
+    size_t rem_size = encode_remaining(
+        (unsigned int)(2 + topic_size + 2 + payload_size), remaining);
+    header[offset++] = 0x32;
+    memcpy(header + offset, remaining, rem_size); offset += rem_size;
+    header[offset++] = (unsigned char)(topic_size >> 8);
+    header[offset++] = (unsigned char)topic_size;
+    memcpy(header + offset, topic, topic_size); offset += topic_size;
+    header[offset++] = (unsigned char)(packet_id >> 8);
+    header[offset++] = (unsigned char)packet_id;
+    if (tls_write_all(ssl, header, offset) != 0 ||
+        tls_write_all(ssl, payload, payload_size) != 0)
+        return -1;
+    return wait_puback(ssl, packet_id);
+}
+
+static int parse_publish(unsigned char type, unsigned char* body,
+                         unsigned int body_size, char* topic,
+                         size_t topic_capacity, unsigned char** payload,
+                         unsigned int* payload_size, unsigned int* packet_id)
+{
+    if ((type >> 4) != 3 || body_size < 2)
+        return -1;
+    unsigned int topic_size = ((unsigned int)body[0] << 8) | body[1];
+    unsigned int offset = 2 + topic_size;
+    if (topic_size + 1 > topic_capacity || offset > body_size)
+        return -1;
+    memcpy(topic, body + 2, topic_size);
+    topic[topic_size] = '\0';
+    if (((type >> 1) & 3U) != 0U) {
+        if (offset + 2 > body_size)
+            return -1;
+        *packet_id = ((unsigned int)body[offset] << 8) | body[offset + 1];
+        offset += 2;
+    }
+    else {
+        *packet_id = 0;
+    }
+    *payload = body + offset;
+    *payload_size = body_size - offset;
+    return 0;
+}
+
+static int load_transfer_plan(const char* path,
+                              struct transfer_operation operations[6])
+{
+    FILE* file = fopen(path, "r");
+    int count = 0;
+    if (file == NULL)
+        return -1;
+    char header[128];
+    if (fgets(header, sizeof(header), file) == NULL) {
+        fclose(file);
+        return -1;
+    }
+    while (count < 6 && fscanf(file, "%u,%23[^,],%u,%u\n",
+            &operations[count].order, operations[count].direction,
+            &operations[count].payload_bytes,
+            &operations[count].payload_seed) == 4)
+        count++;
+    fclose(file);
+    return count == 6 ? 0 : -1;
+}
+
+static int handle_subscribe_and_ready(WOLFSSL* ssl)
+{
+    unsigned char type, *body = NULL, *payload;
+    unsigned int size, packet_id = 0, payload_size;
+    char topic[64];
+    if (read_packet(ssl, &type, &body, &size) != 0 || type != 0x82 || size < 2)
+        goto fail;
+    packet_id = ((unsigned int)body[0] << 8) | body[1];
+    free(body); body = NULL;
+    unsigned char suback[] = {0x90, 0x04, packet_id >> 8, packet_id, 0x01, 0x01};
+    if (tls_write_all(ssl, suback, sizeof(suback)) != 0 ||
+        read_packet(ssl, &type, &body, &size) != 0 ||
+        parse_publish(type, body, size, topic, sizeof(topic), &payload,
+                      &payload_size, &packet_id) != 0 ||
+        strcmp(topic, "bench/up") != 0 || payload_size != 5 ||
+        memcmp(payload, "READY", 5) != 0 || send_puback(ssl, packet_id) != 0)
+        goto fail;
+    free(body);
+    return 0;
+fail:
+    free(body);
+    return -1;
+}
+
+static int run_transfers(WOLFSSL* ssl, const char* plan_path)
+{
+    struct transfer_operation operations[6];
+    unsigned int packet_id_state = 100;
+    if (load_transfer_plan(plan_path, operations) != 0 ||
+        handle_subscribe_and_ready(ssl) != 0)
+        return -1;
+    fprintf(stderr, "[BENCH_TRANSFER_SERVER] status=ready\n");
+
+    for (int i = 0; i < 6; i++) {
+        struct transfer_operation* op = &operations[i];
+        unsigned char* expected = make_payload(op->payload_seed, op->payload_bytes);
+        unsigned char *body = NULL, *payload;
+        unsigned int body_size, payload_size, packet_id;
+        unsigned char type;
+        char topic[64], expected_hash[65], command[192];
+        if (expected == NULL)
+            return -1;
+        hash_hex(expected, op->payload_bytes, expected_hash);
+        snprintf(command, sizeof(command), "%s %u %u %u %s",
+            strcmp(op->direction, "server_to_device") == 0 ? "DOWN" : "UP",
+            op->order, op->payload_bytes, op->payload_seed, expected_hash);
+        if (publish(ssl, "bench/control", (unsigned char*)command,
+                    (unsigned int)strlen(command), &packet_id_state) != 0)
+            goto operation_fail;
+
+        struct timeval start, end;
+        gettimeofday(&start, NULL);
+        if (strcmp(op->direction, "server_to_device") == 0) {
+            if (publish(ssl, "bench/down", expected, op->payload_bytes,
+                        &packet_id_state) != 0 ||
+                read_packet(ssl, &type, &body, &body_size) != 0 ||
+                parse_publish(type, body, body_size, topic, sizeof(topic),
+                              &payload, &payload_size, &packet_id) != 0 ||
+                strcmp(topic, "bench/device_ack") != 0 ||
+                payload_size >= sizeof(command) ||
+                send_puback(ssl, packet_id) != 0)
+                goto operation_fail;
+            memcpy(command, payload, payload_size);
+            command[payload_size] = '\0';
+            char expected_ack[192];
+            snprintf(expected_ack, sizeof(expected_ack), "ACK_DOWN %u 1 %s",
+                     op->order, expected_hash);
+            if (strcmp(command, expected_ack) != 0)
+                goto operation_fail;
+        }
+        else {
+            if (read_packet(ssl, &type, &body, &body_size) != 0 ||
+                parse_publish(type, body, body_size, topic, sizeof(topic),
+                              &payload, &payload_size, &packet_id) != 0 ||
+                strcmp(topic, "bench/up") != 0 ||
+                payload_size != op->payload_bytes ||
+                memcmp(payload, expected, payload_size) != 0 ||
+                send_puback(ssl, packet_id) != 0)
+                goto operation_fail;
+            snprintf(command, sizeof(command), "ACK_UP %u 1 %s",
+                     op->order, expected_hash);
+            if (publish(ssl, "bench/control", (unsigned char*)command,
+                        (unsigned int)strlen(command), &packet_id_state) != 0)
+                goto operation_fail;
+        }
+        gettimeofday(&end, NULL);
+        free(body);
+        body = NULL;
+        if (read_packet(ssl, &type, &body, &body_size) != 0 ||
+            parse_publish(type, body, body_size, topic, sizeof(topic),
+                          &payload, &payload_size, &packet_id) != 0 ||
+            strcmp(topic, "bench/metrics") != 0 ||
+            send_puback(ssl, packet_id) != 0)
+            goto operation_fail;
+        fprintf(stderr, "[BENCH_TRANSFER_DEVICE] %.*s\n",
+                (int)payload_size, (const char*)payload);
+        long long elapsed = (end.tv_sec - start.tv_sec) * 1000000LL +
+                            end.tv_usec - start.tv_usec;
+        fprintf(stderr,
+            "[BENCH_TRANSFER_SERVER] sequence=%u direction=%s payload_bytes=%u "
+            "status=success integrity_match=1 sha256=%s server_end_to_end_us=%lld\n",
+            op->order, op->direction, op->payload_bytes, expected_hash, elapsed);
+        fflush(stderr);
+        free(body);
+        free(expected);
+        continue;
+operation_fail:
+        free(body);
+        free(expected);
+        return -1;
+    }
+    fprintf(stderr, "[BENCH_TRANSFER_SERVER] status=complete\n");
+    fflush(stderr);
+    return 0;
+}
+
 int main(int argc, char** argv)
 {
     struct config cfg;
@@ -480,6 +794,12 @@ int main(int argc, char** argv)
             goto cleanup;
         fprintf(stderr, "[wolfssl-server] MQTT CONNACK sent\n");
         fflush(stderr);
+
+        if (cfg.transfer_plan != NULL &&
+            run_transfers(ssl, cfg.transfer_plan) != 0) {
+            fprintf(stderr, "[BENCH_TRANSFER_SERVER] status=fail\n");
+            goto cleanup;
+        }
 
         (void)wolfSSL_shutdown(ssl);
         wolfSSL_free(ssl);

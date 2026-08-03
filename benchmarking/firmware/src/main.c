@@ -16,6 +16,12 @@
 #include "benchmark_metrics.h"
 #include "benchmark_dwt.h"
 #include "power_markers.h"
+#ifdef BENCH_TRANSFER_MODE
+#include "mqtt_transfer.h"
+#define BENCH_HANDSHAKE_TAG "[BENCH_HANDSHAKE]"
+#else
+#define BENCH_HANDSHAKE_TAG "[BENCH_RESULT]"
+#endif
 #ifdef BENCH_USE_PQM4_MLKEM
 #include "pqm4_mlkem_backend.h"
 #endif
@@ -1045,7 +1051,7 @@ void start_secure_mqtt_session(struct bt_l2cap_chan *chan)
                 goto cleanup;
             }
             BENCH_RESULT_OUT(
-                "[BENCH_RESULT] status=success tls_setup_ms=%lld "
+                BENCH_HANDSHAKE_TAG " status=success tls_setup_ms=%lld "
                 "raw_handshake_ms=%lld mqtt_connect_ms=%lld full_connect_ms=%lld "
                 "end_to_end_ms=%lld client_cpu_cycles=%llu client_cpu_us=%llu "
                 "client_cycle_hz=%u client_cpu_usage_bp=%u "
@@ -1114,6 +1120,14 @@ void start_secure_mqtt_session(struct bt_l2cap_chan *chan)
                 selected_signature->signature_scheme,
                 BENCH_CLIENT_SIG_SCHEME, BENCH_CLIENT_IDENTITY_ID,
                 BENCHMARK_DWT_VALUES(dwt));
+#ifdef BENCH_TRANSFER_MODE
+            ret = benchmark_mqtt_transfer_run(
+                ssl, &wolfssl_heap, WOLFSSL_HEAP_SIZE);
+            BENCH_RESULT_OUT(
+                "[BENCH_RESULT] status=%s stage=transfer_%s error=%d\n",
+                ret == 0 ? "success" : "fail",
+                ret == 0 ? "complete" : "failed", ret);
+#endif
             goto cleanup;
         }
         if (bytes_read < 0) {

@@ -140,6 +140,7 @@ def build(
     mtls_mode: bool = False,
     certificate_gen: bool = False,
     kem_benchmark: bool = False,
+    transfer_mode: bool = False,
 ) -> None:
     if certificate_gen and kem_benchmark:
         raise ValueError("certificate_gen and kem_benchmark are mutually exclusive")
@@ -151,6 +152,7 @@ def build(
         f"-DBENCH_MTLS_MODE={'ON' if mtls_mode else 'OFF'}",
         f"-DBENCH_CERTIFICATE_GEN={'ON' if certificate_gen else 'OFF'}",
         f"-DBENCH_KEM_OPERATIONS={'ON' if kem_benchmark else 'OFF'}",
+        f"-DBENCH_TRANSFER_MODE={'ON' if transfer_mode else 'OFF'}",
     ]
     if not standalone_benchmark:
         cmake_args.append(f"-DBENCH_GENERATED_DIR={generated_dir}")
@@ -166,6 +168,7 @@ def build(
         build_env["BENCH_GENERATED_DIR"] = str(generated_dir)
     build_env["BENCH_MLKEM_BACKEND"] = mlkem_backend
     build_env["BENCH_MTLS_MODE"] = "ON" if mtls_mode else "OFF"
+    build_env["BENCH_TRANSFER_MODE"] = "ON" if transfer_mode else "OFF"
     if pqm4_dir is not None:
         build_env["PQM4_ROOT"] = str(pqm4_dir)
     command, cwd, env = west_command(

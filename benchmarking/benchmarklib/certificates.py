@@ -340,6 +340,14 @@ def write_case_configs(case: dict[str, str], output: Path) -> None:
         "keyfile __REMOTE_CASE_DIR__/server.key\n"
         "require_certificate false\n"
     )
+    (output / "mosquitto-transfer.conf").write_text(
+        "per_listener_settings true\n"
+        "listener 8883\nallow_anonymous true\n"
+        "certfile __REMOTE_CASE_DIR__/server_chain.crt\n"
+        "keyfile __REMOTE_CASE_DIR__/server.key\n"
+        "require_certificate false\n"
+        "listener 18884 127.0.0.1\nallow_anonymous true\n"
+    )
     if (output / "client_ca.crt").exists():
         mtls_openssl = (output / "openssl.cnf").read_text().replace(
             f"SignatureAlgorithms = {leaf.tls_signature_scheme}\n",
@@ -355,6 +363,16 @@ def write_case_configs(case: dict[str, str], output: Path) -> None:
             "require_certificate true\n"
             "use_identity_as_username true\n"
         )
+        (output / "mosquitto-transfer-mtls.conf").write_text(
+            "per_listener_settings true\n"
+            "listener 8883\nallow_anonymous true\n"
+            "cafile __REMOTE_CASE_DIR__/client_ca.crt\n"
+            "certfile __REMOTE_CASE_DIR__/server_chain.crt\n"
+            "keyfile __REMOTE_CASE_DIR__/server.key\n"
+            "require_certificate true\n"
+            "use_identity_as_username true\n"
+            "listener 18884 127.0.0.1\nallow_anonymous true\n"
+    )
 
 
 def generate_server_case(

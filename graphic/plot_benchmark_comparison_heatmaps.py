@@ -22,6 +22,8 @@ from plot_tls_handshake_bars import (
     heatmap_axes_by_descending_mean,
     kem_security_level,
     load_rows,
+    pki_category,
+    pki_signature_label,
     resolve_run_dir,
     signature_security_level,
 )
@@ -48,9 +50,9 @@ METRICS = (
         0,
     ),
     (
-        "peak_system_cpu_usage_percent",
-        "Peak system CPU usage difference",
-        "cpu_peak_usage_difference",
+        "mean_system_cpu_usage_percent",
+        "Average system CPU usage difference",
+        "cpu_average_usage_difference",
         "percentage points",
         1,
     ),
@@ -73,7 +75,7 @@ METRICS = (
 
 def rows_by_pair(rows: list[dict[str, str]]) -> dict[tuple[str, str], dict[str, str]]:
     return {
-        (row.get("kex_group", ""), row.get("cert_sig_alg", "")): row
+        (row.get("kex_group", ""), pki_signature_label(row)): row
         for row in rows
         if row.get("kex_group") and row.get("cert_sig_alg")
     }
@@ -161,7 +163,7 @@ def plot_difference_heatmap(
         pair[0]: kem_security_level(row) for pair, row in metadata.items()
     }
     signature_levels = {
-        pair[1]: signature_security_level(row)
+        pki_signature_label(row): signature_security_level(row)
         for pair, row in metadata.items()
     }
     ax.set_xticklabels(
@@ -243,19 +245,29 @@ def main() -> int:
         / f"comparison_{first_dir.name}_vs_{second_dir.name}"
     )
     extension = "png" if args.generate_png else "pdf"
-    for metric, title, filename, unit, decimals in METRICS:
-        cells = plot_difference_heatmap(
-            first_rows,
-            second_rows,
-            metric=metric,
-            title=title,
-            unit=unit,
-            decimals=decimals,
-            first_name=first_dir.name,
-            second_name=second_dir.name,
-            output=output_dir / f"{filename}.{extension}",
-        )
-        print(f"{metric}_shared_cells={cells}")
+    for pki in ("homogeneous", "heterogeneous"):
+        first_pki_rows = [
+            row for row in first_rows if pki_category(row) == pki
+        ]
+        second_pki_rows = [
+            row for row in second_rows if pki_category(row) == pki
+        ]
+        if not first_pki_rows or not second_pki_rows:
+            print(f"warning: no shared {pki} PKI rows to compare")
+            continue
+        for metric, title, filename, unit, decimals in METRICS:
+            cells = plot_difference_heatmap(
+                first_pki_rows,
+                second_pki_rows,
+                metric=metric,
+                title=f"{title} - {pki.capitalize()} PKI",
+                unit=unit,
+                decimals=decimals,
+                first_name=first_dir.name,
+                second_name=second_dir.name,
+                output=output_dir / f"{filename}_{pki}.{extension}",
+            )
+            print(f"{pki}_{metric}_shared_cells={cells}")
 
     print(f"input_1={first_dir}")
     print(f"input_2={second_dir}")

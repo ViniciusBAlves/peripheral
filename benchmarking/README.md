@@ -440,6 +440,36 @@ Each run writes immutable artifacts below `results/<timestamp>_<seed>/`,
 including the input CSV, run and session manifests, per-case attempts and logs,
 and the aggregate `summary.csv`.
 
+## Bidirectional Payload Benchmark
+
+`run_transfer_benchmarks.py` reuses the same case CSV, PKI generation,
+universal firmware profiles, Raspberry Pi bridge, TLS backends, and seed. Each
+CSV `iteration` is one fresh BLE/TLS/MQTT round containing six QoS 1 transfers:
+1, 10, and 100 KiB in both directions. `warmup_iterations` and
+`--sessions-per-case` are ignored by this runner.
+
+```bash
+python3 benchmarking/run_transfer_benchmarks.py \
+  --cases benchmarking/cases/simple_cases.csv \
+  --seed 123 \
+  --limit 1
+```
+
+Use `--mtls-mode` to retain mutual TLS. Resume an interrupted run with:
+
+```bash
+python3 benchmarking/run_transfer_benchmarks.py --resume <run_id>
+```
+
+The round and its six operations are shuffled deterministically. Results are
+written to `round_manifest.csv`, `transfer_manifest.csv`,
+`handshake_summary.csv`, `transfer_summary.csv`, and per-case
+`handshakes.csv`/`transmissions.csv`. Payload integrity uses a deterministic
+stream and SHA-256 plus MQTT PUBACK and an application-level ACK. Failed retry
+data remains in `transmissions.csv`, while aggregates include only complete
+rounds with confirmed integrity. Power columns are explicitly `unsupported`
+on the current nRF5340 port.
+
 To require every recorded execution, including warmups, to have succeeded:
 
 ```bash

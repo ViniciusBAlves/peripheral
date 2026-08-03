@@ -10,6 +10,11 @@ endif()
 option(BENCH_POWER_MARKERS "Enable PPK2 GPIO timing markers" OFF)
 option(BENCH_BLE_TELEMETRY "Send structured benchmark output over BLE L2CAP" OFF)
 option(BENCH_MTLS_MODE "Load the fixed client identity for mutual TLS" OFF)
+option(BENCH_TRANSFER_MODE "Run bidirectional MQTT payload transfers" OFF)
+if(DEFINED ENV{BENCH_TRANSFER_MODE})
+    set(BENCH_TRANSFER_MODE "$ENV{BENCH_TRANSFER_MODE}" CACHE BOOL
+        "Run bidirectional MQTT payload transfers" FORCE)
+endif()
 if(DEFINED ENV{BENCH_MTLS_MODE})
     set(BENCH_MTLS_MODE "$ENV{BENCH_MTLS_MODE}" CACHE BOOL
         "Load the fixed client identity for mutual TLS" FORCE)
@@ -202,6 +207,9 @@ if(BENCH_MTLS_MODE)
 else()
     target_compile_definitions(app PRIVATE BENCH_MTLS_MODE=0)
 endif()
+if(BENCH_TRANSFER_MODE)
+    target_compile_definitions(app PRIVATE BENCH_TRANSFER_MODE=1)
+endif()
 
 # Measure processing of the server's TLS 1.3 CertificateVerify separately
 # from X.509 chain signature verification.
@@ -264,6 +272,9 @@ elseif(BENCH_KEM_OPERATIONS)
         src/kem_bench_main.c src/benchmark_metrics.c src/power_markers.c)
 else()
     target_sources(app PRIVATE src/main.c src/benchmark_metrics.c src/power_markers.c)
+    if(BENCH_TRANSFER_MODE)
+        target_sources(app PRIVATE src/mqtt_transfer.c)
+    endif()
 endif()
 
 target_sources(app PRIVATE

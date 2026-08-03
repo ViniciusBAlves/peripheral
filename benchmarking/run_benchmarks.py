@@ -43,6 +43,15 @@ from benchmarklib.power_profiler import (
     PowerProfilerSession,
 )
 from benchmarklib.scheduler import SessionJob, build_jobs
+from benchmarklib.transfer import (
+    TransferOperation,
+    TransferRound,
+    build_transfer_rounds,
+    confidence_95_half_width,
+    mqtt_publish_header,
+    payload_sha256,
+    percentile_95 as transfer_percentile_95,
+)
 from benchmarklib.server_backends import (
     SERVER_BACKEND_CHOICES,
     server_backend_for_case,
@@ -121,6 +130,35 @@ ATTEMPT_FIELDS = [
     "power_profiler_window_count", "power_profiler_vdd_mv",
     "power_profiler_output_samples_per_second",
     "error_code", "message",
+]
+
+TRANSFER_FIELDS = [
+    "case_id", "round_index", "round_try", "round_complete", "attempt_index",
+    "schedule_index",
+    "transfer_order", "direction", "payload_bytes", "status", "qos",
+    "packet_id", "reconnect_count", "expected_sha256", "received_sha256",
+    "integrity_match", "client_transfer_ms", "server_transfer_ms",
+    "ack_latency_ms", "end_to_end_ms", "goodput_kib_s",
+    "client_cpu_cycles", "client_cycle_hz", "client_cpu_ms",
+    "client_cpu_usage_percent", "system_cpu_usage_percent",
+    "client_heap_current_bytes", "client_heap_peak_bytes",
+    "thread_stack_used_bytes", "thread_stack_capacity_bytes",
+    "l2cap_tx_packets", "l2cap_tx_bytes", "l2cap_rx_packets",
+    "l2cap_rx_bytes", "l2cap_tx_retries", "l2cap_tx_wait_ms",
+    "l2cap_rx_overflows", "dwt_cyccnt", "dwt_cpicnt", "dwt_exccnt",
+    "dwt_sleepcnt", "dwt_lsucnt", "dwt_foldcnt", "mqtt_wire_bytes",
+    "mqtt_protocol_overhead_bytes", "power_status", "transfer_energy_uj",
+    "message",
+]
+
+TRANSFER_SUMMARY_FIELDS = [
+    "case_id", "direction", "payload_bytes", "success_count", "fail_count",
+    "timeout_count", "not_run_count", "mean_end_to_end_ms",
+    "median_end_to_end_ms", "p95_end_to_end_ms", "min_end_to_end_ms",
+    "max_end_to_end_ms", "stddev_end_to_end_ms", "ci95_end_to_end_ms",
+    "mean_goodput_kib_s", "median_goodput_kib_s", "p95_goodput_kib_s",
+    "min_goodput_kib_s", "max_goodput_kib_s", "stddev_goodput_kib_s",
+    "ci95_goodput_kib_s",
 ]
 
 SUMMARY_FIELDS = [
@@ -286,6 +324,33 @@ def load_session_jobs(run_dir: Path) -> list[SessionJob]:
     ]
 
 
+def load_transfer_rounds(run_dir: Path) -> list[TransferRound]:
+    operations: dict[tuple[int, str], list[TransferOperation]] = defaultdict(list)
+    with (run_dir / "transfer_manifest.csv").open(newline="") as stream:
+        for row in csv.DictReader(stream):
+            key = (int(row["execution_order"]), row["case_id"])
+            operations[key].append(TransferOperation(
+                order=int(row["transfer_order"]),
+                direction=row["direction"],
+                payload_bytes=int(row["payload_bytes"]),
+                payload_seed=int(row["payload_seed"]),
+            ))
+    with (run_dir / "round_manifest.csv").open(newline="") as stream:
+        rows = sorted(csv.DictReader(stream), key=lambda row: int(row["execution_order"]))
+    return [
+        TransferRound(
+            sequence=int(row["source_sequence"]),
+            case_id=row["case_id"],
+            round_index=int(row["round_index"]),
+            operations=tuple(sorted(
+                operations[(int(row["execution_order"]), row["case_id"])],
+                key=lambda operation: operation.order,
+            )),
+        )
+        for row in rows
+    ]
+
+
 def load_attempts(
     case_dirs: dict[str, Path],
 ) -> dict[str, list[dict[str, object]]]:
@@ -297,6 +362,18 @@ def load_attempts(
         with path.open(newline="") as stream:
             attempts[case_id].extend(dict(row) for row in csv.DictReader(stream))
     return attempts
+
+
+def load_transmissions(
+    case_dirs: dict[str, Path],
+) -> dict[str, list[dict[str, object]]]:
+    rows: dict[str, list[dict[str, object]]] = defaultdict(list)
+    for case_id, directory in case_dirs.items():
+        path = directory / "transmissions.csv"
+        if path.exists():
+            with path.open(newline="") as stream:
+                rows[case_id].extend(dict(row) for row in csv.DictReader(stream))
+    return rows
 
 
 def read_checkpoint(run_dir: Path) -> dict[str, object]:
@@ -466,6 +543,7 @@ def wait_for_result(
     board_log: Path,
     timeout: float,
     fatal_detector=None,
+    observations: list[tuple[str, dict[str, str]]] | None = None,
 ) -> dict[str, str]:
     deadline = time.monotonic() + timeout
     next_fatal_check = time.monotonic()
@@ -501,6 +579,8 @@ def wait_for_result(
             stream.write(line + "\n")
             stream.flush()
             parsed = parse_bench_line(line)
+            if parsed and observations is not None:
+                observations.append(parsed)
             if parsed and parsed[0] == "RESULT":
                 return parsed[1]
     return {"status": "timeout", "stage": "serial_wait", "error": "timeout"}
@@ -512,6 +592,7 @@ def wait_for_ble_result(
     board_log: Path,
     timeout: float,
     fatal_detector=None,
+    observations: list[tuple[str, dict[str, str]]] | None = None,
 ) -> dict[str, str]:
     deadline = time.monotonic() + timeout
     next_fatal_check = time.monotonic()
@@ -521,6 +602,8 @@ def wait_for_ble_result(
             with board_log.open("a") as stream:
                 stream.write(line + "\n")
             parsed = parse_bench_line(line)
+            if parsed and observations is not None:
+                observations.append(parsed)
             if parsed and parsed[0] == "RESULT":
                 return parsed[1]
         now = time.monotonic()
@@ -615,8 +698,164 @@ def classify_gateway_start_failure(
     return final
 
 
+def transfer_plan_for_job(job: TransferRound) -> dict[str, object]:
+    return {
+        "case_id": job.case_id,
+        "round_index": job.round_index,
+        "operations": [
+            {
+                "order": operation.order,
+                "direction": operation.direction,
+                "payload_bytes": operation.payload_bytes,
+                "payload_seed": operation.payload_seed,
+            }
+            for operation in job.operations
+        ],
+    }
+
+
+def parse_transfer_server_metrics(path: Path) -> dict[int, dict[str, str]]:
+    values: dict[int, dict[str, str]] = {}
+    if not path.exists():
+        return values
+    for line in path.read_text(errors="replace").splitlines():
+        parsed = parse_bench_line(line)
+        if parsed and parsed[0] == "TRANSFER_SERVER" and "sequence" in parsed[1]:
+            values[int(parsed[1]["sequence"])] = parsed[1]
+    return values
+
+
+def parse_transfer_device_metrics(path: Path) -> dict[int, dict[str, str]]:
+    values: dict[int, dict[str, str]] = {}
+    if not path.exists():
+        return values
+    for line in path.read_text(errors="replace").splitlines():
+        parsed = parse_bench_line(line)
+        if parsed and parsed[0] == "TRANSFER_DEVICE" and "sequence" in parsed[1]:
+            values[int(parsed[1]["sequence"])] = parsed[1]
+    return values
+
+
+def transfer_rows_for_round(
+    job: TransferRound,
+    observations: list[tuple[str, dict[str, str]]],
+    broker_log: Path,
+    *,
+    attempt_index: int,
+    reconnect_count: int,
+    round_status: str,
+) -> list[dict[str, object]]:
+    board: dict[int, dict[str, str]] = {}
+    for kind, values in observations:
+        if kind not in {
+            "TRANSFER_RESULT", "TRANSFER_RESOURCE", "TRANSFER_TRANSPORT"
+        } or "sequence" not in values:
+            continue
+        board.setdefault(int(values["sequence"]), {}).update(values)
+    server = parse_transfer_server_metrics(broker_log)
+    for sequence, values in parse_transfer_device_metrics(broker_log).items():
+        board.setdefault(sequence, {}).update(values)
+    rows: list[dict[str, object]] = []
+    for operation in job.operations:
+        values = board.get(operation.order, {})
+        server_values = server.get(operation.order, {})
+        if (
+            not values and round_status == "success" and
+            server_values.get("status") == "success"
+        ):
+            values = {
+                "status": "success",
+                "integrity_match": server_values.get("integrity_match", "1"),
+                "sha256": server_values.get("sha256", ""),
+            }
+        completed = bool(values)
+        status = values.get("status", "not_run") if completed else "not_run"
+        if status == "not_run" and round_status == "timeout":
+            status = "timeout"
+        transfer_us = number(values, "transfer_us")
+        end_us = number(values, "end_to_end_us")
+        server_us = number(server_values, "server_end_to_end_us")
+        cpu_cycles = number(values, "client_cpu_cycles")
+        cycle_hz = number(values, "client_cycle_hz")
+        packet_id = values.get("packet_id", "")
+        expected_hash = payload_sha256(
+            operation.payload_seed, operation.payload_bytes
+        )
+        actual_hash = values.get("sha256", server_values.get("sha256", ""))
+        mqtt_header_bytes = len(
+            mqtt_publish_header(
+                "bench/down" if operation.direction == "server_to_device"
+                else "bench/up",
+                int(packet_id or 1),
+                operation.payload_bytes,
+            )
+        )
+        end_ms = end_us / 1000.0 if end_us is not None else None
+        rows.append({
+            "case_id": job.case_id,
+            "round_index": job.round_index,
+            "attempt_index": attempt_index,
+            "schedule_index": job.sequence,
+            "transfer_order": operation.order,
+            "direction": operation.direction,
+            "payload_bytes": operation.payload_bytes,
+            "status": status,
+            "qos": 1,
+            "packet_id": packet_id,
+            "reconnect_count": reconnect_count,
+            "expected_sha256": expected_hash,
+            "received_sha256": actual_hash,
+            "integrity_match": values.get("integrity_match", "0"),
+            "client_transfer_ms": (
+                f"{transfer_us / 1000.0:.3f}" if transfer_us is not None else ""
+            ),
+            "server_transfer_ms": (
+                f"{server_us / 1000.0:.3f}" if server_us is not None else ""
+            ),
+            "ack_latency_ms": microseconds_as_milliseconds(values, "ack_us"),
+            "end_to_end_ms": f"{end_ms:.3f}" if end_ms is not None else "",
+            "goodput_kib_s": (
+                f"{operation.payload_bytes / end_ms:.3f}"
+                if end_ms and status == "success" else ""
+            ),
+            "client_cpu_cycles": values.get("client_cpu_cycles", ""),
+            "client_cycle_hz": values.get("client_cycle_hz", ""),
+            "client_cpu_ms": (
+                f"{cpu_cycles * 1000.0 / cycle_hz:.3f}"
+                if cpu_cycles is not None and cycle_hz else ""
+            ),
+            "client_cpu_usage_percent": (
+                f"{float(values['client_cpu_usage_bp']) / 100.0:.2f}"
+                if values.get("client_cpu_usage_bp") else ""
+            ),
+            "system_cpu_usage_percent": (
+                f"{float(values['system_cpu_usage_bp']) / 100.0:.2f}"
+                if values.get("system_cpu_usage_bp") else ""
+            ),
+            "client_heap_current_bytes": values.get("client_heap_current_bytes", ""),
+            "client_heap_peak_bytes": values.get("client_heap_peak_bytes", ""),
+            "thread_stack_used_bytes": values.get("thread_stack_used_bytes", ""),
+            "thread_stack_capacity_bytes": values.get("thread_stack_capacity_bytes", ""),
+            **{field: values.get(field, "") for field in (
+                "l2cap_tx_packets", "l2cap_tx_bytes", "l2cap_rx_packets",
+                "l2cap_rx_bytes", "l2cap_tx_retries", "l2cap_rx_overflows",
+                "dwt_cyccnt", "dwt_cpicnt", "dwt_exccnt", "dwt_sleepcnt",
+                "dwt_lsucnt", "dwt_foldcnt",
+            )},
+            "l2cap_tx_wait_ms": microseconds_as_milliseconds(
+                values, "l2cap_tx_wait_us"
+            ),
+            "mqtt_wire_bytes": operation.payload_bytes + mqtt_header_bytes,
+            "mqtt_protocol_overhead_bytes": mqtt_header_bytes,
+            "power_status": "unsupported",
+            "transfer_energy_uj": "",
+            "message": values.get("error", "") if completed else round_status,
+        })
+    return rows
+
+
 def run_job(
-    job: SessionJob,
+    job: SessionJob | TransferRound,
     case: dict[str, str],
     case_dir: Path,
     remote_case: str,
@@ -632,9 +871,15 @@ def run_job(
     final: dict[str, str] = {}
     reconnect_count = 0
     attempt_timeout = timeout_for_case(case, args.attempt_timeout_sec)
+    if getattr(args, "transfer_mode", False):
+        # The six operations have independent 30/120/600 second ceilings.
+        attempt_timeout += 2 * (30.0 + 120.0 + 600.0)
     power_values: dict[str, object] = {}
     power_session = getattr(args, "power_profiler_session", None)
+    observations: list[tuple[str, dict[str, str]]] = []
+    all_transfer_rows: list[dict[str, object]] = []
     for retry in range(args.reconnect_retries + 1):
+        observations = []
         power_capture = None
         retry_trace = None
         if getattr(args, "power_profiler", False):
@@ -672,6 +917,10 @@ def run_job(
                 ].tls_signature_scheme,
                 tls_timeout_sec=attempt_timeout,
                 mtls_mode=getattr(args, "mtls_mode", False),
+                transfer_plan=(
+                    transfer_plan_for_job(job)
+                    if isinstance(job, TransferRound) else None
+                ),
                 )
                 remote_broker_log = f"{gateway.workdir}/logs/{case['case_id']}.broker.log"
                 fatal_detector = lambda: gateway.remote_file_contains(
@@ -681,11 +930,13 @@ def run_job(
                     final = wait_for_ble_result(
                         gateway, case["case_id"], board_log, attempt_timeout,
                         fatal_detector=fatal_detector,
+                        observations=observations,
                     )
                 else:
                     final = wait_for_result(
                         serial_port, board_log, attempt_timeout,
                         fatal_detector=fatal_detector,
+                        observations=observations,
                     )
             except Exception as error:
                 final = {
@@ -735,6 +986,22 @@ def run_job(
             if power_capture is not None and retry_trace is not None:
                 power_values = power_capture.stop(retry_trace)
 
+        if isinstance(job, TransferRound):
+            retry_rows = transfer_rows_for_round(
+                job, observations, broker_log,
+                attempt_index=attempt_index,
+                reconnect_count=retry,
+                round_status=final.get("status", "fail"),
+            )
+            complete = (
+                final.get("status") == "success" and
+                all(row["status"] == "success" for row in retry_rows)
+            )
+            for transfer_row in retry_rows:
+                transfer_row["round_try"] = retry + 1
+                transfer_row["round_complete"] = int(complete)
+            all_transfer_rows.extend(retry_rows)
+
         if final.get("status") == "success" or final.get("fatal") == "1" or \
                 retry >= args.reconnect_retries:
             if retry_trace is not None and retry_trace.exists():
@@ -745,6 +1012,17 @@ def run_job(
         if getattr(args, "power_profiler", False):
             power_session.power_cycle()
         time.sleep(args.reconnect_delay_sec)
+
+    terminal = final
+    if getattr(args, "transfer_mode", False):
+        handshakes = [values for kind, values in observations if kind == "HANDSHAKE"]
+        if handshakes:
+            final = {
+                **handshakes[-1],
+                "status": terminal.get("status", "fail"),
+                "stage": terminal.get("stage", "transfer_complete"),
+                "error": terminal.get("error", ""),
+            }
 
     gateway_values = parse_gateway_metrics(gateway_log)
     server_values = parse_server_metrics(broker_log)
@@ -773,7 +1051,7 @@ def run_job(
         path = case_dir / "generated" / name
         return path.stat().st_size if path.exists() else ""
 
-    return {
+    row = {
         "attempt_index": attempt_index,
         "schedule_index": job.sequence,
         "session": job.session,
@@ -940,6 +1218,9 @@ def run_job(
         "_fatal": final.get("fatal", ""),
         "_fatal_message": final.get("fatal_message", ""),
     }
+    if isinstance(job, TransferRound):
+        row["_transmissions"] = all_transfer_rows
+    return row
 
 
 def summarize(case: dict[str, str], attempts: list[dict[str, object]]) -> dict[str, object]:
@@ -1242,6 +1523,54 @@ def summarize(case: dict[str, str], attempts: list[dict[str, object]]) -> dict[s
     }
 
 
+def summarize_transfers(rows: list[dict[str, object]]) -> list[dict[str, object]]:
+    grouped: dict[tuple[str, str, int], list[dict[str, object]]] = defaultdict(list)
+    for row in rows:
+        grouped[(
+            str(row["case_id"]), str(row["direction"]), int(row["payload_bytes"])
+        )].append(row)
+    output: list[dict[str, object]] = []
+    for (case_id, direction, payload_size), group in sorted(grouped.items()):
+        success = [
+            row for row in group
+            if row["status"] == "success" and int(row.get("round_complete", 0))
+        ]
+        times = [float(row["end_to_end_ms"]) for row in success if row["end_to_end_ms"] != ""]
+        goodputs = [float(row["goodput_kib_s"]) for row in success if row["goodput_kib_s"] != ""]
+
+        def metrics(values: list[float], suffix: str) -> dict[str, object]:
+            if not values:
+                return {f"{name}_{suffix}": "" for name in (
+                    "mean", "median", "p95", "min", "max", "stddev", "ci95"
+                )}
+            stats = aggregate(values)
+            return {
+                f"mean_{suffix}": stats["mean"],
+                f"median_{suffix}": stats["median"],
+                f"p95_{suffix}": f"{transfer_percentile_95(values):.3f}",
+                f"min_{suffix}": stats["min"],
+                f"max_{suffix}": stats["max"],
+                f"stddev_{suffix}": stats["stddev"],
+                f"ci95_{suffix}": (
+                    f"{confidence_95_half_width(values):.3f}"
+                    if confidence_95_half_width(values) is not None else ""
+                ),
+            }
+
+        output.append({
+            "case_id": case_id,
+            "direction": direction,
+            "payload_bytes": payload_size,
+            "success_count": len(success),
+            "fail_count": sum(row["status"] == "fail" for row in group),
+            "timeout_count": sum(row["status"] == "timeout" for row in group),
+            "not_run_count": sum(row["status"] == "not_run" for row in group),
+            **metrics(times, "end_to_end_ms"),
+            **metrics(goodputs, "goodput_kib_s"),
+        })
+    return output
+
+
 def load_config(path: Path) -> dict[str, object]:
     if not path.exists():
         raise FileNotFoundError(f"benchmark configuration not found: {path}")
@@ -1357,6 +1686,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--only-case", action="append", default=[])
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--transfer-mode", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--skip-build", action="store_true")
     parser.add_argument("--skip-flash", action="store_true")
     parser.add_argument(
@@ -1462,8 +1792,8 @@ def resolve_pi_workdir(pi_host: str, configured: str) -> str:
     return f"/home/{username}/peripheral-benchmark"
 
 
-def main() -> int:
-    args = parse_args()
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
     args.pi_workdir = resolve_pi_workdir(args.pi_host, args.pi_workdir)
     if args.sessions_per_case < 1 or args.reconnect_retries < 0:
         raise ValueError("sessions and reconnect retries must be non-negative")
@@ -1492,10 +1822,13 @@ def main() -> int:
         run_id = run_dir.name
         cases = load_manifest_cases(run_dir)
         seed = int((run_dir / "seed.txt").read_text().strip())
-        jobs = load_session_jobs(run_dir)
         saved_config_path = run_dir / "run_config.json"
         if saved_config_path.exists():
             saved_config = json.loads(saved_config_path.read_text())
+            saved_transfer_mode = saved_config.get("benchmark_mode") == "transfer"
+            if args.transfer_mode and not saved_transfer_mode:
+                raise ValueError("--transfer-mode cannot resume a normal benchmark run")
+            args.transfer_mode = saved_transfer_mode
             args.mlkem_backend = saved_config["mlkem_backend"]
             args.server_backend = saved_config["server_backend"]
             args.mtls_mode = bool(saved_config.get("mtls_mode", False))
@@ -1514,6 +1847,10 @@ def main() -> int:
                 "power_profiler_output_samples_per_second",
                 args.power_profiler_output_samples_per_second,
             )
+        jobs = (
+            load_transfer_rounds(run_dir) if args.transfer_mode
+            else load_session_jobs(run_dir)
+        )
         checkpoint = read_checkpoint(run_dir)
         last_completed_execution_order = int(
             checkpoint.get("last_completed_execution_order", 0)
@@ -1547,6 +1884,7 @@ def main() -> int:
         (run_dir / "seed.txt").write_text(f"{seed}\n")
         (run_dir / "mlkem_backend.txt").write_text(f"{args.mlkem_backend}\n")
         (run_dir / "run_config.json").write_text(json.dumps({
+            "benchmark_mode": "transfer" if args.transfer_mode else "handshake",
             "sessions_per_case": args.sessions_per_case,
             "mlkem_backend": args.mlkem_backend,
             "server_backend": args.server_backend,
@@ -1578,8 +1916,10 @@ def main() -> int:
             ["sequence", *INPUT_FIELDS, "seed", "run_id"],
             manifest,
         )
-        jobs = build_jobs(
-            cases, seed=seed, sessions_per_case=args.sessions_per_case
+        jobs = (
+            build_transfer_rounds(cases, seed=seed)
+            if args.transfer_mode else
+            build_jobs(cases, seed=seed, sessions_per_case=args.sessions_per_case)
         )
         session_rows = [
             {
@@ -1602,6 +1942,46 @@ def main() -> int:
              "firmware_profile", "seed"],
             session_rows,
         )
+        if args.transfer_mode:
+            round_rows = [
+                {
+                    "execution_order": order,
+                    "source_sequence": job.sequence,
+                    "case_id": job.case_id,
+                    "round_index": job.round_index,
+                    "firmware_profile": "universal",
+                    "seed": seed,
+                }
+                for order, job in enumerate(jobs, 1)
+            ]
+            transfer_rows = [
+                {
+                    "execution_order": order,
+                    "case_id": job.case_id,
+                    "round_index": job.round_index,
+                    "transfer_order": operation.order,
+                    "direction": operation.direction,
+                    "payload_bytes": operation.payload_bytes,
+                    "payload_seed": operation.payload_seed,
+                    "expected_sha256": payload_sha256(
+                        operation.payload_seed, operation.payload_bytes
+                    ),
+                }
+                for order, job in enumerate(jobs, 1)
+                for operation in job.operations
+            ]
+            write_csv(
+                run_dir / "round_manifest.csv",
+                ["execution_order", "source_sequence", "case_id", "round_index",
+                 "firmware_profile", "seed"],
+                round_rows,
+            )
+            write_csv(
+                run_dir / "transfer_manifest.csv",
+                ["execution_order", "case_id", "round_index", "transfer_order",
+                 "direction", "payload_bytes", "payload_seed", "expected_sha256"],
+                transfer_rows,
+            )
         (run_dir / "checkpoint.json").write_text(json.dumps({
             "version": 1,
             "status": "new",
@@ -1629,6 +2009,10 @@ def main() -> int:
     for directory in case_dirs.values():
         (directory / "generated").mkdir(parents=True, exist_ok=True)
     attempts = load_attempts(case_dirs) if resuming else defaultdict(list)
+    transmissions = (
+        load_transmissions(case_dirs)
+        if resuming and args.transfer_mode else defaultdict(list)
+    )
     scheduled_jobs = [
         (execution_order, job)
         for execution_order, job in enumerate(jobs, 1)
@@ -1648,9 +2032,16 @@ def main() -> int:
             for case in cases
         ]
         write_csv(run_dir / "summary.csv", SUMMARY_FIELDS, summaries)
+        if args.transfer_mode:
+            write_csv(run_dir / "handshake_summary.csv", SUMMARY_FIELDS, summaries)
+            write_csv(
+                run_dir / "transfer_summary.csv", TRANSFER_SUMMARY_FIELDS, []
+            )
         print("[dry-run] Schedule validation completed; no hardware actions were performed.")
         print(f"[dry-run] cases={len(cases)} blocks={len(jobs)} seed={seed}")
-        print(f"[dry-run] schedule={run_dir / 'session_manifest.csv'}")
+        print(
+            f"[dry-run] schedule={run_dir / ('round_manifest.csv' if args.transfer_mode else 'session_manifest.csv')}"
+        )
         print("[dry-run] Remove --dry-run to build, flash, connect to the Pi, and execute.")
         print(f"results={run_dir}")
         return 0
@@ -1768,6 +2159,7 @@ def main() -> int:
                 mlkem_backend=args.mlkem_backend, pqm4_dir=pqm4_dir,
                 large_rsa=False, power_markers=False, ble_telemetry=False,
                 mtls_mode=args.mtls_mode,
+                transfer_mode=args.transfer_mode,
             )
         return directory
 
@@ -1840,6 +2232,44 @@ def main() -> int:
                 for order, job in enumerate(jobs, 1)
             ],
         )
+        if args.transfer_mode:
+            write_csv(
+                run_dir / "round_manifest.csv",
+                ["execution_order", "source_sequence", "case_id", "round_index",
+                 "firmware_profile", "seed"],
+                [
+                    {
+                        "execution_order": order,
+                        "source_sequence": job.sequence,
+                        "case_id": job.case_id,
+                        "round_index": job.round_index,
+                        "firmware_profile": case_by_id[job.case_id]["firmware_profile"],
+                        "seed": seed,
+                    }
+                    for order, job in enumerate(jobs, 1)
+                ],
+            )
+            write_csv(
+                run_dir / "transfer_manifest.csv",
+                ["execution_order", "case_id", "round_index", "transfer_order",
+                 "direction", "payload_bytes", "payload_seed", "expected_sha256"],
+                [
+                    {
+                        "execution_order": order,
+                        "case_id": job.case_id,
+                        "round_index": job.round_index,
+                        "transfer_order": operation.order,
+                        "direction": operation.direction,
+                        "payload_bytes": operation.payload_bytes,
+                        "payload_seed": operation.payload_seed,
+                        "expected_sha256": payload_sha256(
+                            operation.payload_seed, operation.payload_bytes
+                        ),
+                    }
+                    for order, job in enumerate(jobs, 1)
+                    for operation in job.operations
+                ],
+            )
     config = json.loads(config_path.read_text())
     config["firmware_profiles"] = {
         "roots": {name: sorted(roots) for name, roots in profile_roots.items()},
@@ -1996,6 +2426,8 @@ def main() -> int:
                     )
                     active_profile = required_profile
                 timeout = timeout_for_case(case, args.attempt_timeout_sec)
+                if args.transfer_mode:
+                    timeout += 2 * (30.0 + 120.0 + 600.0)
                 print(
                     f"[{execution_order}/{len(jobs)}] {job.case_id} "
                     f"session={job.session} attempt={job.attempt_in_session} "
@@ -2015,6 +2447,16 @@ def main() -> int:
                         **case_metadata(case),
                         "message": unsupported[job.case_id],
                     }
+                    if isinstance(job, TransferRound):
+                        row["_transmissions"] = transfer_rows_for_round(
+                            job, [], case_dirs[job.case_id] / "broker.log",
+                            attempt_index=len(attempts[job.case_id]) + 1,
+                            reconnect_count=0,
+                            round_status="unsupported",
+                        )
+                        for transfer_row in row["_transmissions"]:
+                            transfer_row["round_try"] = 1
+                            transfer_row["round_complete"] = 0
                 else:
                     row = run_job(
                         job, case, case_dirs[job.case_id],
@@ -2026,11 +2468,22 @@ def main() -> int:
                 row["mlkem_backend"] = args.mlkem_backend
                 row["rsa_profile"] = "fast-math"
                 row["firmware_profile"] = required_profile
+                transfer_rows = row.pop("_transmissions", [])
                 attempts[job.case_id].append(row)
                 write_csv(
                     case_dirs[job.case_id] / "attempts.csv",
                     ATTEMPT_FIELDS, attempts[job.case_id],
                 )
+                if args.transfer_mode:
+                    transmissions[job.case_id].extend(transfer_rows)
+                    write_csv(
+                        case_dirs[job.case_id] / "handshakes.csv",
+                        ATTEMPT_FIELDS, attempts[job.case_id],
+                    )
+                    write_csv(
+                        case_dirs[job.case_id] / "transmissions.csv",
+                        TRANSFER_FIELDS, transmissions[job.case_id],
+                    )
                 write_checkpoint(
                     run_dir,
                     execution_order=execution_order,
@@ -2057,6 +2510,15 @@ def main() -> int:
         row["mlkem_backend"] = args.mlkem_backend
         row["rsa_profile"] = "fast-math"
     write_csv(run_dir / "summary.csv", SUMMARY_FIELDS, summaries)
+    if args.transfer_mode:
+        write_csv(run_dir / "handshake_summary.csv", SUMMARY_FIELDS, summaries)
+        write_csv(
+            run_dir / "transfer_summary.csv",
+            TRANSFER_SUMMARY_FIELDS,
+            summarize_transfers([
+                row for case_rows in transmissions.values() for row in case_rows
+            ]),
+        )
     print(f"results={run_dir}")
     return 130 if interrupted else 0
 

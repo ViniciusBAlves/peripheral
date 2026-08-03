@@ -87,6 +87,35 @@ def case_category(row: dict[str, str]) -> str:
     return "mixed"
 
 
+def pki_category(row: dict[str, str]) -> str:
+    """Classify current and legacy rows as homogeneous or heterogeneous PKI."""
+    kind = row.get("pki_kind", "").strip().lower()
+    chain_id = row.get("pki_chain_id", "").strip().lower()
+    if kind.startswith("homogeneous") or chain_id.startswith("homogeneous_"):
+        return "homogeneous"
+    if kind in {"heavy_root", "heterogeneous", "heterogeneous_x509"}:
+        return "heterogeneous"
+
+    algorithms = [
+        row.get(field, "").strip()
+        for field in ("root_sig_alg", "intermediate_sig_alg", "leaf_sig_alg")
+        if row.get(field, "").strip()
+    ]
+    if algorithms and len(set(algorithms)) > 1:
+        return "heterogeneous"
+    # Older result schemas had no PKI metadata and represented one algorithm.
+    return "homogeneous"
+
+
+def pki_signature_label(row: dict[str, str]) -> str:
+    """Keep distinct heterogeneous roots from collapsing into one heatmap row."""
+    leaf = row.get("leaf_sig_alg") or row.get("cert_sig_alg", "")
+    if pki_category(row) == "homogeneous":
+        return leaf
+    root = row.get("root_sig_alg", "")
+    return f"{root} -> {leaf}" if root and leaf else row.get("pki_chain_id", leaf)
+
+
 def heatmap_axes_by_descending_mean(
     values_by_pair: dict[tuple[str, str], list[float]],
 ) -> tuple[list[str], list[str]]:
@@ -280,6 +309,11 @@ def load_from_attempts(run_dir: Path) -> list[dict[str, str]]:
         rows.append(
             {
                 "case_id": attempts_csv.parent.name.split("_", 1)[-1],
+                "pki_chain_id": first.get("pki_chain_id", ""),
+                "pki_kind": first.get("pki_kind", ""),
+                "root_sig_alg": first.get("root_sig_alg", ""),
+                "intermediate_sig_alg": first.get("intermediate_sig_alg", ""),
+                "leaf_sig_alg": first.get("leaf_sig_alg", ""),
                 "kex_group": first.get("kex_group", ""),
                 "kex_nist_level": first.get("kex_nist_level", ""),
                 "cert_sig_alg": first.get("cert_sig_alg", ""),
@@ -305,7 +339,9 @@ def load_from_attempts(run_dir: Path) -> list[dict[str, str]]:
     return rows
 
 
-def add_attempt_cpu_peaks(rows: list[dict[str, str]], run_dir: Path) -> None:
+def add_attempt_resource_metrics(
+    rows: list[dict[str, str]], run_dir: Path
+) -> None:
     rows_by_case = {row.get("case_id", ""): row for row in rows}
     for attempts_csv in sorted((run_dir / "cases").glob("*/attempts.csv")):
         case_id = attempts_csv.parent.name.split("_", 1)[-1]
@@ -336,9 +372,20 @@ def add_attempt_cpu_peaks(rows: list[dict[str, str]], run_dir: Path) -> None:
                     )
                 ) is not None
             ]
+            heap_values = [
+                value
+                for attempt in attempts
+                if attempt.get("status") == "success"
+                and attempt.get("warmup") != "1"
+                and (
+                    value := float_or_none(
+                        attempt.get("client_heap_peak_bytes")
+                    )
+                ) is not None
+            ]
         if cpu_values:
-            target["peak_system_cpu_usage_percent"] = (
-                f"{max(cpu_values):.3f}"
+            target["mean_system_cpu_usage_percent"] = (
+                f"{statistics.mean(cpu_values):.3f}"
             )
         if cache_values and not float_or_none(
             target.get("mean_client_icache_hit_percent")
@@ -346,15 +393,17 @@ def add_attempt_cpu_peaks(rows: list[dict[str, str]], run_dir: Path) -> None:
             target["mean_client_icache_hit_percent"] = (
                 f"{statistics.mean(cache_values):.3f}"
             )
+        if heap_values:
+            target["max_client_heap_peak_bytes"] = f"{max(heap_values):.3f}"
 
 
 def load_rows(run_dir: Path) -> list[dict[str, str]]:
     rows = load_from_summary(run_dir / "summary.csv")
     if rows:
-        add_attempt_cpu_peaks(rows, run_dir)
+        add_attempt_resource_metrics(rows, run_dir)
         return rows
     rows = load_from_attempts(run_dir)
-    add_attempt_cpu_peaks(rows, run_dir)
+    add_attempt_resource_metrics(rows, run_dir)
     return rows
 
 
@@ -413,7 +462,7 @@ def load_reconnect_count_rows(run_dir: Path) -> list[dict[str, str]]:
 
 def short_label(row: dict[str, str]) -> str:
     kex = row.get("kex_group", "")
-    sig = row.get("cert_sig_alg", "")
+    sig = pki_signature_label(row)
     return (
         f"{algorithm_label(kex, kem_security_level(row))}\n"
         f"{algorithm_label(sig, signature_security_level(row))}"
@@ -435,7 +484,11 @@ def plot_algorithm_metric(
     values_by_algorithm: dict[str, list[float]] = defaultdict(list)
     levels_by_algorithm: dict[str, int | None] = {}
     for row in rows:
-        algorithm = row.get(algorithm_field, "")
+        algorithm = (
+            pki_signature_label(row)
+            if algorithm_field == "pki_signature_label"
+            else row.get(algorithm_field, "")
+        )
         value = float_or_none(row.get(metric_field))
         if value is None:
             components = handshake_components(row)
@@ -610,7 +663,7 @@ def plot_heatmap(rows: list[dict[str, str]], output: Path, run_id: str) -> None:
     ci_by_pair: dict[tuple[str, str], list[float]] = defaultdict(list)
     for row in rows:
         kex = row.get("kex_group", "")
-        sig = row.get("cert_sig_alg", "")
+        sig = pki_signature_label(row)
         value = handshake_value(row)
         if kex and sig and value is not None:
             values_by_pair[(kex, sig)].append(value)
@@ -656,7 +709,7 @@ def plot_heatmap(rows: list[dict[str, str]], output: Path, run_id: str) -> None:
         row.get("kex_group", ""): kem_security_level(row) for row in rows
     }
     sig_levels = {
-        row.get("cert_sig_alg", ""): signature_security_level(row)
+        pki_signature_label(row): signature_security_level(row)
         for row in rows
     }
     ax.set_xticklabels(
@@ -697,7 +750,7 @@ def plot_percent_heatmap(
     *,
     value_suffix: str = "%",
     value_decimals: int = 1,
-    colorbar_label: str = "Peak usage (%)",
+    colorbar_label: str = "Usage (%)",
     vmin: float | None = 0,
     vmax: float | None = 100,
 ) -> int:
@@ -705,7 +758,7 @@ def plot_percent_heatmap(
     values_by_pair: dict[tuple[str, str], list[float]] = defaultdict(list)
     for row in rows:
         kex = row.get("kex_group", "")
-        sig = row.get("cert_sig_alg", "")
+        sig = pki_signature_label(row)
         value = float_or_none(row.get(metric))
         if kex and sig and value is not None:
             values_by_pair[(kex, sig)].append(value)
@@ -739,7 +792,7 @@ def plot_percent_heatmap(
         row.get("kex_group", ""): kem_security_level(row) for row in rows
     }
     sig_levels = {
-        row.get("cert_sig_alg", ""): signature_security_level(row)
+        pki_signature_label(row): signature_security_level(row)
         for row in rows
     }
     ax.set_xticklabels(
@@ -757,7 +810,7 @@ def plot_percent_heatmap(
                 ax.text(
                     col_idx, row_idx,
                     f"{value:.{value_decimals}f}{value_suffix}",
-                    ha="center", va="center", fontsize=12,
+                    ha="center", va="center", fontsize=11,
                     color="black",
                 )
     colorbar = fig.colorbar(image, ax=ax)
@@ -839,16 +892,6 @@ def main() -> int:
         if args.skip_rsa_pss
         else rows
     )
-    categories = {
-        "pqc_only": [
-            row for row in plot_rows if case_category(row) == "pqc_only"
-        ],
-        "classic_only": [
-            row for row in plot_rows if case_category(row) == "classic_only"
-        ],
-        "mixed": [row for row in plot_rows if case_category(row) == "mixed"],
-    }
-
     out_dir = args.out_dir or (PROJECT_ROOT / "graphic" / "out" / run_dir.name)
     extension = "png" if args.generate_png else "pdf"
     chart_config = {
@@ -858,57 +901,77 @@ def main() -> int:
         ),
         "mixed": ("Mixed / hybrid TLS handshakes", "tls_handshake_mixed"),
     }
-    for category, category_rows in categories.items():
-        if not category_rows:
+    pki_groups = {
+        pki: [row for row in plot_rows if pki_category(row) == pki]
+        for pki in ("homogeneous", "heterogeneous")
+    }
+    heatmap_pki_groups = {
+        pki: [row for row in rows if pki_category(row) == pki]
+        for pki in ("homogeneous", "heterogeneous")
+    }
+    categories: dict[tuple[str, str], list[dict[str, str]]] = {}
+    kem_bar_count = 0
+    signature_bar_count = 0
+    for pki, pki_rows in pki_groups.items():
+        if not pki_rows:
             continue
-        title, filename = chart_config[category]
-        plot_group(
-            category_rows,
-            f"{title} - {run_dir.name}",
-            out_dir / f"{filename}.{extension}",
-        )
-        if args.sec_levels:
-            counts = plot_security_levels(
-                category_rows, title, filename, out_dir, run_dir.name,
-                extension,
+        pki_title = f"{pki.capitalize()} PKI"
+        for category in ("pqc_only", "classic_only", "mixed"):
+            category_rows = [
+                row for row in pki_rows if case_category(row) == category
+            ]
+            categories[(pki, category)] = category_rows
+            if not category_rows:
+                continue
+            title, filename = chart_config[category]
+            filename = f"{filename}_{pki}"
+            full_title = f"{title} - {pki_title}"
+            plot_group(
+                category_rows,
+                f"{full_title} - {run_dir.name}",
+                out_dir / f"{filename}.{extension}",
             )
-            for level in SECURITY_LEVELS:
-                print(
-                    f"{category}_nist_level_{level}={counts.get(level, 0)}"
+            if args.sec_levels:
+                counts = plot_security_levels(
+                    category_rows, full_title, filename, out_dir,
+                    run_dir.name, extension,
                 )
+                for level in SECURITY_LEVELS:
+                    print(
+                        f"{pki}_{category}_nist_level_{level}="
+                        f"{counts.get(level, 0)}"
+                    )
 
-    kem_bar_count = plot_algorithm_metric(
-        plot_rows,
-        algorithm_field="kex_group",
-        level_field="kex_nist_level",
-        metric_field="mean_kem_client_total_ms",
-        title=f"Client KEM execution time - {run_dir.name}",
-        ylabel="Mean client KEM time (ms)",
-        color="#2a9d8f",
-        output=out_dir / f"kem_execution_time.{extension}",
-    )
-    signature_bar_count = plot_algorithm_metric(
-        plot_rows,
-        algorithm_field="cert_sig_alg",
-        level_field="sig_nist_level",
-        metric_field="mean_client_signature_total_ms",
-        title=f"Client digital-signature execution time - {run_dir.name}",
-        ylabel="Mean client signature time (ms)",
-        color="#e9c46a",
-        output=out_dir / f"signature_execution_time.{extension}",
-    )
+        kem_bar_count += plot_algorithm_metric(
+            pki_rows,
+            algorithm_field="kex_group",
+            level_field="kex_nist_level",
+            metric_field="mean_kem_client_total_ms",
+            title=f"Client KEM execution time - {pki_title} - {run_dir.name}",
+            ylabel="Mean client KEM time (ms)",
+            color="#2a9d8f",
+            output=out_dir / f"kem_execution_time_{pki}.{extension}",
+        )
+        signature_bar_count += plot_algorithm_metric(
+            pki_rows,
+            algorithm_field="pki_signature_label",
+            level_field="sig_nist_level",
+            metric_field="mean_client_signature_total_ms",
+            title=(
+                f"Client digital-signature execution time - {pki_title} - "
+                f"{run_dir.name}"
+            ),
+            ylabel="Mean client signature time (ms)",
+            color="#e9c46a",
+            output=out_dir / f"signature_execution_time_{pki}.{extension}",
+        )
 
     if args.heatmap:
-        plot_heatmap(
-            rows,
-            out_dir / f"tls_handshake_heatmap.{extension}",
-            run_dir.name,
-        )
         hardware_heatmaps = (
             (
-                "peak_system_cpu_usage_percent",
-                f"Peak observed system CPU usage - {run_dir.name}",
-                "heatmap_cpu_peak_usage_percent",
+                "mean_system_cpu_usage_percent",
+                f"Average system CPU usage - {run_dir.name}",
+                "heatmap_cpu_average_usage_percent",
             ),
             (
                 "max_client_heap_peak_usage_percent",
@@ -926,48 +989,66 @@ def main() -> int:
                 "heatmap_thread_stack_peak_percent",
             ),
         )
-        for metric, title, filename_prefix in hardware_heatmaps:
-            plotted = plot_percent_heatmap(
-                rows, metric, title,
-                out_dir / f"{filename_prefix}.{extension}",
-            )
-            print(f"{metric}_heatmap_cells={plotted}")
-        cache_cells = plot_percent_heatmap(
-            rows,
-            "mean_client_icache_hit_percent",
-            f"Client instruction-cache hit rate - {run_dir.name}",
-            out_dir / f"heatmap_client_icache_hit_percent.{extension}",
-            colorbar_label="Mean instruction-cache hit rate (%)",
-        )
-        print(f"mean_client_icache_hit_percent_heatmap_cells={cache_cells}")
-        heap_bytes_cells = plot_percent_heatmap(
-            rows,
-            "max_client_heap_peak_bytes",
-            f"Peak wolfSSL heap allocation in bytes - {run_dir.name}",
-            out_dir / f"heatmap_client_heap_peak_bytes.{extension}",
-            value_suffix="",
-            value_decimals=0,
-            colorbar_label="Peak wolfSSL heap allocation (bytes)",
-            vmin=None,
-            vmax=None,
-        )
-        print(f"max_client_heap_peak_bytes_heatmap_cells={heap_bytes_cells}")
         reconnect_rows = load_reconnect_count_rows(run_dir)
-        reconnect_cells = plot_reconnect_count_heatmap(
-            reconnect_rows,
-            out_dir / f"heatmap_reconnects.{extension}",
-            run_dir.name,
-        )
-        print(f"reconnect_count_heatmap_cells={reconnect_cells}")
-        print("heatmaps=8")
+        heatmap_count = 0
+        for pki, pki_rows in heatmap_pki_groups.items():
+            if not pki_rows:
+                continue
+            pki_title = f"{pki.capitalize()} PKI"
+            plot_heatmap(
+                pki_rows,
+                out_dir / f"tls_handshake_heatmap_{pki}.{extension}",
+                f"{run_dir.name} - {pki_title}",
+            )
+            heatmap_count += 1
+            for metric, title, filename_prefix in hardware_heatmaps:
+                plotted = plot_percent_heatmap(
+                    pki_rows, metric, f"{title} - {pki_title}",
+                    out_dir / f"{filename_prefix}_{pki}.{extension}",
+                )
+                heatmap_count += int(plotted > 0)
+                print(f"{pki}_{metric}_heatmap_cells={plotted}")
+            cache_cells = plot_percent_heatmap(
+                pki_rows,
+                "mean_client_icache_hit_percent",
+                f"Client instruction-cache hit rate - {run_dir.name} - {pki_title}",
+                out_dir / f"heatmap_client_icache_hit_percent_{pki}.{extension}",
+                colorbar_label="Mean instruction-cache hit rate (%)",
+            )
+            heatmap_count += int(cache_cells > 0)
+            print(f"{pki}_mean_client_icache_hit_percent_heatmap_cells={cache_cells}")
+            heap_bytes_cells = plot_percent_heatmap(
+                pki_rows,
+                "max_client_heap_peak_bytes",
+                f"Peak wolfSSL heap allocation in bytes - {run_dir.name} - {pki_title}",
+                out_dir / f"heatmap_client_heap_peak_bytes_{pki}.{extension}",
+                value_suffix="",
+                value_decimals=0,
+                colorbar_label="Peak wolfSSL heap allocation (bytes)",
+                vmin=None,
+                vmax=None,
+            )
+            heatmap_count += int(heap_bytes_cells > 0)
+            print(f"{pki}_max_client_heap_peak_bytes_heatmap_cells={heap_bytes_cells}")
+            pki_reconnect_rows = [
+                row for row in reconnect_rows if pki_category(row) == pki
+            ]
+            reconnect_cells = plot_reconnect_count_heatmap(
+                pki_reconnect_rows,
+                out_dir / f"heatmap_reconnects_{pki}.{extension}",
+                f"{run_dir.name} - {pki_title}",
+            )
+            heatmap_count += int(reconnect_cells > 0)
+            print(f"{pki}_reconnect_count_heatmap_cells={reconnect_cells}")
+        print(f"heatmaps={heatmap_count}")
 
     print(f"rows={len(rows)}")
     print(f"bar_chart_rows={len(plot_rows)}")
     print(f"kem_algorithm_bars={kem_bar_count}")
     print(f"signature_algorithm_bars={signature_bar_count}")
     print(f"format={extension}")
-    for category, category_rows in categories.items():
-        print(f"{category}={len(category_rows)}")
+    for (pki, category), category_rows in categories.items():
+        print(f"{pki}_{category}={len(category_rows)}")
     print(f"out_dir={out_dir}")
     return 0
 
