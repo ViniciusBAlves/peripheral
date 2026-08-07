@@ -1020,7 +1020,7 @@ int main(int argc, char **argv)
         address = discovered_address;
     }
 
-    int prepare_scan_seconds = cfg.device_addr ? cfg.scan_timeout_sec : 0;
+    int prepare_scan_seconds = cfg.device_addr ? 0 : cfg.scan_timeout_sec;
     prepare_bluetooth_adapter(address, prepare_scan_seconds,
                               cfg.forget_cache, cfg.reset_adapter);
 

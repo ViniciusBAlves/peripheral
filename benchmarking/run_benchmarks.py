@@ -107,6 +107,7 @@ ATTEMPT_FIELDS = [
     "l2cap_tx_retries", "l2cap_tx_wait_ms", "l2cap_rx_overflows",
     "client_cpu_cycles", "client_cycle_hz", "client_cpu_ms",
     "client_cpu_usage_percent", "system_cpu_usage_percent",
+    "average_cpu_usage_percent", "peak_cpu_usage_percent",
     "client_icache_hits", "client_icache_misses", "client_icache_requests",
     "client_icache_hit_percent", "client_icache_miss_percent",
     "client_memory_access_counters_supported",
@@ -179,6 +180,7 @@ SUMMARY_FIELDS = [
     "handshake_throughput_hps", "mean_mqtt_connect_ms", "mean_full_connect_ms",
     "mean_end_to_end_ms", "connections_per_second", "mean_client_cpu_ms",
     "mean_client_cpu_usage_percent", "mean_system_cpu_usage_percent",
+    "mean_average_cpu_usage_percent", "max_peak_cpu_usage_percent",
     "mean_client_icache_hits", "mean_client_icache_misses",
     "mean_client_icache_requests", "mean_client_icache_hit_percent",
     "mean_client_icache_miss_percent",
@@ -578,6 +580,14 @@ def wait_for_result(
                 continue
             stream.write(line + "\n")
             stream.flush()
+            if "***** MPU FAULT *****" in line or \
+                    ">>> ZEPHYR FATAL ERROR" in line:
+                return {
+                    "status": "fail",
+                    "stage": "board_fatal",
+                    "error": "zephyr_fatal_error",
+                    "fatal": "1",
+                }
             parsed = parse_bench_line(line)
             if parsed and observations is not None:
                 observations.append(parsed)
@@ -964,6 +974,7 @@ def run_job(
                                 "status": "fail",
                                 "stage": "board_rearm",
                                 "error": "timeout",
+                                "fatal": "1",
                             }
 
             if (
@@ -1029,6 +1040,8 @@ def run_job(
     cpu_us = number(final, "client_cpu_us")
     client_cpu_usage_bp = number(final, "client_cpu_usage_bp")
     system_cpu_usage_bp = number(final, "system_cpu_usage_bp")
+    average_cpu_usage_bp = number(final, "average_cpu_usage_bp")
+    peak_cpu_usage_bp = number(final, "peak_cpu_usage_bp")
     stack_peak_bp = number(final, "thread_stack_peak_percent_bp")
     icache_hits = number(final, "client_icache_hits")
     icache_misses = number(final, "client_icache_misses")
@@ -1148,6 +1161,14 @@ def run_job(
             f"{system_cpu_usage_bp / 100.0:.2f}"
             if system_cpu_usage_bp is not None else ""
         ),
+        "average_cpu_usage_percent": (
+            f"{average_cpu_usage_bp / 100.0:.2f}"
+            if average_cpu_usage_bp is not None else ""
+        ),
+        "peak_cpu_usage_percent": (
+            f"{peak_cpu_usage_bp / 100.0:.2f}"
+            if peak_cpu_usage_bp is not None else ""
+        ),
         "client_icache_hits": final.get("client_icache_hits", ""),
         "client_icache_misses": final.get("client_icache_misses", ""),
         "client_icache_requests": (
@@ -1238,6 +1259,8 @@ def summarize(case: dict[str, str], attempts: list[dict[str, object]]) -> dict[s
 
     client_cpu_usage = successful_numbers("client_cpu_usage_percent")
     system_cpu_usage = successful_numbers("system_cpu_usage_percent")
+    average_cpu_usage = successful_numbers("average_cpu_usage_percent")
+    peak_cpu_usage = successful_numbers("peak_cpu_usage_percent")
     icache_hits = successful_numbers("client_icache_hits")
     icache_misses = successful_numbers("client_icache_misses")
     icache_requests = successful_numbers("client_icache_requests")
@@ -1362,6 +1385,13 @@ def summarize(case: dict[str, str], attempts: list[dict[str, object]]) -> dict[s
         "mean_system_cpu_usage_percent": (
             f"{sum(system_cpu_usage) / len(system_cpu_usage):.3f}"
             if system_cpu_usage else ""
+        ),
+        "mean_average_cpu_usage_percent": (
+            f"{sum(average_cpu_usage) / len(average_cpu_usage):.3f}"
+            if average_cpu_usage else ""
+        ),
+        "max_peak_cpu_usage_percent": (
+            f"{max(peak_cpu_usage):.3f}" if peak_cpu_usage else ""
         ),
         "mean_client_icache_hits": (
             f"{sum(icache_hits) / len(icache_hits):.3f}" if icache_hits else ""
@@ -1738,7 +1768,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--ssh-key", default=config["ssh-key"])
     parser.add_argument("--pi-adapter", default="hci0")
     parser.add_argument("--ble-addr", default=config["ble-addr"])
-    parser.add_argument("--ble-name", default="PQC5340")
+    parser.add_argument("--ble-name", default="PQC52840")
     parser.add_argument("--ble-addr-type", choices=("public", "random"), default="random")
     parser.add_argument("--psm", default="0x0080")
     parser.add_argument("--mtu", type=int, default=672)
@@ -1751,12 +1781,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--nrfutil", default=default_nrfutil())
     parser.add_argument("--ncs-version", default=DEFAULT_NCS_VERSION)
     parser.add_argument("--ncs-chdir", default=default_ncs_chdir())
-    parser.add_argument("--board", default="nrf5340dk/nrf5340/cpuapp")
+    parser.add_argument("--board", default="nrf52840dk/nrf52840")
     parser.add_argument(
         "--mlkem-backend",
         choices=("wolfssl", "pqm4-m4fstack"),
         default="pqm4-m4fstack",
-        help="ML-KEM implementation used by the nRF5340 application core",
+        help="ML-KEM implementation used by the nRF52840 application core",
     )
     parser.add_argument(
         "--server-backend",
@@ -1766,7 +1796,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     args = parser.parse_args(argv)
     if args.power_profiler:
-        parser.error("--power-profiler is disabled for the nRF5340DK port")
+        parser.error("--power-profiler is disabled for the current benchmark port")
     if bool(args.cases) == bool(args.resume):
         parser.error("provide exactly one of --cases or --resume")
     args.ssh_key = os.path.expandvars(os.path.expanduser(args.ssh_key))
@@ -1835,7 +1865,7 @@ def main(argv: list[str] | None = None) -> int:
             args.power_profiler = saved_config.get("power_profiler", False)
             if args.power_profiler:
                 raise ValueError(
-                    "power-profiler runs cannot be resumed with the nRF5340DK port"
+                    "power-profiler runs cannot be resumed with the current port"
                 )
             args.power_profiler_serial_device = saved_config.get(
                 "power_profiler_serial_device", args.power_profiler_serial_device
@@ -2284,7 +2314,7 @@ def main(argv: list[str] | None = None) -> int:
     build_dir = profile_build_dirs[first_profile]
     if not args.skip_flash:
         print(
-            f"[firmware] Flashing nRF5340 application and network cores; "
+            f"[firmware] Flashing {args.board}; "
             f"log={run_dir / 'flash.log'}",
             flush=True,
         )

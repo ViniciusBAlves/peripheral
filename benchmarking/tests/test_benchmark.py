@@ -412,6 +412,21 @@ class BenchmarkTests(unittest.TestCase):
         self.assertEqual(result["fatal"], "1")
         self.assertIn("unknown ca", result["fatal_message"])
 
+    def test_wait_for_result_fails_fast_on_board_mpu_fault(self) -> None:
+        class FaultSerial:
+            def readline(self) -> bytes:
+                return b"***** MPU FAULT *****\n"
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            result = wait_for_result(
+                FaultSerial(), Path(tmpdir) / "board.log", timeout=30.0
+            )
+
+        self.assertEqual(result["status"], "fail")
+        self.assertEqual(result["stage"], "board_fatal")
+        self.assertEqual(result["error"], "zephyr_fatal_error")
+        self.assertEqual(result["fatal"], "1")
+
     def test_server_certificate_trust_failure_does_not_retry(self) -> None:
         class QuietSerial:
             name = "fake-serial"
@@ -644,6 +659,8 @@ class BenchmarkTests(unittest.TestCase):
             "client_cpu_ms": "40",
             "client_cpu_usage_percent": "40.00",
             "system_cpu_usage_percent": "55.00",
+            "average_cpu_usage_percent": "88.00",
+            "peak_cpu_usage_percent": "99.00",
             "client_icache_hits": "900",
             "client_icache_misses": "100",
             "client_icache_requests": "1000",
@@ -665,6 +682,8 @@ class BenchmarkTests(unittest.TestCase):
         summary = summarize(case, [attempt])
         self.assertEqual(summary["mean_client_cpu_usage_percent"], "40.000")
         self.assertEqual(summary["mean_system_cpu_usage_percent"], "55.000")
+        self.assertEqual(summary["mean_average_cpu_usage_percent"], "88.000")
+        self.assertEqual(summary["max_peak_cpu_usage_percent"], "99.000")
         self.assertEqual(summary["mean_client_icache_hits"], "900.000")
         self.assertEqual(summary["mean_client_icache_hit_percent"], "90.0000")
         self.assertEqual(

@@ -12,7 +12,9 @@
 #define WOLFSSL_USER_IO
 #define SINGLE_THREADED
 #define WOLFSSL_SMALL_STACK
-/* SLH-DSA-SHAKE-256f leaf + root is about 100 KiB in TLS Certificate. */
+/* Release DecodedCert while checking large SLH-DSA certificate signatures. */
+#define WOLFSSL_SMALL_CERT_VERIFY
+/* SLH-DSA-SHAKE-256f leaf + intermediate is about 100 KiB on the wire. */
 #define MAX_CERTIFICATE_SZ (128U * 1024U)
 #define MAX_HANDSHAKE_SZ (128U * 1024U)
 #define NO_FILESYSTEM

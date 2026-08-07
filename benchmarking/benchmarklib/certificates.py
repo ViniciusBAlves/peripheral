@@ -176,7 +176,7 @@ openssl req -x509 -new -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
   -addext keyUsage=critical,keyCertSign,cRLSign
 openssl req -new -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
   -keyout /out/client.key -out /out/client.csr -nodes \
-  -subj /CN=nrf5340-benchmark
+  -subj /CN=nrf-benchmark
 openssl x509 -req -in /out/client.csr -CA /out/client_ca.crt \
   -CAkey /out/client_ca.key -CAcreateserial -out /out/client.crt \
   -not_before {CERT_NOT_BEFORE} -not_after {CERT_NOT_AFTER} \

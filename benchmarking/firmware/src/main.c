@@ -65,12 +65,23 @@ static void benchmark_output(const char *format, ...);
 } while (0)
 
 #define L2CAP_SDU_MTU 672
-/* A direct SLH-DSA leaf + root chain can keep more than 32 KiB in flight. */
+/*
+ * The nRF52840 shares its 256 KiB RAM with the BLE controller. wolfSSL reads
+ * records incrementally, so this ring need not retain a complete PQC chain.
+ */
+#if defined(CONFIG_SOC_NRF52840)
+#define TLS_RX_RINGBUF_SIZE 4992
+#else
 #define TLS_RX_RINGBUF_SIZE 65536
+#endif
 #define BENCH_CONTROL_HEADER_SIZE 8
 #define BENCH_CONTROL_FLAG_START BIT(0)
 #define BENCH_CONTROL_FLAG_END BIT(1)
+#if defined(CONFIG_SOC_NRF52840)
+#define BENCH_CONTROL_BUFFER_SIZE 512
+#else
 #define BENCH_CONTROL_BUFFER_SIZE 1536
+#endif
 
 /*
  * Keep wolfSSL's short-lived PQC allocations out of picolibc's process-wide
@@ -80,8 +91,10 @@ static void benchmark_output(const char *format, ...);
  */
 #if defined(CONFIG_SOC_NRF5340_CPUAPP)
 #define WOLFSSL_HEAP_SIZE (300 * 1024)
+#elif defined(CONFIG_SOC_NRF52840)
+#define WOLFSSL_HEAP_SIZE (201 * 1024)
 #else
-#define WOLFSSL_HEAP_SIZE (170 * 1024)
+#define WOLFSSL_HEAP_SIZE (200 * 1024)
 #endif
 
 K_HEAP_DEFINE(wolfssl_heap, WOLFSSL_HEAP_SIZE);
@@ -96,6 +109,9 @@ static volatile int64_t l2cap_connected_ms;
 static const struct benchmark_ca_entry *selected_root;
 static const struct benchmark_signature_profile *selected_signature;
 static uint16_t benchmark_control_message_id;
+static uint32_t wolfssl_alloc_failure_count;
+static uint32_t wolfssl_alloc_last_failed_bytes;
+static uint32_t wolfssl_alloc_max_failed_bytes;
 K_SEM_DEFINE(pki_profile_selected_sem, 0, 1);
 
 static int benchmark_control_send(const char *message, size_t length);
@@ -143,6 +159,12 @@ struct benchmark_stack_snapshot {
     uint64_t used_bytes;
     uint64_t capacity_bytes;
     uint32_t peak_percent_bp;
+};
+
+struct benchmark_processing_cpu {
+    uint64_t cycles;
+    uint64_t elapsed_us;
+    uint32_t peak_usage_bp;
 };
 
 static struct benchmark_stack_snapshot stack_snapshot;
@@ -193,6 +215,40 @@ static void benchmark_cpu_delta(
         end->non_idle_cycles - start->non_idle_cycles, system_cycles);
 }
 
+/* Measure CPU utilization only while wolfSSL is processing, excluding the
+ * time accumulated by the L2CAP send/receive callbacks. */
+static void benchmark_processing_cpu_update(
+    struct benchmark_processing_cpu *processing,
+    const struct benchmark_cpu_snapshot *start,
+    const struct benchmark_cpu_snapshot *end,
+    benchmark_timepoint_t wall_start,
+    uint64_t communication_start_us)
+{
+    uint64_t wall_us;
+    uint64_t communication_us;
+    uint64_t processing_us;
+    uint64_t cycles;
+    uint64_t cpu_us;
+    uint32_t usage_bp;
+
+    if (!start->valid || !end->valid || end->thread_cycles < start->thread_cycles) {
+        return;
+    }
+    wall_us = k_ticks_to_us_floor64(k_uptime_ticks() - wall_start);
+    communication_us = benchmark_metrics_get()->communication_us -
+                       communication_start_us;
+    processing_us = wall_us > communication_us ? wall_us - communication_us : 0;
+    if (processing_us == 0) {
+        return;
+    }
+    cycles = end->thread_cycles - start->thread_cycles;
+    cpu_us = k_cyc_to_us_floor64(cycles);
+    usage_bp = (uint32_t)MIN((cpu_us * 10000ULL) / processing_us, 10000ULL);
+    processing->cycles += cycles;
+    processing->elapsed_us += processing_us;
+    processing->peak_usage_bp = MAX(processing->peak_usage_bp, usage_bp);
+}
+
 static void benchmark_stack_analyzer_cb(struct thread_analyzer_info *info)
 {
     uint32_t percent_bp;
@@ -236,6 +292,10 @@ static void *wolfssl_malloc(size_t size)
     void *ptr = k_heap_alloc(&wolfssl_heap, size, K_NO_WAIT);
 
     if (ptr == NULL) {
+        wolfssl_alloc_failure_count++;
+        wolfssl_alloc_last_failed_bytes = (uint32_t)size;
+        wolfssl_alloc_max_failed_bytes =
+            MAX(wolfssl_alloc_max_failed_bytes, (uint32_t)size);
         BENCH_LOG("[WOLFSSL HEAP] allocation failed: requested=%u\n",
                (unsigned int)size);
         wolfssl_heap_report("OOM");
@@ -253,6 +313,10 @@ static void *wolfssl_realloc(void *ptr, size_t size)
     void *new_ptr = k_heap_realloc(&wolfssl_heap, ptr, size, K_NO_WAIT);
 
     if (new_ptr == NULL && size != 0) {
+        wolfssl_alloc_failure_count++;
+        wolfssl_alloc_last_failed_bytes = (uint32_t)size;
+        wolfssl_alloc_max_failed_bytes =
+            MAX(wolfssl_alloc_max_failed_bytes, (uint32_t)size);
         BENCH_LOG("[WOLFSSL HEAP] realloc failed: requested=%u\n",
                (unsigned int)size);
         wolfssl_heap_report("OOM");
@@ -322,7 +386,7 @@ static void update_led(bool on)
  * the rest of the TLS record and the board only sees WANT_READ until timeout.
  */
 NET_BUF_POOL_DEFINE(l2cap_tx_pool, 5, BT_L2CAP_BUF_SIZE(L2CAP_SDU_MTU), 8, NULL);
-NET_BUF_POOL_DEFINE(l2cap_rx_pool, 8, BT_L2CAP_BUF_SIZE(L2CAP_SDU_MTU), 8, NULL);
+NET_BUF_POOL_DEFINE(l2cap_rx_pool, 7, BT_L2CAP_BUF_SIZE(L2CAP_SDU_MTU), 8, NULL);
 
 static struct bt_l2cap_le_chan l2cap_chan;
 static volatile bool l2cap_rx_overflow;
@@ -480,7 +544,7 @@ static struct bt_l2cap_chan_ops l2cap_ops = {
 
 static const struct bt_data ad_l2cap_ok[] = {
     BT_DATA_BYTES(BT_DATA_FLAGS, (BT_LE_AD_GENERAL | BT_LE_AD_NO_BREDR)),
-    BT_DATA_BYTES(BT_DATA_NAME_COMPLETE, 'P', 'Q', 'C', '5', '3', '4', '0')
+    BT_DATA_BYTES(BT_DATA_NAME_COMPLETE, 'P', 'Q', 'C', '5', '2', '8', '4', '0')
 };
 
 static const struct bt_data ad_l2cap_error[] = {
@@ -809,6 +873,7 @@ void start_secure_mqtt_session(struct bt_l2cap_chan *chan)
     uint64_t client_cpu_us = 0;
     uint32_t client_cpu_usage_bp = 0;
     uint32_t system_cpu_usage_bp = 0;
+    struct benchmark_processing_cpu processing_cpu = {0};
     uint32_t cpu_cycle_hz = benchmark_cpu_cycles_per_sec();
     struct benchmark_dwt_snapshot dwt_start = {0};
     struct benchmark_dwt_delta dwt = {0};
@@ -925,6 +990,9 @@ void start_secure_mqtt_session(struct bt_l2cap_chan *chan)
     setup_done_ms = k_uptime_get();
 
     (void)sys_heap_runtime_stats_reset_max(&wolfssl_heap.heap);
+    wolfssl_alloc_failure_count = 0;
+    wolfssl_alloc_last_failed_bytes = 0;
+    wolfssl_alloc_max_failed_bytes = 0;
     benchmark_metrics_reset();
     benchmark_hardware_counters_start();
     dwt_start = benchmark_dwt_snapshot_get();
@@ -934,7 +1002,18 @@ void start_secure_mqtt_session(struct bt_l2cap_chan *chan)
     benchmark_power_handshake_set(true);
     struct benchmark_cpu_snapshot cpu_start = benchmark_cpu_snapshot_get();
     do {
+        struct benchmark_cpu_snapshot processing_start =
+            benchmark_cpu_snapshot_get();
+        benchmark_timepoint_t processing_wall_start = benchmark_metric_start();
+        uint64_t processing_communication_start =
+            benchmark_metrics_get()->communication_us;
+
         ret = wolfSSL_connect(ssl);
+        struct benchmark_cpu_snapshot processing_end =
+            benchmark_cpu_snapshot_get();
+        benchmark_processing_cpu_update(
+            &processing_cpu, &processing_start, &processing_end,
+            processing_wall_start, processing_communication_start);
         if (ret != WOLFSSL_SUCCESS) {
             int error = wolfSSL_get_error(ssl, ret);
             if (error == WOLFSSL_ERROR_WANT_READ || error == WOLFSSL_ERROR_WANT_WRITE) {
@@ -954,10 +1033,19 @@ void start_secure_mqtt_session(struct bt_l2cap_chan *chan)
             dwt = benchmark_dwt_delta_get(&dwt_start);
             tls_handshake_active = false;
             benchmark_power_handshake_set(false);
+            struct sys_memory_stats failure_heap_stats = {0};
+            (void)sys_heap_runtime_stats_get(
+                &wolfssl_heap.heap, &failure_heap_stats);
             BENCH_RESULT_OUT(
                 "[BENCH_RESULT] status=fail stage=tls_handshake error=%d "
                 "tls_setup_ms=%lld client_cpu_cycles=%llu "
                 "client_cpu_us=%llu client_cycle_hz=%u "
+                "client_heap_current_bytes=%u client_heap_peak_bytes=%u "
+                "client_heap_free_bytes=%u client_heap_capacity_bytes=%u "
+                "wolfssl_alloc_failure_count=%u "
+                "wolfssl_alloc_last_failed_bytes=%u "
+                "wolfssl_alloc_max_failed_bytes=%u "
+                "average_cpu_usage_bp=%u peak_cpu_usage_bp=%u "
                 "certificate_verify_alg=%s "
                 "certificate_verify_scheme_id=0x%04x "
                 "expected_certificate_verify_alg=%s "
@@ -966,6 +1054,19 @@ void start_secure_mqtt_session(struct bt_l2cap_chan *chan)
                 BENCHMARK_DWT_FORMAT "\n",
                 error, setup_done_ms - setup_start_ms,
                 client_cpu_cycles, client_cpu_us, cpu_cycle_hz,
+                (unsigned int)failure_heap_stats.allocated_bytes,
+                (unsigned int)failure_heap_stats.max_allocated_bytes,
+                (unsigned int)failure_heap_stats.free_bytes,
+                WOLFSSL_HEAP_SIZE, wolfssl_alloc_failure_count,
+                wolfssl_alloc_last_failed_bytes,
+                wolfssl_alloc_max_failed_bytes,
+                processing_cpu.elapsed_us
+                    ? (uint32_t)MIN(
+                        (k_cyc_to_us_floor64(processing_cpu.cycles) * 10000ULL) /
+                            processing_cpu.elapsed_us,
+                        10000ULL)
+                    : 0,
+                processing_cpu.peak_usage_bp,
                 benchmark_metrics_get()->server_certificate_verify_scheme_seen
                     ? benchmark_signature_scheme_name(
                         benchmark_metrics_get()->
@@ -1056,6 +1157,7 @@ void start_secure_mqtt_session(struct bt_l2cap_chan *chan)
                 "end_to_end_ms=%lld client_cpu_cycles=%llu client_cpu_us=%llu "
                 "client_cycle_hz=%u client_cpu_usage_bp=%u "
                 "system_cpu_usage_bp=%u "
+                "average_cpu_usage_bp=%u peak_cpu_usage_bp=%u "
                 "client_heap_current_bytes=%u client_heap_peak_bytes=%u "
                 "client_heap_free_bytes=%u client_heap_capacity_bytes=%u "
                 "firmware_flash_used_bytes=%u firmware_flash_capacity_bytes=%u "
@@ -1089,6 +1191,13 @@ void start_secure_mqtt_session(struct bt_l2cap_chan *chan)
                 mqtt_done_ms - l2cap_connected_ms,
                 client_cpu_cycles, client_cpu_us, cpu_cycle_hz,
                 client_cpu_usage_bp, system_cpu_usage_bp,
+                processing_cpu.elapsed_us
+                    ? (uint32_t)MIN(
+                        (k_cyc_to_us_floor64(processing_cpu.cycles) * 10000ULL) /
+                            processing_cpu.elapsed_us,
+                        10000ULL)
+                    : 0,
+                processing_cpu.peak_usage_bp,
                 (unsigned int)stats.allocated_bytes,
                 (unsigned int)stats.max_allocated_bytes,
                 (unsigned int)stats.free_bytes, WOLFSSL_HEAP_SIZE,
