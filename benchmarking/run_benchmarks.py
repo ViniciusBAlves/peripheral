@@ -1742,22 +1742,22 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--power-profiler",
         action=argparse.BooleanOptionalAction,
         default=False,
-        help=argparse.SUPPRESS,
+        help="power the nRF52840DK from the PPK2 and capture GPIO-synchronized energy",
     )
     parser.add_argument(
         "--power-profiler-serial-device",
         default=config["power-profiler-serial-device"],
-        help=argparse.SUPPRESS,
+        help="PPK2 command/data CDC device",
     )
     parser.add_argument(
         "--power-profiler-vdd-mv", type=int,
         default=config["power-profiler-vdd-mv"],
-        help=argparse.SUPPRESS,
+        help="PPK2 Source Mode output voltage in millivolts",
     )
     parser.add_argument(
         "--power-profiler-output-samples-per-second", type=int,
         default=config["power-profiler-output-samples-per-second"],
-        help=argparse.SUPPRESS,
+        help="saved trace rate; energy integration remains at the native 100 kS/s",
     )
     parser.add_argument("--pi-host", default=config["pi-host"])
     parser.add_argument(
@@ -1795,8 +1795,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="server TLS backend selection",
     )
     args = parser.parse_args(argv)
-    if args.power_profiler:
-        parser.error("--power-profiler is disabled for the current benchmark port")
     if bool(args.cases) == bool(args.resume):
         parser.error("provide exactly one of --cases or --resume")
     args.ssh_key = os.path.expandvars(os.path.expanduser(args.ssh_key))
@@ -1863,10 +1861,7 @@ def main(argv: list[str] | None = None) -> int:
             args.server_backend = saved_config["server_backend"]
             args.mtls_mode = bool(saved_config.get("mtls_mode", False))
             args.power_profiler = saved_config.get("power_profiler", False)
-            if args.power_profiler:
-                raise ValueError(
-                    "power-profiler runs cannot be resumed with the current port"
-                )
+            args.board = saved_config.get("board", args.board)
             args.power_profiler_serial_device = saved_config.get(
                 "power_profiler_serial_device", args.power_profiler_serial_device
             )
@@ -1918,6 +1913,7 @@ def main(argv: list[str] | None = None) -> int:
             "sessions_per_case": args.sessions_per_case,
             "mlkem_backend": args.mlkem_backend,
             "server_backend": args.server_backend,
+            "board": args.board,
             "mtls_mode": args.mtls_mode,
             "pki_layout": "three-tier-v1",
             "power_profiler": args.power_profiler,
@@ -2187,7 +2183,8 @@ def main(argv: list[str] | None = None) -> int:
                 nrfutil=args.nrfutil, ncs_version=args.ncs_version,
                 ncs_chdir=args.ncs_chdir, board=args.board,
                 mlkem_backend=args.mlkem_backend, pqm4_dir=pqm4_dir,
-                large_rsa=False, power_markers=False, ble_telemetry=False,
+                large_rsa=False, power_markers=args.power_profiler,
+                ble_telemetry=args.power_profiler,
                 mtls_mode=args.mtls_mode,
                 transfer_mode=args.transfer_mode,
             )
@@ -2310,6 +2307,18 @@ def main(argv: list[str] | None = None) -> int:
     config["firmware_profiles_planned"] = True
     config_path.write_text(json.dumps(config, indent=2) + "\n")
 
+    if args.power_profiler:
+        if not args.board.startswith("nrf52840dk/"):
+            raise ValueError(
+                "--power-profiler Source Mode is supported only with "
+                "nrf52840dk/nrf52840"
+            )
+        if len(profile_build_dirs) != 1:
+            raise RuntimeError(
+                "PPK2 Source Mode requires one firmware profile because the DK "
+                "target is isolated by SW6 during capture"
+            )
+
     first_profile = case_by_id[scheduled_jobs[0][1].case_id]["firmware_profile"]
     build_dir = profile_build_dirs[first_profile]
     if not args.skip_flash:
@@ -2328,19 +2337,19 @@ def main(argv: list[str] | None = None) -> int:
     if args.power_profiler:
         print(
             "\n[power] Prepare the PPK2 in Source Mode:\n"
-            "  1. Disconnect the nRF52840DK USB cable.\n"
-            "  2. Remove the P22 jumper.\n"
-            "  3. Connect PPK2 VOUT to the P22 VDD_nRF pin and PPK2 GND to DK GND.\n"
-            "  4. Connect DK VDD/GND to PPK2 logic VCC/GND.\n"
+            "  1. Keep the DK USB connected and the P22 jumper installed.\n"
+            "  2. Set SW6 to nRF ONLY and SW10 to VEXT -> nRF.\n"
+            "  3. Connect PPK2 VOUT to P21 and PPK2 GND to DK GND.\n"
+            "  4. Connect DK VDD_nRF/GND to PPK2 logic VCC/GND.\n"
             "  5. Connect A0/P0.03->D7, A1/P0.04->D6, "
             "A2/P0.28->D5, A3/P0.29->D4.\n"
-            "  6. Keep the DK USB disconnected and close the Power Profiler app.",
+            "  6. Connect the PPK2 USB and close the Power Profiler app.",
             flush=True,
         )
-        input("[power] Press Enter when the wiring is ready...")
+        input("[power] Press Enter when the wiring and switches are ready...")
         print(
-            f"[power] Enabling persistent PPK2 Source Mode at "
-            f"{args.power_profiler_vdd_mv} mV...",
+            f"[power] Configuring PPK2 Source Mode at "
+            f"{args.power_profiler_vdd_mv} mV with DUT power OFF...",
             flush=True,
         )
         power_profiler_session = PowerProfilerSession(
@@ -2351,6 +2360,11 @@ def main(argv: list[str] | None = None) -> int:
         power_profiler_session.open()
         atexit.register(power_profiler_session.close)
         args.power_profiler_session = power_profiler_session
+        input(
+            "[power] Source Mode is ready and the nRF52840 is still unpowered. "
+            "Press Enter to enable DUT power..."
+        )
+        power_profiler_session.power_on()
         idle_mean_ua, idle_peak_ua = power_profiler_session.probe_current()
         print(
             f"[power] DUT powered: mean={idle_mean_ua:.2f} uA "
@@ -2361,7 +2375,7 @@ def main(argv: list[str] | None = None) -> int:
             raise RuntimeError(
                 "PPK2 Source Mode sees only leakage current after enabling DUT power "
                 f"(mean={idle_mean_ua:.2f} uA, peak={idle_peak_ua:.2f} uA). "
-                "Connect PPK2 VOUT to the P22 VDD_nRF pin and share GND."
+                "Connect PPK2 VOUT to P21, set SW10 to VEXT -> nRF, and share GND."
             )
 
     gateway = PiGateway(args.pi_host, args.pi_workdir, args.ssh_key)

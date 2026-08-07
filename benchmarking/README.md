@@ -265,7 +265,10 @@ Hardware connection defaults are read from `benchmarking/config.json`:
   "serial-device": "/dev/ttyACM0",
   "pi-host": "user@ip",
   "ssh-key": "~/.ssh/[INSERT_SSH_KEY]",
-  "ble-addr": "00:00:00:00:00:00"
+  "ble-addr": "00:00:00:00:00:00",
+  "power-profiler-serial-device": "/dev/serial/by-id/usb-Nordic_Semiconductor_PPK2_SERIAL-if01",
+  "power-profiler-vdd-mv": 3000,
+  "power-profiler-output-samples-per-second": 100
 }
 ```
 
@@ -281,10 +284,44 @@ universal credential bundle.
 
 ## PPK2 Energy Measurement
 
-Power-profiler integration is disabled in the current nRF52840DK port. Passing
-`--power-profiler` is rejected before build or hardware access. The historical
-energy columns remain in the CSV schema so existing result-processing scripts
-continue to read old runs.
+`--power-profiler` enables PPK2 Source Mode for the nRF52840DK. The runner
+flashes the DK first, pauses for wiring, configures Source Mode with DUT power
+off, and pauses again before energizing the nRF52840 at the voltage configured
+by `power-profiler-vdd-mv` (3000 mV by default).
+
+With SB40 cut, keep the P22 jumper installed while flashing. At the runner
+prompt:
+
+1. Keep the DK USB connected and the P22 jumper installed.
+2. Set SW6 to `nRF ONLY` and SW10 to `VEXT -> nRF`.
+3. Connect PPK2 `VOUT` to P21 and PPK2 `GND` to DK `GND`.
+4. Connect DK `VDD_nRF`/`GND` to PPK2 logic `VCC`/`GND`.
+5. Connect `A0/P0.03 -> D7`, `A1/P0.04 -> D6`, `A2/P0.28 -> D5`, and
+   `A3/P0.29 -> D4`.
+6. Keep the Power Profiler desktop app closed while the Python runner owns the
+   PPK2 serial device.
+
+After the first confirmation the PPK2 is configured but the DUT output remains
+off. Check the wiring once more, then use the second confirmation to power and
+boot the nRF52840.
+
+The four GPIO windows measure total execution, TLS handshake, client KEM, and
+client signature. Current is integrated at the PPK2 native 100 kS/s rate; the
+configured output rate only controls the compressed `power_trace_*.csv.gz`.
+Run a single-case smoke test with:
+
+```bash
+python3 benchmarking/run_benchmarks.py \
+  --cases benchmarking/cases/simple_cases.csv \
+  --seed 123 \
+  --limit 1 \
+  --sessions-per-case 1 \
+  --power-profiler
+```
+
+Source Mode is intentionally limited to `nrf52840dk/nrf52840` and a single
+firmware profile because SW6 isolates the target from the debugger during
+capture.
 
 ### Save and resume
 

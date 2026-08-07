@@ -63,11 +63,13 @@ class PowerProfilerSession:
         self.vdd_mv = vdd_mv
         self.output_rate = output_samples_per_second
         self.ppk = None
+        self.powered = False
 
     def open(self) -> None:
         self.ppk = _open_ppk(self.device)
         try:
             self.ppk.stop_measuring()
+            self.ppk.toggle_DUT_power("OFF")
             time.sleep(0.1)
             self.ppk.ser.reset_input_buffer()
             if not self.ppk.get_modifiers():
@@ -76,10 +78,6 @@ class PowerProfilerSession:
                 )
             self.ppk.use_source_meter()
             self.ppk.set_source_voltage(self.vdd_mv)
-            self.ppk.toggle_DUT_power("OFF")
-            time.sleep(0.1)
-            self.ppk.toggle_DUT_power("ON")
-            time.sleep(0.5)
         except BaseException:
             try:
                 self.ppk.toggle_DUT_power("OFF")
@@ -88,9 +86,18 @@ class PowerProfilerSession:
                 self.ppk = None
             raise
 
+    def power_on(self, boot_seconds: float = 0.5) -> None:
+        if self.ppk is None:
+            raise RuntimeError("PPK2 session is not open")
+        self.ppk.toggle_DUT_power("ON")
+        self.powered = True
+        time.sleep(boot_seconds)
+
     def probe_current(self) -> tuple[float, float]:
         if self.ppk is None:
             raise RuntimeError("PPK2 session is not open")
+        if not self.powered:
+            raise RuntimeError("PPK2 DUT power is off")
         samples: list[float] = []
         self.ppk.start_measuring()
         try:
@@ -122,8 +129,10 @@ class PowerProfilerSession:
             raise RuntimeError("PPK2 session is not open")
         self.ppk.stop_measuring()
         self.ppk.toggle_DUT_power("OFF")
+        self.powered = False
         time.sleep(off_seconds)
         self.ppk.toggle_DUT_power("ON")
+        self.powered = True
         time.sleep(boot_seconds)
 
     def close(self) -> None:
@@ -134,6 +143,7 @@ class PowerProfilerSession:
         finally:
             try:
                 self.ppk.toggle_DUT_power("OFF")
+                self.powered = False
             finally:
                 self.ppk.ser.close()
                 self.ppk = None

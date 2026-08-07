@@ -156,6 +156,8 @@ def build(
     ]
     if not standalone_benchmark:
         cmake_args.append(f"-DBENCH_GENERATED_DIR={generated_dir}")
+        if power_markers:
+            cmake_args.append(f"-DEXTRA_CONF_FILE={firmware_dir / 'power.conf'}")
     else:
         cmake_args.append(
             f"-DEXTRA_CONF_FILE={firmware_dir / ('kem_bench.conf' if kem_benchmark else 'certgen.conf')}"

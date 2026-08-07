@@ -225,6 +225,10 @@ class BenchmarkTests(unittest.TestCase):
         self.assertEqual(overridden.serial_device, "/dev/ttyUSB9")
         self.assertEqual(overridden.server_backend, "wolfssl")
 
+        powered = parse_args(["--cases", "cases.csv", "--power-profiler"])
+        self.assertTrue(powered.power_profiler)
+        self.assertEqual(powered.board, "nrf52840dk/nrf52840")
+
     def test_old_config_gets_power_profiler_defaults(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             config_path = Path(tmpdir) / "config.json"
@@ -257,6 +261,9 @@ class BenchmarkTests(unittest.TestCase):
         with patch("benchmarklib.power_profiler._open_ppk", return_value=ppk):
             session = PowerProfilerSession("/dev/ppk2", 3000, 100)
             session.open()
+            self.assertFalse(session.powered)
+            session.power_on(boot_seconds=0)
+            self.assertTrue(session.powered)
             session.power_cycle(off_seconds=0, boot_seconds=0)
             session.close()
 
@@ -276,7 +283,10 @@ class BenchmarkTests(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 session.open()
 
-        ppk.toggle_DUT_power.assert_called_once_with("OFF")
+        self.assertEqual(
+            [call.args[0] for call in ppk.toggle_DUT_power.call_args_list],
+            ["OFF", "OFF"],
+        )
         ppk.ser.close.assert_called_once_with()
         self.assertIsNone(session.ppk)
 

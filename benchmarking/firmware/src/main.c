@@ -78,7 +78,7 @@ static void benchmark_output(const char *format, ...);
 #define BENCH_CONTROL_FLAG_START BIT(0)
 #define BENCH_CONTROL_FLAG_END BIT(1)
 #if defined(CONFIG_SOC_NRF52840)
-#define BENCH_CONTROL_BUFFER_SIZE 512
+#define BENCH_CONTROL_BUFFER_SIZE 2048
 #else
 #define BENCH_CONTROL_BUFFER_SIZE 1536
 #endif
@@ -750,18 +750,27 @@ static int benchmark_control_send(const char *message, size_t length)
 static void benchmark_output(const char *format, ...)
 {
 #ifdef BENCH_BLE_TELEMETRY
-    static char output[BENCH_CONTROL_BUFFER_SIZE];
+    char *output;
     va_list args;
     int length;
 
-    va_start(args, format);
-    length = vsnprintk(output, sizeof(output), format, args);
-    va_end(args);
-    if (length < 0) {
+    /* Source Meter builds are within a few hundred bytes of the nRF52840 RAM
+     * limit. Keep this synchronous formatting buffer transient instead of
+     * reserving it in .bss for the entire benchmark. */
+    output = k_heap_alloc(&wolfssl_heap, BENCH_CONTROL_BUFFER_SIZE, K_NO_WAIT);
+    if (output == NULL) {
         return;
     }
-    length = MIN(length, (int)sizeof(output) - 1);
+    va_start(args, format);
+    length = vsnprintk(output, BENCH_CONTROL_BUFFER_SIZE, format, args);
+    va_end(args);
+    if (length < 0) {
+        k_heap_free(&wolfssl_heap, output);
+        return;
+    }
+    length = MIN(length, BENCH_CONTROL_BUFFER_SIZE - 1);
     (void)benchmark_control_send(output, (size_t)length);
+    k_heap_free(&wolfssl_heap, output);
 #else
     va_list args;
 
