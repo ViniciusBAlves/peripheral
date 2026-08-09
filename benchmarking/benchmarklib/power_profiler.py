@@ -10,13 +10,18 @@ from pathlib import Path
 
 
 NATIVE_SAMPLE_RATE_HZ = 100_000
-WINDOW_BITS = {
-    # DK P0.03/P0.04/P0.28/P0.29 are wired to PPK2 D7/D6/D5/D4.
-    "total_execution": 7,
-    "handshake": 6,
-    "client_kem": 5,
-    "client_signature": 4,
+# DK P0.03/P0.04/P0.28/P0.29 are wired to PPK2 D7/D6/D5/D4.
+# D5 is the aggregate KEX marker. D5+D4 distinguishes classical ECDHE/X25519,
+# while D5 alone is ML-KEM and D4 alone remains the signature marker.
+WINDOW_ACTIVE = {
+    "total_execution": lambda mask: bool(mask & (1 << 7)),
+    "handshake": lambda mask: bool(mask & (1 << 6)),
+    "client_kem": lambda mask: bool(mask & (1 << 5)),
+    "mlkem": lambda mask: bool(mask & (1 << 5)) and not bool(mask & (1 << 4)),
+    "classical_kex": lambda mask: bool(mask & (1 << 5)) and bool(mask & (1 << 4)),
+    "client_signature": lambda mask: bool(mask & (1 << 4)) and not bool(mask & (1 << 5)),
 }
+REQUIRED_WINDOWS = {"total_execution", "handshake", "client_kem", "client_signature"}
 
 
 def _open_ppk(device: str):
@@ -116,11 +121,12 @@ class PowerProfilerSession:
         absolute = [abs(value) for value in samples]
         return statistics.fmean(absolute), max(absolute)
 
-    def capture(self) -> "PowerProfilerCapture":
+    def capture(self, *, transfer_mode: bool = False) -> "PowerProfilerCapture":
         if self.ppk is None:
             raise RuntimeError("PPK2 session is not open")
         return PowerProfilerCapture(
-            self.device, self.vdd_mv, self.output_rate, ppk=self.ppk
+            self.device, self.vdd_mv, self.output_rate, ppk=self.ppk,
+            transfer_mode=transfer_mode,
         )
 
     def power_cycle(self, off_seconds: float = 0.25,
@@ -153,7 +159,8 @@ class PowerProfilerCapture:
     """Capture PPK2 current and synchronous digital markers for one attempt."""
 
     def __init__(
-        self, device: str, vdd_mv: int, output_samples_per_second: int, *, ppk=None
+        self, device: str, vdd_mv: int, output_samples_per_second: int, *,
+        ppk=None, transfer_mode: bool = False,
     ):
         if vdd_mv <= 0:
             raise ValueError("PPK2 VDD must be positive")
@@ -164,6 +171,7 @@ class PowerProfilerCapture:
         self.output_rate = output_samples_per_second
         self._ppk = ppk
         self._owns_ppk = ppk is None
+        self._transfer_mode = transfer_mode
         self._thread: threading.Thread | None = None
         self._stop = threading.Event()
         self._error: Exception | None = None
@@ -171,7 +179,7 @@ class PowerProfilerCapture:
         self._trace: list[tuple[float, float, int]] = []
         self._active: dict[str, dict[str, float | int]] = {}
         self._completed: dict[str, list[_Window]] = {
-            name: [] for name in WINDOW_BITS
+            name: [] for name in WINDOW_ACTIVE
         }
         self._last_mask = 0
 
@@ -216,9 +224,9 @@ class PowerProfilerCapture:
             self._error = error
 
     def _process_sample(self, index: int, current_ua: float, mask: int) -> None:
-        for name, bit in WINDOW_BITS.items():
-            high = bool(mask & (1 << bit))
-            was_high = bool(self._last_mask & (1 << bit))
+        for name, is_active in WINDOW_ACTIVE.items():
+            high = is_active(mask)
+            was_high = is_active(self._last_mask)
             if high and not was_high:
                 self._active[name] = {
                     "start": index, "count": 0, "sum": 0.0, "peak": current_ua,
@@ -289,8 +297,17 @@ class PowerProfilerCapture:
         if not totals:
             return self._empty_result("incomplete")
         total = totals[-1]
+        transfer_totals: list[_Window] = []
+        if self._transfer_mode and self._completed["handshake"]:
+            handshake = self._completed["handshake"][-1]
+            total = next(
+                (window for window in totals
+                 if window.start <= handshake.start and handshake.end <= window.end),
+                totals[0],
+            )
+            transfer_totals = [window for window in totals if window.start > total.end]
         selected: dict[str, _Window] = {"total_execution": total}
-        for name in WINDOW_BITS:
+        for name in WINDOW_ACTIVE:
             if name == "total_execution":
                 continue
             contained = [
@@ -300,7 +317,7 @@ class PowerProfilerCapture:
             if contained:
                 selected[name] = _combine_windows(contained)
         result = self._empty_result(
-            "success" if len(selected) == len(WINDOW_BITS) else "incomplete"
+            "success" if REQUIRED_WINDOWS <= selected.keys() else "incomplete"
         )
         for name, window in selected.items():
             duration_s = window.sample_count / NATIVE_SAMPLE_RATE_HZ
@@ -313,4 +330,16 @@ class PowerProfilerCapture:
                 f"{name}_avg_current_ua": f"{avg_current_ua:.3f}",
                 f"{name}_peak_current_ua": f"{window.peak_current_ua:.3f}",
             })
+        if self._transfer_mode:
+            result["transfer_power_windows"] = [
+                {
+                    "duration_ms": f"{window.sample_count * 1000.0 / NATIVE_SAMPLE_RATE_HZ:.3f}",
+                    "charge_uc": f"{window.current_sum_ua / NATIVE_SAMPLE_RATE_HZ:.6f}",
+                    "energy_uj": f"{window.current_sum_ua / NATIVE_SAMPLE_RATE_HZ * self.vdd_mv / 1000.0:.6f}",
+                    "avg_current_ua": f"{window.current_sum_ua / window.sample_count:.3f}",
+                    "peak_current_ua": f"{window.peak_current_ua:.3f}",
+                }
+                for window in transfer_totals
+                if window.sample_count > 0
+            ]
         return result

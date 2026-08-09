@@ -420,6 +420,27 @@ static int handle_mqtt_connect(WOLFSSL* ssl)
     return 0;
 }
 
+/* Keep the bridge alive until the board emits its BCTL result and initiates
+ * TLS shutdown. Closing immediately after CONNACK races with slow clients. */
+static void wait_for_client_shutdown(WOLFSSL* ssl)
+{
+    unsigned char byte;
+
+    for (;;) {
+        int ret = wolfSSL_read(ssl, &byte, 1);
+        if (ret > 0)
+            continue;
+        if (ret == 0)
+            return;
+
+        int err = wolfSSL_get_error(ssl, ret);
+        if (err != WOLFSSL_ERROR_WANT_READ &&
+            err != WOLFSSL_ERROR_WANT_WRITE) {
+            return;
+        }
+    }
+}
+
 static int tls_read_exact(WOLFSSL* ssl, unsigned char* data, size_t size)
 {
     size_t offset = 0;
@@ -584,10 +605,12 @@ static int parse_publish(unsigned char type, unsigned char* body,
 }
 
 static int load_transfer_plan(const char* path,
-                              struct transfer_operation operations[6])
+                              struct transfer_operation** operations_out,
+                              size_t* count_out)
 {
     FILE* file = fopen(path, "r");
-    int count = 0;
+    struct transfer_operation* operations = NULL;
+    size_t count = 0, capacity = 0;
     if (file == NULL)
         return -1;
     char header[128];
@@ -595,13 +618,38 @@ static int load_transfer_plan(const char* path,
         fclose(file);
         return -1;
     }
-    while (count < 6 && fscanf(file, "%u,%23[^,],%u,%u\n",
-            &operations[count].order, operations[count].direction,
-            &operations[count].payload_bytes,
-            &operations[count].payload_seed) == 4)
-        count++;
+    for (;;) {
+        struct transfer_operation operation;
+        int parsed = fscanf(file, "%u,%23[^,],%u,%u\n",
+            &operation.order, operation.direction, &operation.payload_bytes,
+            &operation.payload_seed);
+        if (parsed == EOF)
+            break;
+        if (parsed != 4)
+            goto fail;
+        if (count == capacity) {
+            size_t next_capacity = capacity == 0 ? 16 : capacity * 2;
+            void* resized = realloc(operations,
+                next_capacity * sizeof(*operations));
+            if (resized == NULL)
+                goto fail;
+            operations = resized;
+            capacity = next_capacity;
+        }
+        operations[count++] = operation;
+    }
     fclose(file);
-    return count == 6 ? 0 : -1;
+    if (count == 0) {
+        free(operations);
+        return -1;
+    }
+    *operations_out = operations;
+    *count_out = count;
+    return 0;
+fail:
+    fclose(file);
+    free(operations);
+    return -1;
 }
 
 static int handle_subscribe_and_ready(WOLFSSL* ssl)
@@ -630,22 +678,34 @@ fail:
 
 static int run_transfers(WOLFSSL* ssl, const char* plan_path)
 {
-    struct transfer_operation operations[6];
+    struct transfer_operation* operations = NULL;
+    size_t operation_count = 0;
     unsigned int packet_id_state = 100;
-    if (load_transfer_plan(plan_path, operations) != 0 ||
-        handle_subscribe_and_ready(ssl) != 0)
+    if (load_transfer_plan(plan_path, &operations, &operation_count) != 0 ||
+        handle_subscribe_and_ready(ssl) != 0) {
+        free(operations);
         return -1;
+    }
     fprintf(stderr, "[BENCH_TRANSFER_SERVER] status=ready\n");
+    char begin[64];
+    snprintf(begin, sizeof(begin), "BEGIN %zu", operation_count);
+    if (publish(ssl, "bench/control", (unsigned char*)begin,
+                (unsigned int)strlen(begin), &packet_id_state) != 0) {
+        free(operations);
+        return -1;
+    }
 
-    for (int i = 0; i < 6; i++) {
+    for (size_t i = 0; i < operation_count; i++) {
         struct transfer_operation* op = &operations[i];
         unsigned char* expected = make_payload(op->payload_seed, op->payload_bytes);
         unsigned char *body = NULL, *payload;
         unsigned int body_size, payload_size, packet_id;
         unsigned char type;
         char topic[64], expected_hash[65], command[192];
-        if (expected == NULL)
+        if (expected == NULL) {
+            free(operations);
             return -1;
+        }
         hash_hex(expected, op->payload_bytes, expected_hash);
         snprintf(command, sizeof(command), "%s %u %u %u %s",
             strcmp(op->direction, "server_to_device") == 0 ? "DOWN" : "UP",
@@ -713,10 +773,12 @@ static int run_transfers(WOLFSSL* ssl, const char* plan_path)
 operation_fail:
         free(body);
         free(expected);
+        free(operations);
         return -1;
     }
     fprintf(stderr, "[BENCH_TRANSFER_SERVER] status=complete\n");
     fflush(stderr);
+    free(operations);
     return 0;
 }
 
@@ -780,11 +842,11 @@ int main(int argc, char** argv)
             goto cleanup;
         }
         wolfSSL_set_fd(ssl, client_fd);
-
         int accept_ret = wolfSSL_accept(ssl);
         if (accept_ret != WOLFSSL_SUCCESS) {
             int err = wolfSSL_get_error(ssl, accept_ret);
             fprintf(stderr, "wolfSSL_accept failed: %d\n", err);
+            wolfSSL_ERR_print_errors_fp(stderr, 0);
             goto cleanup;
         }
         fprintf(stderr, "[wolfssl-server] TLS handshake complete\n");
@@ -801,6 +863,9 @@ int main(int argc, char** argv)
             goto cleanup;
         }
 
+        /* Keep L2CAP alive long enough for the board's terminal BCTL frame and
+         * TLS close_notify. Closing immediately races transfer completion. */
+        wait_for_client_shutdown(ssl);
         (void)wolfSSL_shutdown(ssl);
         wolfSSL_free(ssl);
         ssl = NULL;

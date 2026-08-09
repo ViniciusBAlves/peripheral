@@ -478,12 +478,34 @@ Each run writes immutable artifacts below `results/<timestamp>_<seed>/`,
 including the input CSV, run and session manifests, per-case attempts and logs,
 and the aggregate `summary.csv`.
 
+## Disk Usage And Caches
+
+Certificate chains are generated once in `work/certificate-cache/` and reused
+by later runs. Public certificates are hard-linked into per-case result
+directories when the filesystem permits it; private keys are copied because
+stateful LMS/XMSS keys must never share mutable state.
+
+Firmware builds use the content-addressed `work/firmware-cache/`. The cache key
+includes the firmware sources, generated trust bundle, board and build options,
+so an identical benchmark reuses one Zephyr build while any relevant change
+creates a separate entry.
+
+Old run-specific build directories can be inspected and removed without
+touching benchmark results or the reusable certificate cache:
+
+```bash
+python3 benchmarking/clean_work.py
+python3 benchmarking/clean_work.py --apply
+```
+
 ## Bidirectional Payload Benchmark
 
 `run_transfer_benchmarks.py` reuses the same case CSV, PKI generation,
 universal firmware profiles, Raspberry Pi bridge, TLS backends, and seed. Each
-CSV `iteration` is one fresh BLE/TLS/MQTT round containing six QoS 1 transfers:
-1, 10, and 100 KiB in both directions. `warmup_iterations` and
+case uses one fresh BLE/TLS/MQTT connection. CSV `iterations=N` repeats each of
+the six QoS 1 transfers N times inside that connection: 128 bytes, 1 KiB and
+16 KiB in both directions. Payloads are generated and validated as a stream.
+`warmup_iterations` and
 `--sessions-per-case` are ignored by this runner.
 
 ```bash
@@ -499,14 +521,31 @@ Use `--mtls-mode` to retain mutual TLS. Resume an interrupted run with:
 python3 benchmarking/run_transfer_benchmarks.py --resume <run_id>
 ```
 
-The round and its six operations are shuffled deterministically. Results are
+The case order and all `6 * iterations` operations are shuffled
+deterministically from the seed. Results are
 written to `round_manifest.csv`, `transfer_manifest.csv`,
 `handshake_summary.csv`, `transfer_summary.csv`, and per-case
 `handshakes.csv`/`transmissions.csv`. Payload integrity uses a deterministic
 stream and SHA-256 plus MQTT PUBACK and an application-level ACK. Failed retry
 data remains in `transmissions.csv`, while aggregates include only complete
-rounds with confirmed integrity. Power columns are explicitly `unsupported`
-on the current nRF52840 port.
+rounds with confirmed integrity.
+
+The transfer runner accepts the same nRF52840DK PPK2 Source Mode option as the
+handshake runner:
+
+```bash
+python3 benchmarking/run_transfer_benchmarks.py \
+  --cases benchmarking/cases/simple_cases.csv \
+  --seed 123 \
+  --limit 1 \
+  --power-profiler
+```
+
+The handshake keeps the existing D7-D4 windows. After it completes, each
+payload transfer emits a separate D7 pulse. Its duration, charge, energy,
+average current, and peak current are written to `transmissions.csv`; current
+is still integrated from the native 100 kS/s samples. Without
+`--power-profiler`, these transfer energy fields are marked `unsupported`.
 
 To require every recorded execution, including warmups, to have succeeded:
 
@@ -516,6 +555,12 @@ python benchmarking/check_results.py <run_id>
 
 The checker prints `PASS` or `FAIL` for every case and exits with status `1`
 when at least one case is missing attempts or contains a non-success status.
+For a benchmark that is still running, hide cases without attempts while
+retaining completed passes, failures and timeouts with:
+
+```bash
+python benchmarking/check_results.py <run_id> --ongoing
+```
 
 ## Tests
 

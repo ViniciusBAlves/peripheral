@@ -54,6 +54,11 @@ def main() -> int:
         "run_dir",
         help="result directory or run id under benchmarking/results",
     )
+    parser.add_argument(
+        "--ongoing",
+        action="store_true",
+        help="hide cases that do not have any recorded attempts yet",
+    )
     args = parser.parse_args()
     run_dir = resolve_run_dir(args.run_dir)
     attempts = attempts_by_case(run_dir)
@@ -62,6 +67,8 @@ def main() -> int:
 
     for case_id in case_ids:
         rows = attempts.get(case_id, [])
+        if args.ongoing and not rows:
+            continue
         successes = sum(row.get("status") == "success" for row in rows)
         if rows and successes == len(rows):
             print(f"PASS {case_id} ({successes}/{len(rows)})")

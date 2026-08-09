@@ -124,7 +124,17 @@ def _append_log(log: Path, message: str) -> None:
 def _copy_files(source: Path, destination: Path, names: tuple[str, ...]) -> None:
     destination.mkdir(parents=True, exist_ok=True)
     for name in names:
-        shutil.copy2(source / name, destination / name)
+        target = destination / name
+        target.unlink(missing_ok=True)
+        # Stateful LMS/XMSS private keys may be updated after signing, so every
+        # materialized case must retain its own private-key file.
+        if name.endswith(".key") or name.endswith("_key.der"):
+            shutil.copy2(source / name, target)
+            continue
+        try:
+            os.link(source / name, target)
+        except OSError:
+            shutil.copy2(source / name, target)
 
 
 def _cert_is_valid(path: Path, *, min_valid_seconds: int = MIN_CACHE_VALID_SECONDS) -> bool:
@@ -210,6 +220,26 @@ PUBLIC_CHAIN_FILES = (
     "server_intermediate.der", "server.crt", "server.der", "server.key",
     "server_chain.crt",
 )
+
+
+def materialize_case(template: Path, destination: Path) -> None:
+    """Create one case directory without duplicating immutable certificates."""
+    destination.mkdir(parents=True, exist_ok=True)
+    immutable = (set(PUBLIC_CHAIN_FILES) - {"server.key"}) | {
+        "client_ca.crt", "client_ca.der", "client_cert.der",
+    }
+    for source in template.iterdir():
+        target = destination / source.name
+        if source.is_dir():
+            shutil.copytree(source, target, dirs_exist_ok=True)
+        elif source.name in immutable:
+            target.unlink(missing_ok=True)
+            try:
+                os.link(source, target)
+            except OSError:
+                shutil.copy2(source, target)
+        else:
+            shutil.copy2(source, target)
 
 
 def _case_algorithms(

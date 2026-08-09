@@ -11,15 +11,20 @@
 
 static const struct device *const gpio0 = DEVICE_DT_GET(DT_NODELABEL(gpio0));
 static bool markers_ready;
-static unsigned int kem_depth;
+static unsigned int mlkem_depth;
+static unsigned int classical_kex_depth;
 static unsigned int signature_depth;
 
-static bool is_kem(enum benchmark_crypto_operation operation)
+static bool is_mlkem(enum benchmark_crypto_operation operation)
 {
     return operation == BENCH_CRYPTO_KEM_KEYGEN ||
            operation == BENCH_CRYPTO_KEM_ENCAPSULATE ||
-           operation == BENCH_CRYPTO_KEM_DECAPSULATE ||
-           operation == BENCH_CRYPTO_CLASSICAL_KEX_KEYGEN ||
+           operation == BENCH_CRYPTO_KEM_DECAPSULATE;
+}
+
+static bool is_classical_kex(enum benchmark_crypto_operation operation)
+{
+    return operation == BENCH_CRYPTO_CLASSICAL_KEX_KEYGEN ||
            operation == BENCH_CRYPTO_CLASSICAL_KEX_SHARED_SECRET;
 }
 
@@ -47,7 +52,8 @@ void benchmark_power_markers_reset(void)
     if (!markers_ready) {
         return;
     }
-    kem_depth = 0;
+    mlkem_depth = 0;
+    classical_kex_depth = 0;
     signature_depth = 0;
     gpio_port_clear_bits_raw(gpio0, BIT(MARKER_TOTAL_PIN) |
         BIT(MARKER_HANDSHAKE_PIN) | BIT(MARKER_KEM_PIN) |
@@ -73,8 +79,14 @@ void benchmark_power_crypto_start(enum benchmark_crypto_operation operation)
     if (!markers_ready) {
         return;
     }
-    if (is_kem(operation) && kem_depth++ == 0) {
+    if (is_mlkem(operation) && mlkem_depth++ == 0) {
         gpio_pin_set_raw(gpio0, MARKER_KEM_PIN, 1);
+    }
+    /* D5 marks every KEX operation. D5+D4 identifies the classical
+     * ECDHE/X25519 component without requiring a fifth PPK2 wire. */
+    if (is_classical_kex(operation) && classical_kex_depth++ == 0) {
+        gpio_pin_set_raw(gpio0, MARKER_KEM_PIN, 1);
+        gpio_pin_set_raw(gpio0, MARKER_SIGNATURE_PIN, 1);
     }
     if (is_signature(operation) && signature_depth++ == 0) {
         gpio_pin_set_raw(gpio0, MARKER_SIGNATURE_PIN, 1);
@@ -86,11 +98,23 @@ void benchmark_power_crypto_stop(enum benchmark_crypto_operation operation)
     if (!markers_ready) {
         return;
     }
-    if (is_kem(operation) && kem_depth > 0 && --kem_depth == 0) {
+    if (is_mlkem(operation) && mlkem_depth > 0 && --mlkem_depth == 0 &&
+        classical_kex_depth == 0) {
         gpio_pin_set_raw(gpio0, MARKER_KEM_PIN, 0);
     }
+    if (is_classical_kex(operation) && classical_kex_depth > 0 &&
+        --classical_kex_depth == 0) {
+        if (mlkem_depth == 0) {
+            gpio_pin_set_raw(gpio0, MARKER_KEM_PIN, 0);
+        }
+        if (signature_depth == 0) {
+            gpio_pin_set_raw(gpio0, MARKER_SIGNATURE_PIN, 0);
+        }
+    }
     if (is_signature(operation) && signature_depth > 0 && --signature_depth == 0) {
-        gpio_pin_set_raw(gpio0, MARKER_SIGNATURE_PIN, 0);
+        if (classical_kex_depth == 0) {
+            gpio_pin_set_raw(gpio0, MARKER_SIGNATURE_PIN, 0);
+        }
     }
 }
 #else

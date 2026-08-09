@@ -9,6 +9,7 @@ import json
 import socket
 import time
 from collections import deque
+from functools import lru_cache
 
 
 TOPIC_CONTROL = "bench/control"
@@ -16,6 +17,12 @@ TOPIC_DOWN = "bench/down"
 TOPIC_UP = "bench/up"
 TOPIC_DEVICE_ACK = "bench/device_ack"
 TOPIC_METRICS = "bench/metrics"
+TRANSFER_TIMEOUT_SECONDS = 30.0
+PAYLOAD_PERIOD_SIZE = 1 << 16
+_BASE_PAYLOAD_PERIOD = bytes(
+    (offset * 31 + (offset >> 8) * 17) & 0xFF
+    for offset in range(PAYLOAD_PERIOD_SIZE)
+)
 
 
 def encode_remaining_length(value: int) -> bytes:
@@ -39,17 +46,34 @@ def payload_byte(seed: int, offset: int) -> int:
     return (seed + offset * 31 + (offset >> 8) * 17) & 0xFF
 
 
+@lru_cache(maxsize=256)
+def payload_period(seed_low_byte: int) -> bytes:
+    translation = bytes((value + seed_low_byte) & 0xFF for value in range(256))
+    return _BASE_PAYLOAD_PERIOD.translate(translation)
+
+
+def payload_slice(seed: int, offset: int, size: int) -> bytes:
+    period = payload_period(seed & 0xFF)
+    start = offset % PAYLOAD_PERIOD_SIZE
+    first = min(size, PAYLOAD_PERIOD_SIZE - start)
+    remaining = size - first
+    return (
+        period[start:start + first]
+        + period * (remaining // PAYLOAD_PERIOD_SIZE)
+        + period[:remaining % PAYLOAD_PERIOD_SIZE]
+    )
+
+
 def make_payload(seed: int, size: int) -> bytes:
-    return bytes(payload_byte(seed, offset) for offset in range(size))
+    return payload_slice(seed, 0, size)
 
 
 def payload_hash(seed: int, size: int) -> str:
     digest = hashlib.sha256()
-    for offset in range(0, size, 1024):
-        count = min(1024, size - offset)
-        digest.update(bytes(
-            payload_byte(seed, index) for index in range(offset, offset + count)
-        ))
+    period = payload_period(seed & 0xFF)
+    for _ in range(size // PAYLOAD_PERIOD_SIZE):
+        digest.update(period)
+    digest.update(period[:size % PAYLOAD_PERIOD_SIZE])
     return digest.hexdigest()
 
 
@@ -154,10 +178,7 @@ class MqttClient:
         )
         for offset in range(0, size, 1024):
             count = min(1024, size - offset)
-            self.sock.sendall(bytes(
-                payload_byte(seed, index)
-                for index in range(offset, offset + count)
-            ))
+            self.sock.sendall(payload_slice(seed, offset, count))
         self._wait_puback(packet_id)
 
     def wait_pattern_publish(self, topic: str, seed: int, size: int) -> tuple[str, bool]:
@@ -175,10 +196,7 @@ class MqttClient:
         while offset < payload_size:
             chunk = self._read_exact(min(1024, payload_size - offset))
             digest.update(chunk)
-            valid &= all(
-                value == payload_byte(seed, offset + index)
-                for index, value in enumerate(chunk)
-            )
+            valid &= chunk == payload_slice(seed, offset, len(chunk))
             offset += len(chunk)
         if packet_id:
             self.sock.sendall(b"\x40\x02" + packet_id.to_bytes(2, "big"))
@@ -203,15 +221,16 @@ def run(plan: dict[str, object], host: str, port: int, timeout: float) -> None:
         if ready != b"READY":
             raise RuntimeError(f"expected board READY, received {ready[:80]!r}")
         print("[BENCH_TRANSFER_SERVER] status=ready", flush=True)
+        client.publish(
+            TOPIC_CONTROL, f"BEGIN {len(plan['operations'])}".encode()
+        )
 
         for operation in plan["operations"]:
             sequence = int(operation["order"])
             direction = str(operation["direction"])
             size = int(operation["payload_bytes"])
             seed = int(operation["payload_seed"])
-            client.sock.settimeout(
-                30.0 if size <= 1024 else 120.0 if size <= 10240 else 600.0
-            )
+            client.sock.settimeout(TRANSFER_TIMEOUT_SECONDS)
             expected = payload_hash(seed, size)
             command = f"{'DOWN' if direction == 'server_to_device' else 'UP'} {sequence} {size} {seed} {expected}"
             client.publish(TOPIC_CONTROL, command.encode())

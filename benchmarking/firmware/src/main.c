@@ -64,13 +64,14 @@ static void benchmark_output(const char *format, ...);
     BENCH_OUT(__VA_ARGS__); \
 } while (0)
 
-#define L2CAP_SDU_MTU 672
+#define L2CAP_RX_SDU_MTU 672
+#define L2CAP_TX_SDU_MTU 5120
 /*
  * The nRF52840 shares its 256 KiB RAM with the BLE controller. wolfSSL reads
  * records incrementally, so this ring need not retain a complete PQC chain.
  */
 #if defined(CONFIG_SOC_NRF52840)
-#define TLS_RX_RINGBUF_SIZE 4992
+#define TLS_RX_RINGBUF_SIZE (11 * L2CAP_RX_SDU_MTU)
 #else
 #define TLS_RX_RINGBUF_SIZE 65536
 #endif
@@ -92,7 +93,7 @@ static void benchmark_output(const char *format, ...);
 #if defined(CONFIG_SOC_NRF5340_CPUAPP)
 #define WOLFSSL_HEAP_SIZE (300 * 1024)
 #elif defined(CONFIG_SOC_NRF52840)
-#define WOLFSSL_HEAP_SIZE (201 * 1024)
+#define WOLFSSL_HEAP_SIZE (200 * 1024)
 #else
 #define WOLFSSL_HEAP_SIZE (200 * 1024)
 #endif
@@ -324,11 +325,18 @@ static void *wolfssl_realloc(void *ptr, size_t size)
     return new_ptr;
 }
 
-RING_BUF_DECLARE(rx_ringbuf, TLS_RX_RINGBUF_SIZE);
+K_FIFO_DEFINE(l2cap_rx_fifo);
+static struct net_buf *l2cap_rx_current;
+static atomic_t l2cap_rx_queued_bytes;
 K_SEM_DEFINE(rx_sem, 0, 1);
 K_SEM_DEFINE(l2cap_connected_sem, 0, 1);
 K_SEM_DEFINE(conn_params_ready_sem, 0, 1);
 K_SEM_DEFINE(l2cap_tx_complete_sem, 0, 1);
+#ifdef BENCH_TRANSFER_MODE
+#define L2CAP_TX_COMPLETE_TIMEOUT K_SECONDS(30)
+#else
+#define L2CAP_TX_COMPLETE_TIMEOUT K_SECONDS(5)
+#endif
 
 /* --- WOLFSSL TIME HOOKS --- */
 time_t time_sec(time_t *timer) {
@@ -380,13 +388,11 @@ static void update_led(bool on)
 
 /* --- BLUETOOTH L2CAP BRIDGE --- */
 /*
- * ML-KEM-768 and ML-KEM-1024 ClientHello records are larger than one or two
- * 672-byte LE CoC SDUs.  With only two TX buffers, the first TLS flight can be
- * truncated/stalled after the second chunk; Mosquitto then waits forever for
- * the rest of the TLS record and the board only sees WANT_READ until timeout.
+ * A single large TX SDU keeps a 1 MiB upload below the Pi kernel's 254-command
+ * LE credit limit. Sends are serialized, so one TX buffer is sufficient.
  */
-NET_BUF_POOL_DEFINE(l2cap_tx_pool, 5, BT_L2CAP_BUF_SIZE(L2CAP_SDU_MTU), 8, NULL);
-NET_BUF_POOL_DEFINE(l2cap_rx_pool, 7, BT_L2CAP_BUF_SIZE(L2CAP_SDU_MTU), 8, NULL);
+NET_BUF_POOL_DEFINE(l2cap_tx_pool, 1, BT_L2CAP_BUF_SIZE(L2CAP_TX_SDU_MTU), 8, NULL);
+NET_BUF_POOL_DEFINE(l2cap_rx_pool, 11, BT_L2CAP_BUF_SIZE(L2CAP_RX_SDU_MTU), 8, NULL);
 
 static struct bt_l2cap_le_chan l2cap_chan;
 static volatile bool l2cap_rx_overflow;
@@ -395,7 +401,7 @@ static volatile bool acl_peer_disconnected = true;
 static volatile bool disconnect_requested;
 static struct bt_conn *active_conn;
 static const struct bt_le_conn_param benchmark_conn_params =
-    BT_LE_CONN_PARAM_INIT(12, 12, 0, 3200);
+    BT_LE_CONN_PARAM_INIT(16, 16, 0, 3200);
 
 static void bt_connected(struct bt_conn *conn, uint8_t err)
 {
@@ -492,18 +498,16 @@ static int l2cap_recv(struct bt_l2cap_chan *chan, struct net_buf *buf) {
         return 0;
     }
     benchmark_l2cap_rx(buf->len);
-    uint32_t written = ring_buf_put(&rx_ringbuf, buf->data, buf->len);
-    benchmark_l2cap_rx_ring_usage(ring_buf_size_get(&rx_ringbuf));
-    if (written < buf->len) {
-        l2cap_rx_overflow = true;
-        benchmark_l2cap_rx_overflow();
-        BENCH_LOG("[L2CAP RX] RX ring buffer overflowed: kept %u/%u bytes\n",
-               written, buf->len);
-    } else if (!suppress_l2cap_rx_log) {
+    atomic_add(&l2cap_rx_queued_bytes, buf->len);
+    benchmark_l2cap_rx_ring_usage((uint32_t)atomic_get(&l2cap_rx_queued_bytes));
+    k_fifo_put(&l2cap_rx_fifo, buf);
+    if (!suppress_l2cap_rx_log) {
         BENCH_LOG("[L2CAP RX] queued %u bytes\n", buf->len);
     }
     k_sem_give(&rx_sem);
-    return 0; /* Return 0 to indicate we consumed the data */
+    /* Hold the L2CAP credit until wolfSSL consumes this SDU. This provides
+     * transport backpressure instead of overflowing a small nRF52840 ring. */
+    return -EINPROGRESS;
 }
 
 static void l2cap_connected(struct bt_l2cap_chan *chan) {
@@ -601,7 +605,7 @@ static int l2cap_accept(struct bt_conn *conn, struct bt_l2cap_server *server, st
 
     l2cap_chan.chan.ops = &l2cap_ops;
     
-    l2cap_chan.rx.mtu = L2CAP_SDU_MTU;
+    l2cap_chan.rx.mtu = L2CAP_RX_SDU_MTU;
     
     *chan = &l2cap_chan.chan;
     BENCH_LOG("[L2CAP] Connection accepted; waiting for channel setup.\n");
@@ -618,13 +622,14 @@ int l2cap_wolfssl_send(WOLFSSL* ssl, char* buf, int sz, void* ctx) {
     return (value); \
 } while (0)
 
-    if (l2cap_peer_disconnected && !ring_buf_is_empty(&rx_ringbuf)) {
+    if (l2cap_peer_disconnected &&
+        (l2cap_rx_current != NULL || !k_fifo_is_empty(&l2cap_rx_fifo))) {
         SEND_RETURN(WOLFSSL_CBIO_ERR_WANT_READ);
     }
 
     if (!chan || !chan->conn) { SEND_RETURN(WOLFSSL_CBIO_ERR_CONN_CLOSE); }
 
-    uint16_t mtu = MIN(le_chan->tx.mtu, L2CAP_SDU_MTU);
+    uint16_t mtu = MIN(le_chan->tx.mtu, L2CAP_TX_SDU_MTU);
     if (mtu == 0) mtu = 23; 
 
     while (sent < sz) {
@@ -634,7 +639,9 @@ int l2cap_wolfssl_send(WOLFSSL* ssl, char* buf, int sz, void* ctx) {
         int err = 0;
         do {
             /* 1. Abort if connection dropped during retry */
-            if (l2cap_peer_disconnected && !ring_buf_is_empty(&rx_ringbuf)) {
+            if (l2cap_peer_disconnected &&
+                (l2cap_rx_current != NULL ||
+                 !k_fifo_is_empty(&l2cap_rx_fifo))) {
                 SEND_RETURN(sent > 0 ? sent : WOLFSSL_CBIO_ERR_WANT_READ);
             }
             if (!chan || !chan->conn) {
@@ -682,7 +689,8 @@ int l2cap_wolfssl_send(WOLFSSL* ssl, char* buf, int sz, void* ctx) {
          * queuing the next TLS fragment so large client Certificate flights do
          * not exhaust CoC credits while wolfSSL believes they were delivered.
          */
-        if (k_sem_take(&l2cap_tx_complete_sem, K_SECONDS(5)) != 0 ||
+        if (k_sem_take(&l2cap_tx_complete_sem,
+                       L2CAP_TX_COMPLETE_TIMEOUT) != 0 ||
             chan->conn == NULL || l2cap_peer_disconnected) {
             SEND_RETURN(sent > 0 ? sent : WOLFSSL_CBIO_ERR_TIMEOUT);
         }
@@ -705,7 +713,7 @@ static int benchmark_control_send(const char *message, size_t length)
         return -ENOTCONN;
     }
     le_chan = CONTAINER_OF(chan, struct bt_l2cap_le_chan, chan);
-    mtu = MIN(le_chan->tx.mtu, L2CAP_SDU_MTU);
+    mtu = MIN(le_chan->tx.mtu, L2CAP_TX_SDU_MTU);
     if (mtu <= BENCH_CONTROL_HEADER_SIZE) {
         return -EMSGSIZE;
     }
@@ -737,7 +745,8 @@ static int benchmark_control_send(const char *message, size_t length)
             net_buf_unref(tx_buf);
             return err;
         }
-        if (k_sem_take(&l2cap_tx_complete_sem, K_SECONDS(5)) != 0 ||
+        if (k_sem_take(&l2cap_tx_complete_sem,
+                       L2CAP_TX_COMPLETE_TIMEOUT) != 0 ||
             chan->conn == NULL || l2cap_peer_disconnected) {
             return -ETIMEDOUT;
         }
@@ -750,27 +759,20 @@ static int benchmark_control_send(const char *message, size_t length)
 static void benchmark_output(const char *format, ...)
 {
 #ifdef BENCH_BLE_TELEMETRY
-    char *output;
+    char output[BENCH_CONTROL_BUFFER_SIZE];
     va_list args;
     int length;
 
-    /* Source Meter builds are within a few hundred bytes of the nRF52840 RAM
-     * limit. Keep this synchronous formatting buffer transient instead of
-     * reserving it in .bss for the entire benchmark. */
-    output = k_heap_alloc(&wolfssl_heap, BENCH_CONTROL_BUFFER_SIZE, K_NO_WAIT);
-    if (output == NULL) {
-        return;
-    }
+    /* Keep telemetry outside wolfSSL's heap: large RSA handshakes can leave no
+     * contiguous 2 KiB block even though TLS and MQTT already succeeded. */
     va_start(args, format);
     length = vsnprintk(output, BENCH_CONTROL_BUFFER_SIZE, format, args);
     va_end(args);
     if (length < 0) {
-        k_heap_free(&wolfssl_heap, output);
         return;
     }
     length = MIN(length, BENCH_CONTROL_BUFFER_SIZE - 1);
     (void)benchmark_control_send(output, (size_t)length);
-    k_heap_free(&wolfssl_heap, output);
 #else
     va_list args;
 
@@ -801,8 +803,19 @@ int l2cap_wolfssl_recv(WOLFSSL* ssl, char* buf, int sz, void* ctx) {
      * after it.  If we check chan->conn first, wolfSSL only sees SOCKET_ERROR_E
      * (-308) and never gets the real TLS close/alert bytes.
      */
-    uint32_t read_bytes = ring_buf_get(&rx_ringbuf, (uint8_t*)buf, sz);
-    if (read_bytes > 0) {
+    if (l2cap_rx_current == NULL) {
+        l2cap_rx_current = k_fifo_get(&l2cap_rx_fifo, K_NO_WAIT);
+    }
+    if (l2cap_rx_current != NULL) {
+        uint32_t read_bytes = MIN((uint32_t)sz, l2cap_rx_current->len);
+        memcpy(buf, l2cap_rx_current->data, read_bytes);
+        net_buf_pull(l2cap_rx_current, read_bytes);
+        atomic_sub(&l2cap_rx_queued_bytes, read_bytes);
+        if (l2cap_rx_current->len == 0) {
+            struct net_buf *completed = l2cap_rx_current;
+            l2cap_rx_current = NULL;
+            (void)bt_l2cap_chan_recv_complete(chan, completed);
+        }
         BENCH_LOG("[WOLFSSL RX] delivering %u bytes to wolfSSL\n", read_bytes);
         RECV_RETURN(read_bytes);
     }
@@ -813,11 +826,7 @@ int l2cap_wolfssl_recv(WOLFSSL* ssl, char* buf, int sz, void* ctx) {
 
     /* Wait briefly. If nothing arrives, tell wolfSSL we want to read later. */
     if (k_sem_take(&rx_sem, K_MSEC(50)) == 0) {
-        read_bytes = ring_buf_get(&rx_ringbuf, (uint8_t*)buf, sz);
-        if (read_bytes > 0) {
-            BENCH_LOG("[WOLFSSL RX] delivering %u bytes to wolfSSL\n", read_bytes);
-            RECV_RETURN(read_bytes);
-        }
+        RECV_RETURN(WOLFSSL_CBIO_ERR_WANT_READ);
         if (!chan->conn || l2cap_peer_disconnected) {
             RECV_RETURN(WOLFSSL_CBIO_ERR_CONN_CLOSE);
         }
@@ -842,7 +851,8 @@ static void shutdown_tls_gracefully(WOLFSSL *ssl, struct bt_l2cap_chan *chan)
         }
 
         if (shutdown_ret == WOLFSSL_SHUTDOWN_NOT_DONE) {
-            if (l2cap_peer_disconnected && ring_buf_is_empty(&rx_ringbuf)) {
+            if (l2cap_peer_disconnected && l2cap_rx_current == NULL &&
+                k_fifo_is_empty(&l2cap_rx_fifo)) {
                 BENCH_LOG("TLS shutdown complete: peer closed after close_notify.\n");
                 return;
             }
@@ -854,7 +864,8 @@ static void shutdown_tls_gracefully(WOLFSSL *ssl, struct bt_l2cap_chan *chan)
 
         int err = wolfSSL_get_error(ssl, shutdown_ret);
         if (err == WOLFSSL_ERROR_WANT_READ || err == WOLFSSL_ERROR_WANT_WRITE) {
-            if (l2cap_peer_disconnected && ring_buf_is_empty(&rx_ringbuf)) {
+            if (l2cap_peer_disconnected && l2cap_rx_current == NULL &&
+                k_fifo_is_empty(&l2cap_rx_fifo)) {
                 BENCH_LOG("TLS shutdown complete: peer closed transport.\n");
                 return;
             }
@@ -1026,7 +1037,8 @@ void start_secure_mqtt_session(struct bt_l2cap_chan *chan)
         if (ret != WOLFSSL_SUCCESS) {
             int error = wolfSSL_get_error(ssl, ret);
             if (error == WOLFSSL_ERROR_WANT_READ || error == WOLFSSL_ERROR_WANT_WRITE) {
-                if (l2cap_peer_disconnected && ring_buf_is_empty(&rx_ringbuf)) {
+                if (l2cap_peer_disconnected && l2cap_rx_current == NULL &&
+                    k_fifo_is_empty(&l2cap_rx_fifo)) {
                     error = WOLFSSL_CBIO_ERR_CONN_CLOSE;
                 } else {
                     k_sleep(K_MSEC(1));
@@ -1349,7 +1361,7 @@ int main(void) {
                l2cap_server.psm);
     }
     BENCH_OUT("[BENCH_READY] psm=0x%04x mtu=%u ca_count=%u mlkem_backend=%s rsa_profile=%s\n",
-              l2cap_server.psm, L2CAP_SDU_MTU,
+              l2cap_server.psm, L2CAP_RX_SDU_MTU,
               (unsigned int)BENCHMARK_CA_COUNT, BENCH_MLKEM_BACKEND_NAME,
               BENCH_RSA_PROFILE_NAME);
     
@@ -1357,7 +1369,16 @@ int main(void) {
 
     /* FIX 6: The Infinite Reconnection Loop */
     while (1) {
-        ring_buf_reset(&rx_ringbuf);
+        if (l2cap_rx_current != NULL) {
+            (void)bt_l2cap_chan_recv_complete(
+                &l2cap_chan.chan, l2cap_rx_current);
+            l2cap_rx_current = NULL;
+        }
+        struct net_buf *pending;
+        while ((pending = k_fifo_get(&l2cap_rx_fifo, K_NO_WAIT)) != NULL) {
+            (void)bt_l2cap_chan_recv_complete(&l2cap_chan.chan, pending);
+        }
+        atomic_set(&l2cap_rx_queued_bytes, 0);
         k_sem_reset(&rx_sem);
         k_sem_reset(&l2cap_connected_sem);
         k_sem_reset(&conn_params_ready_sem);
@@ -1376,7 +1397,7 @@ int main(void) {
         } else {
             BENCH_LOG("Advertising started! Waiting for Mac gateway...\n");
             BENCH_OUT("[BENCH_READY] psm=0x%04x mtu=%u ca_count=%u mlkem_backend=%s rsa_profile=%s\n",
-                      l2cap_server.psm, L2CAP_SDU_MTU,
+                      l2cap_server.psm, L2CAP_RX_SDU_MTU,
                       (unsigned int)BENCHMARK_CA_COUNT, BENCH_MLKEM_BACKEND_NAME,
                       BENCH_RSA_PROFILE_NAME);
         }
@@ -1385,7 +1406,7 @@ int main(void) {
          * boot can still validate the correct console before starting BLE. */
         while (k_sem_take(&l2cap_connected_sem, K_SECONDS(5)) != 0) {
             BENCH_OUT("[BENCH_READY] psm=0x%04x mtu=%u ca_count=%u mlkem_backend=%s rsa_profile=%s\n",
-                      l2cap_server.psm, L2CAP_SDU_MTU,
+                      l2cap_server.psm, L2CAP_RX_SDU_MTU,
                       (unsigned int)BENCHMARK_CA_COUNT, BENCH_MLKEM_BACKEND_NAME,
                       BENCH_RSA_PROFILE_NAME);
         }
@@ -1398,7 +1419,7 @@ int main(void) {
         }
         BENCH_OUT("[BENCH_READY] psm=0x%04x mtu=%u ca_count=%u "
                   "mlkem_backend=%s rsa_profile=%s transport=l2cap\n",
-                  l2cap_server.psm, L2CAP_SDU_MTU,
+                  l2cap_server.psm, L2CAP_RX_SDU_MTU,
                   (unsigned int)BENCHMARK_CA_COUNT,
                   BENCH_MLKEM_BACKEND_NAME, BENCH_RSA_PROFILE_NAME);
         if (k_sem_take(&pki_profile_selected_sem, K_SECONDS(10)) != 0) {
@@ -1470,7 +1491,7 @@ int main(void) {
 
         memset(&l2cap_chan, 0, sizeof(l2cap_chan));
         l2cap_chan.chan.ops = &l2cap_ops;
-        l2cap_chan.rx.mtu = L2CAP_SDU_MTU;
+        l2cap_chan.rx.mtu = L2CAP_RX_SDU_MTU;
         
         /* Brief cooldown before firing up the radio again. */
         k_sleep(K_MSEC(500));

@@ -54,8 +54,11 @@
 #define DEFAULT_DISCOVERY_ATTEMPTS 3
 #define COMMAND_OUTPUT_MAX 8192
 #define BRIDGE_RECV_BUFFER_SIZE 65535
+#define L2CAP_SOCKET_RCVBUF_SIZE (2 * 1024 * 1024)
 #define L2CAP_SEND_RETRY_TIMEOUT_MS 10000
-#define L2CAP_SDU_PACING_US 30000
+/* At the requested 20 ms BLE connection interval, one SDU per interval keeps
+ * the link fed without adding four idle intervals between every TLS chunk. */
+#define L2CAP_SDU_PACING_US 20000
 #define CONTROL_HEADER_SIZE 8
 #define CONTROL_FLAG_START 0x01
 #define CONTROL_FLAG_END 0x02
@@ -552,6 +555,13 @@ static int connect_l2cap(const char *address, int address_type, uint16_t psm)
         return -1;
     }
 
+    int receive_buffer = L2CAP_SOCKET_RCVBUF_SIZE;
+    if (setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &receive_buffer,
+                   sizeof(receive_buffer)) < 0) {
+        fprintf(stderr, "[!] Unable to enlarge L2CAP receive buffer: %s\n",
+                strerror(errno));
+    }
+
     struct sockaddr_l2 local = {0};
     local.l2_family = AF_BLUETOOTH;
     bacpy(&local.l2_bdaddr, BDADDR_ANY);
@@ -560,6 +570,14 @@ static int connect_l2cap(const char *address, int address_type, uint16_t psm)
         fprintf(stderr, "[-] L2CAP local bind failed: %s\n", strerror(errno));
         close(fd);
         return -1;
+    }
+
+    /* Keep a 1 MiB upload below the affected Pi kernel's LE credit limit. */
+    uint16_t requested_receive_mtu = 5120;
+    if (setsockopt(fd, SOL_BLUETOOTH, BT_RCVMTU, &requested_receive_mtu,
+                   sizeof(requested_receive_mtu)) < 0) {
+        fprintf(stderr, "[!] Unable to request L2CAP RX MTU %u: %s\n",
+                requested_receive_mtu, strerror(errno));
     }
 
     uint8_t mode = BT_MODE_LE_FLOWCTL;
@@ -608,12 +626,15 @@ static int connect_l2cap(const char *address, int address_type, uint16_t psm)
 
     uint16_t receive_mtu = 0;
     uint16_t send_mtu = 0;
+    int actual_receive_buffer = 0;
     socklen_t length = sizeof(uint16_t);
     (void)getsockopt(fd, SOL_BLUETOOTH, BT_RCVMTU, &receive_mtu, &length);
     length = sizeof(uint16_t);
     (void)getsockopt(fd, SOL_BLUETOOTH, BT_SNDMTU, &send_mtu, &length);
-    printf("[+] L2CAP Channel Established! RX MTU=%u TX MTU=%u\n",
-           receive_mtu, send_mtu);
+    length = sizeof(actual_receive_buffer);
+    (void)getsockopt(fd, SOL_SOCKET, SO_RCVBUF, &actual_receive_buffer, &length);
+    printf("[+] L2CAP Channel Established! RX MTU=%u TX MTU=%u RCVBUF=%d\n",
+           receive_mtu, send_mtu, actual_receive_buffer);
     return fd;
 }
 

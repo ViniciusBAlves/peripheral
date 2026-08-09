@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import atexit
 import csv
+import hashlib
 import json
 import os
 import random
@@ -30,6 +31,7 @@ from benchmarklib.certificates import (
     generate_client_identity,
     generate_server_case,
     generate_universal_header,
+    materialize_case,
     write_case_configs,
 )
 from benchmarklib.firmware import build as build_firmware
@@ -51,6 +53,7 @@ from benchmarklib.transfer import (
     mqtt_publish_header,
     payload_sha256,
     percentile_95 as transfer_percentile_95,
+    timeout_for_payload,
 )
 from benchmarklib.server_backends import (
     SERVER_BACKEND_CHOICES,
@@ -66,7 +69,8 @@ WORK = ROOT / "work"
 DEFAULT_CONFIG = ROOT / "config.json"
 DEFAULT_NCS_VERSION = "v3.3.0"
 POWER_WINDOWS = (
-    "client_kem", "client_signature", "handshake", "total_execution",
+    "client_kem", "mlkem", "classical_kex", "client_signature",
+    "handshake", "total_execution",
 )
 POWER_METRICS = (
     "duration_ms", "charge_uc", "energy_uj", "avg_current_ua",
@@ -80,6 +84,27 @@ FATAL_SERVER_LOG_PATTERNS = (
     r"unknown ca",
     r"certificate verify failed",
 )
+
+
+def firmware_cache_key(
+    firmware_dir: Path,
+    credentials_header: Path,
+    *,
+    build_options: dict[str, object],
+) -> str:
+    """Hash firmware inputs so identical runs share one Zephyr build tree."""
+    digest = hashlib.sha256()
+    digest.update(json.dumps(build_options, sort_keys=True).encode())
+    for path in sorted(
+        item for item in firmware_dir.rglob("*")
+        if item.is_file() and "__pycache__" not in item.parts
+    ):
+        digest.update(path.relative_to(firmware_dir).as_posix().encode())
+        with path.open("rb") as stream:
+            for block in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(block)
+    digest.update(credentials_header.read_bytes())
+    return digest.hexdigest()[:24]
 
 ATTEMPT_FIELDS = [
     "attempt_index", "schedule_index", "session", "attempt_in_session", "warmup",
@@ -136,7 +161,7 @@ ATTEMPT_FIELDS = [
 TRANSFER_FIELDS = [
     "case_id", "round_index", "round_try", "round_complete", "attempt_index",
     "schedule_index",
-    "transfer_order", "direction", "payload_bytes", "status", "qos",
+    "transfer_order", "iteration", "direction", "payload_bytes", "status", "qos",
     "packet_id", "reconnect_count", "expected_sha256", "received_sha256",
     "integrity_match", "client_transfer_ms", "server_transfer_ms",
     "ack_latency_ms", "end_to_end_ms", "goodput_kib_s",
@@ -148,7 +173,9 @@ TRANSFER_FIELDS = [
     "l2cap_rx_bytes", "l2cap_tx_retries", "l2cap_tx_wait_ms",
     "l2cap_rx_overflows", "dwt_cyccnt", "dwt_cpicnt", "dwt_exccnt",
     "dwt_sleepcnt", "dwt_lsucnt", "dwt_foldcnt", "mqtt_wire_bytes",
-    "mqtt_protocol_overhead_bytes", "power_status", "transfer_energy_uj",
+    "mqtt_protocol_overhead_bytes", "power_status", "transfer_duration_ms",
+    "transfer_charge_uc", "transfer_energy_uj", "transfer_avg_current_ua",
+    "transfer_peak_current_ua",
     "message",
 ]
 
@@ -159,7 +186,10 @@ TRANSFER_SUMMARY_FIELDS = [
     "max_end_to_end_ms", "stddev_end_to_end_ms", "ci95_end_to_end_ms",
     "mean_goodput_kib_s", "median_goodput_kib_s", "p95_goodput_kib_s",
     "min_goodput_kib_s", "max_goodput_kib_s", "stddev_goodput_kib_s",
-    "ci95_goodput_kib_s",
+    "ci95_goodput_kib_s", "mean_transfer_energy_uj",
+    "median_transfer_energy_uj", "p95_transfer_energy_uj",
+    "min_transfer_energy_uj", "max_transfer_energy_uj",
+    "stddev_transfer_energy_uj", "ci95_transfer_energy_uj",
 ]
 
 SUMMARY_FIELDS = [
@@ -333,6 +363,7 @@ def load_transfer_rounds(run_dir: Path) -> list[TransferRound]:
             key = (int(row["execution_order"]), row["case_id"])
             operations[key].append(TransferOperation(
                 order=int(row["transfer_order"]),
+                iteration=int(row.get("iteration") or 1),
                 direction=row["direction"],
                 payload_bytes=int(row["payload_bytes"]),
                 payload_seed=int(row["payload_seed"]),
@@ -593,6 +624,14 @@ def wait_for_result(
                 observations.append(parsed)
             if parsed and parsed[0] == "RESULT":
                 return parsed[1]
+            if line.startswith("*** Booting") and observations and any(
+                kind.startswith("TRANSFER_") for kind, _ in observations
+            ):
+                return {
+                    "status": "fail",
+                    "stage": "board_reboot",
+                    "error": "reboot_before_result",
+                }
     return {"status": "timeout", "stage": "serial_wait", "error": "timeout"}
 
 
@@ -651,39 +690,15 @@ def wait_for_board_ready(serial_port, board_log: Path, timeout: float) -> None:
     )
 
 
+MAX_HANDSHAKE_TIMEOUT_SEC = 60.0
+
+
 def timeout_for_case(case: dict[str, str], override: float | None) -> float:
-    if override is not None:
-        return override
-    signatures = (case.get("root_sig_alg") or case["cert_sig_alg"], case["cert_sig_alg"])
-    signature = max(signatures, key=lambda item: SIGNATURES_BY_NAME[item].signature_bytes)
-    if signature.startswith("SLH-DSA-SHAKE-256"):
-        timeout = 180.0
-    elif signature.startswith("SLH-DSA-SHAKE-192"):
-        timeout = 120.0
-    elif signature.startswith("SLH-DSA-SHAKE-128"):
-        timeout = 75.0
-    elif signature == "RSA-PSS-15360":
-        timeout = 3600.0
-    elif signature == "RSA-PSS-7680":
-        timeout = 900.0
-    elif signature == "RSA-PSS-3072":
-        timeout = 45.0
-    elif signature == "LMS-HSS-L2-H10-W4":
-        timeout = 180.0
-    elif signature == "XMSS-SHA2_20_256":
-        timeout = 210.0
-    elif signature.startswith("ML-DSA"):
-        timeout = 45.0
-    else:
-        timeout = 60.0
-    group = case["kex_group"].upper()
-    if "MLKEM1024" in group:
-        timeout += 45.0
-    elif "MLKEM768" in group:
-        timeout += 30.0
-    elif "MLKEM512" in group:
-        timeout += 20.0
-    return timeout
+    """Return the TLS/MQTT deadline, capped so a stalled case cannot run for hours."""
+    del case
+    if override is None:
+        return MAX_HANDSHAKE_TIMEOUT_SEC
+    return min(override, MAX_HANDSHAKE_TIMEOUT_SEC)
 
 
 def classify_gateway_start_failure(
@@ -715,6 +730,7 @@ def transfer_plan_for_job(job: TransferRound) -> dict[str, object]:
         "operations": [
             {
                 "order": operation.order,
+                "iteration": operation.iteration,
                 "direction": operation.direction,
                 "payload_bytes": operation.payload_bytes,
                 "payload_seed": operation.payload_seed,
@@ -741,9 +757,27 @@ def parse_transfer_device_metrics(path: Path) -> dict[int, dict[str, str]]:
         return values
     for line in path.read_text(errors="replace").splitlines():
         parsed = parse_bench_line(line)
-        if parsed and parsed[0] == "TRANSFER_DEVICE" and "sequence" in parsed[1]:
-            values[int(parsed[1]["sequence"])] = parsed[1]
+        if parsed and parsed[0] == "TRANSFER_DEVICE":
+            try:
+                sequence = int(parsed[1].get("sequence", ""))
+            except ValueError:
+                continue
+            values[sequence] = parsed[1]
     return values
+
+
+def latest_benchmark_observation(
+    path: Path, kind: str,
+) -> dict[str, str] | None:
+    """Return the latest structured frame of one kind from a gateway log."""
+    if not path.exists():
+        return None
+    latest = None
+    for line in path.read_text(errors="replace").splitlines():
+        parsed = parse_bench_line(line)
+        if parsed and parsed[0] == kind:
+            latest = parsed[1]
+    return latest
 
 
 def transfer_rows_for_round(
@@ -754,19 +788,28 @@ def transfer_rows_for_round(
     attempt_index: int,
     reconnect_count: int,
     round_status: str,
+    power_windows: list[dict[str, str]] | None = None,
 ) -> list[dict[str, object]]:
     board: dict[int, dict[str, str]] = {}
     for kind, values in observations:
         if kind not in {
             "TRANSFER_RESULT", "TRANSFER_RESOURCE", "TRANSFER_TRANSPORT"
-        } or "sequence" not in values:
+        }:
             continue
-        board.setdefault(int(values["sequence"]), {}).update(values)
+        try:
+            sequence = int(values.get("sequence", ""))
+        except ValueError:
+            continue
+        board.setdefault(sequence, {}).update(values)
     server = parse_transfer_server_metrics(broker_log)
     for sequence, values in parse_transfer_device_metrics(broker_log).items():
         board.setdefault(sequence, {}).update(values)
     rows: list[dict[str, object]] = []
     for operation in job.operations:
+        power = (
+            power_windows[operation.order - 1]
+            if power_windows and operation.order <= len(power_windows) else None
+        )
         values = board.get(operation.order, {})
         server_values = server.get(operation.order, {})
         if (
@@ -807,6 +850,7 @@ def transfer_rows_for_round(
             "attempt_index": attempt_index,
             "schedule_index": job.sequence,
             "transfer_order": operation.order,
+            "iteration": operation.iteration,
             "direction": operation.direction,
             "payload_bytes": operation.payload_bytes,
             "status": status,
@@ -857,8 +901,15 @@ def transfer_rows_for_round(
             ),
             "mqtt_wire_bytes": operation.payload_bytes + mqtt_header_bytes,
             "mqtt_protocol_overhead_bytes": mqtt_header_bytes,
-            "power_status": "unsupported",
-            "transfer_energy_uj": "",
+            "power_status": (
+                "success" if power else
+                "incomplete" if power_windows is not None else "unsupported"
+            ),
+            "transfer_duration_ms": power.get("duration_ms", "") if power else "",
+            "transfer_charge_uc": power.get("charge_uc", "") if power else "",
+            "transfer_energy_uj": power.get("energy_uj", "") if power else "",
+            "transfer_avg_current_ua": power.get("avg_current_ua", "") if power else "",
+            "transfer_peak_current_ua": power.get("peak_current_ua", "") if power else "",
             "message": values.get("error", "") if completed else round_status,
         })
     return rows
@@ -882,8 +933,10 @@ def run_job(
     reconnect_count = 0
     attempt_timeout = timeout_for_case(case, args.attempt_timeout_sec)
     if getattr(args, "transfer_mode", False):
-        # The six operations have independent 30/120/600 second ceilings.
-        attempt_timeout += 2 * (30.0 + 120.0 + 600.0)
+        attempt_timeout += sum(
+            timeout_for_payload(operation.payload_bytes)
+            for operation in job.operations
+        )
     power_values: dict[str, object] = {}
     power_session = getattr(args, "power_profiler_session", None)
     observations: list[tuple[str, dict[str, str]]] = []
@@ -895,7 +948,9 @@ def run_job(
         if getattr(args, "power_profiler", False):
             if power_session is None:
                 raise RuntimeError("PPK2 source session is not open")
-            power_capture = power_session.capture()
+            power_capture = power_session.capture(
+                transfer_mode=getattr(args, "transfer_mode", False)
+            )
             power_capture.start()
             retry_trace = case_dir / (
                 f"power_trace_{attempt_index:03d}_retry_{retry + 1}.csv.gz"
@@ -1003,6 +1058,10 @@ def run_job(
                 attempt_index=attempt_index,
                 reconnect_count=retry,
                 round_status=final.get("status", "fail"),
+                power_windows=(
+                    power_values.get("transfer_power_windows", [])
+                    if getattr(args, "power_profiler", False) else None
+                ),
             )
             complete = (
                 final.get("status") == "success" and
@@ -1023,6 +1082,15 @@ def run_job(
         if getattr(args, "power_profiler", False):
             power_session.power_cycle()
         time.sleep(args.reconnect_delay_sec)
+
+    if isinstance(job, TransferRound) and not any(
+        kind == "HANDSHAKE" for kind, _ in observations
+    ):
+        # Source Mode receives the terminal BCTL frame directly, while the
+        # detailed handshake frame remains in the collected bridge log.
+        handshake = latest_benchmark_observation(gateway_log, "HANDSHAKE")
+        if handshake is not None:
+            observations.append(("HANDSHAKE", handshake))
 
     terminal = final
     if getattr(args, "transfer_mode", False):
@@ -1567,6 +1635,11 @@ def summarize_transfers(rows: list[dict[str, object]]) -> list[dict[str, object]
         ]
         times = [float(row["end_to_end_ms"]) for row in success if row["end_to_end_ms"] != ""]
         goodputs = [float(row["goodput_kib_s"]) for row in success if row["goodput_kib_s"] != ""]
+        energies = [
+            float(row["transfer_energy_uj"]) for row in success
+            if row.get("power_status") == "success" and
+            row.get("transfer_energy_uj") not in (None, "")
+        ]
 
         def metrics(values: list[float], suffix: str) -> dict[str, object]:
             if not values:
@@ -1597,6 +1670,7 @@ def summarize_transfers(rows: list[dict[str, object]]) -> list[dict[str, object]
             "not_run_count": sum(row["status"] == "not_run" for row in group),
             **metrics(times, "end_to_end_ms"),
             **metrics(goodputs, "goodput_kib_s"),
+            **metrics(energies, "transfer_energy_uj"),
         })
     return output
 
@@ -1731,7 +1805,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--attempt-timeout-sec",
         type=float,
         default=None,
-        help="override the adaptive per-case TLS/MQTT timeout",
+        help="TLS/MQTT timeout per attempt (default and maximum: 60 seconds)",
     )
     parser.add_argument("--gateway-ready-timeout-sec", type=float, default=20.0)
     parser.add_argument("--board-ready-timeout-sec", type=float, default=20.0)
@@ -1740,8 +1814,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--serial-baud", type=int, default=115200)
     parser.add_argument(
         "--power-profiler",
-        action=argparse.BooleanOptionalAction,
-        default=False,
+        action="store_true",
         help="power the nRF52840DK from the PPK2 and capture GPIO-synchronized energy",
     )
     parser.add_argument(
@@ -1986,6 +2059,7 @@ def main(argv: list[str] | None = None) -> int:
                     "case_id": job.case_id,
                     "round_index": job.round_index,
                     "transfer_order": operation.order,
+                    "iteration": operation.iteration,
                     "direction": operation.direction,
                     "payload_bytes": operation.payload_bytes,
                     "payload_seed": operation.payload_seed,
@@ -2005,7 +2079,8 @@ def main(argv: list[str] | None = None) -> int:
             write_csv(
                 run_dir / "transfer_manifest.csv",
                 ["execution_order", "case_id", "round_index", "transfer_order",
-                 "direction", "payload_bytes", "payload_seed", "expected_sha256"],
+                 "iteration", "direction", "payload_bytes", "payload_seed",
+                 "expected_sha256"],
                 transfer_rows,
             )
         (run_dir / "checkpoint.json").write_text(json.dumps({
@@ -2129,7 +2204,7 @@ def main(argv: list[str] | None = None) -> int:
         try:
             generated = case_dirs[case["case_id"]] / "generated"
             template = chain_templates[case["pki_chain_id"]]
-            shutil.copytree(template, generated, dirs_exist_ok=True)
+            materialize_case(template, generated)
             write_case_configs(case, generated)
             supported.append(case)
         except Exception as error:
@@ -2164,22 +2239,47 @@ def main(argv: list[str] | None = None) -> int:
 
     def build_profile(profile: str, roots: set[str]) -> Path:
         generated_dir = generated_root / "firmware-profiles" / profile
+        credentials_header = generated_dir / "benchmark_credentials.h"
         generate_universal_header(
             chain_directory_list,
-            generated_dir / "benchmark_credentials.h",
+            credentials_header,
             root_algorithms=roots,
             client_dir=client_dir,
         )
-        directory = WORK / "firmware-build" / run_id / profile
+        build_options = {
+            "board": args.board,
+            "ncs_version": args.ncs_version,
+            "mlkem_backend": args.mlkem_backend,
+            "profile_roots": sorted(roots),
+            "large_rsa": False,
+            "power_markers": args.power_profiler,
+            "ble_telemetry": args.power_profiler,
+            "mtls_mode": args.mtls_mode,
+            "transfer_mode": args.transfer_mode,
+        }
+        cache_key = firmware_cache_key(
+            ROOT / "firmware", credentials_header,
+            build_options=build_options,
+        )
+        cache_root = WORK / "firmware-cache" / cache_key
+        cache_generated = cache_root / "generated"
+        cache_generated.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(credentials_header, cache_generated / credentials_header.name)
+        directory = cache_root / "build"
         profile_build_dirs[profile] = directory
         ready = any((directory / path).exists() for path in (
             "zephyr/zephyr.hex", "firmware/zephyr/zephyr.hex", "merged.hex",
         ))
-        if not args.skip_build and not (resuming and ready):
+        if args.skip_build and not ready:
+            raise RuntimeError(
+                "--skip-build requested, but no matching cached firmware exists "
+                f"for profile {profile} (cache key {cache_key})"
+            )
+        if not args.skip_build and not ready:
             print(f"[firmware] Building profile {profile}; roots={len(roots)}", flush=True)
             build_firmware(
                 firmware_dir=ROOT / "firmware", build_dir=directory,
-                generated_dir=generated_dir, log=run_dir / "build.log",
+                generated_dir=cache_generated, log=run_dir / "build.log",
                 nrfutil=args.nrfutil, ncs_version=args.ncs_version,
                 ncs_chdir=args.ncs_chdir, board=args.board,
                 mlkem_backend=args.mlkem_backend, pqm4_dir=pqm4_dir,
@@ -2187,6 +2287,11 @@ def main(argv: list[str] | None = None) -> int:
                 ble_telemetry=args.power_profiler,
                 mtls_mode=args.mtls_mode,
                 transfer_mode=args.transfer_mode,
+            )
+        elif ready:
+            print(
+                f"[firmware-cache] Reusing profile {profile} ({cache_key})",
+                flush=True,
             )
         return directory
 
@@ -2279,13 +2384,15 @@ def main(argv: list[str] | None = None) -> int:
             write_csv(
                 run_dir / "transfer_manifest.csv",
                 ["execution_order", "case_id", "round_index", "transfer_order",
-                 "direction", "payload_bytes", "payload_seed", "expected_sha256"],
+                 "iteration", "direction", "payload_bytes", "payload_seed",
+                 "expected_sha256"],
                 [
                     {
                         "execution_order": order,
                         "case_id": job.case_id,
                         "round_index": job.round_index,
                         "transfer_order": operation.order,
+                        "iteration": operation.iteration,
                         "direction": operation.direction,
                         "payload_bytes": operation.payload_bytes,
                         "payload_seed": operation.payload_seed,
@@ -2471,7 +2578,10 @@ def main(argv: list[str] | None = None) -> int:
                     active_profile = required_profile
                 timeout = timeout_for_case(case, args.attempt_timeout_sec)
                 if args.transfer_mode:
-                    timeout += 2 * (30.0 + 120.0 + 600.0)
+                    timeout += sum(
+                        timeout_for_payload(operation.payload_bytes)
+                        for operation in job.operations
+                    )
                 print(
                     f"[{execution_order}/{len(jobs)}] {job.case_id} "
                     f"session={job.session} attempt={job.attempt_in_session} "

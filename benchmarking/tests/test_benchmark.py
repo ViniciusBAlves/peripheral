@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import sys
 import tempfile
 import unittest
@@ -15,7 +16,12 @@ from benchmarklib.algorithms import (
     PKI_CHAINS, SIGNATURES_BY_NAME, normalize_signature_scheme, slug,
 )
 from benchmarklib.power_profiler import PowerProfilerCapture, PowerProfilerSession
-from benchmarklib.certificates import generate_universal_header, write_case_configs
+from benchmarklib.transfer import TransferOperation, TransferRound
+from benchmarklib.certificates import (
+    generate_universal_header,
+    materialize_case,
+    write_case_configs,
+)
 from benchmarklib.gateway import PiGateway
 from benchmarklib.firmware import flash_usage
 from benchmarklib.scheduler import build_jobs
@@ -26,6 +32,7 @@ from run_benchmarks import (
     client_kex_metric_keys,
     classify_gateway_start_failure,
     load_config,
+    latest_benchmark_observation,
     normalize_ble_addr,
     group_jobs_by_firmware_profile,
     pack_root_profiles,
@@ -37,14 +44,97 @@ from run_benchmarks import (
     read_checkpoint,
     run_job,
     summarize,
+    transfer_rows_for_round,
     timeout_for_case,
     wait_for_result,
     wait_for_ble_result,
     write_checkpoint,
+    firmware_cache_key,
 )
 
 
 class BenchmarkTests(unittest.TestCase):
+    def test_latest_handshake_is_recovered_from_gateway_log(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            log = Path(tmpdir) / "gateway.log"
+            log.write_text(
+                "[BENCH_HANDSHAKE] status=success certificate_verify_alg=first\n"
+                "[BENCH_RESULT] status=success stage=transfer_complete\n"
+                "[BENCH_HANDSHAKE] status=success certificate_verify_alg=second\n"
+            )
+            values = latest_benchmark_observation(log, "HANDSHAKE")
+            self.assertIsNotNone(values)
+            self.assertEqual(values["certificate_verify_alg"], "second")
+
+    def test_firmware_cache_key_tracks_inputs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            firmware = root / "firmware"
+            firmware.mkdir()
+            source = firmware / "main.c"
+            source.write_text("int main(void) { return 0; }\n")
+            header = root / "credentials.h"
+            header.write_text("static const int credential = 1;\n")
+            options = {"board": "nrf52840dk_nrf52840"}
+
+            first = firmware_cache_key(firmware, header, build_options=options)
+            self.assertEqual(
+                first,
+                firmware_cache_key(firmware, header, build_options=options),
+            )
+            header.write_text("static const int credential = 2;\n")
+            self.assertNotEqual(
+                first,
+                firmware_cache_key(firmware, header, build_options=options),
+            )
+
+    def test_materialized_case_shares_public_files_not_private_keys(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            template = root / "template"
+            destination = root / "case"
+            template.mkdir()
+            (template / "server.crt").write_text("certificate")
+            (template / "server.key").write_text("private")
+            (template / "mosquitto.conf").write_text("configuration")
+
+            materialize_case(template, destination)
+
+            self.assertTrue(os.path.samefile(
+                template / "server.crt", destination / "server.crt",
+            ))
+            self.assertFalse(os.path.samefile(
+                template / "server.key", destination / "server.key",
+            ))
+            (destination / "mosquitto.conf").write_text("changed")
+            self.assertEqual(
+                (template / "mosquitto.conf").read_text(), "configuration",
+            )
+
+    def test_truncated_transfer_sequence_is_ignored(self) -> None:
+        job = TransferRound(
+            sequence=1,
+            case_id="case-a",
+            round_index=1,
+            operations=(TransferOperation(
+                order=1,
+                iteration=1,
+                direction="device_to_server",
+                payload_bytes=16 * 1024,
+                payload_seed=123,
+            ),),
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            rows = transfer_rows_for_round(
+                job,
+                [("TRANSFER_TRANSPORT", {"sequence": ""})],
+                Path(tmpdir) / "broker.log",
+                attempt_index=1,
+                reconnect_count=0,
+                round_status="fail",
+            )
+        self.assertEqual(rows[0]["status"], "not_run")
+
     def test_signature_schemes_are_exact_tls13_values(self) -> None:
         expected = {
             "ECDSA-P-256": ("ecdsa_secp256r1_sha256", 0x0403),
@@ -244,8 +334,8 @@ class BenchmarkTests(unittest.TestCase):
     def test_power_windows_integrate_native_samples(self) -> None:
         capture = PowerProfilerCapture("/dev/null", 3000, 100)
         capture._process_sample(0, 100.0, 0)
-        capture._process_sample(1, 100.0, 0xf0)
-        capture._process_sample(2, 100.0, 0xf0)
+        capture._process_sample(1, 100.0, 0xe0)
+        capture._process_sample(2, 100.0, 0xd0)
         capture._process_sample(3, 100.0, 0)
         capture._sample_index = 4
         values = capture._measurements()
@@ -328,12 +418,58 @@ class BenchmarkTests(unittest.TestCase):
         self.assertEqual(values["client_signature_peak_current_ua"], "600.000")
         self.assertEqual(values["client_kem_duration_ms"], "0.010")
         self.assertEqual(values["client_kem_energy_uj"], "0.012000")
+        self.assertEqual(values["mlkem_duration_ms"], "0.010")
+        self.assertEqual(values["mlkem_energy_uj"], "0.012000")
+        self.assertNotIn("classical_kex_energy_uj", values)
         self.assertEqual(values["handshake_duration_ms"], "0.070")
         self.assertEqual(values["total_execution_duration_ms"], "0.070")
 
+    def test_power_windows_separate_mlkem_and_classical_kex(self) -> None:
+        capture = PowerProfilerCapture("/dev/null", 3000, 100)
+        masks = (0x00, 0xc0, 0xe0, 0xc0, 0xf0, 0xc0, 0xd0, 0xc0, 0x00)
+        for index, mask in enumerate(masks):
+            capture._process_sample(index, 100.0, mask)
+        capture._sample_index = len(masks)
+
+        values = capture._measurements()
+
+        self.assertEqual(values["power_status"], "success")
+        self.assertEqual(values["client_kem_duration_ms"], "0.020")
+        self.assertEqual(values["mlkem_duration_ms"], "0.010")
+        self.assertEqual(values["classical_kex_duration_ms"], "0.010")
+        self.assertEqual(values["client_signature_duration_ms"], "0.010")
+
+    def test_transfer_power_windows_follow_handshake_window(self) -> None:
+        capture = PowerProfilerCapture(
+            "/dev/null", 3000, 100, transfer_mode=True
+        )
+        masks = (
+            0x00,
+            0xc0, 0xe0, 0xc0, 0xd0, 0xc0, 0x00,
+            0x80, 0x80, 0x00,
+            0x80, 0x80, 0x80, 0x00,
+        )
+        for index, mask in enumerate(masks):
+            capture._process_sample(index, 100.0, mask)
+        capture._sample_index = len(masks)
+
+        values = capture._measurements()
+
+        self.assertEqual(values["power_status"], "success")
+        self.assertEqual(values["total_execution_duration_ms"], "0.050")
+        self.assertEqual(values["handshake_duration_ms"], "0.050")
+        self.assertEqual(
+            [window["duration_ms"] for window in values["transfer_power_windows"]],
+            ["0.020", "0.030"],
+        )
+        self.assertEqual(
+            [window["energy_uj"] for window in values["transfer_power_windows"]],
+            ["0.006000", "0.009000"],
+        )
+
     def test_power_windows_use_only_last_complete_execution(self) -> None:
         capture = PowerProfilerCapture("/dev/null", 3000, 100)
-        masks = (0x00, 0xf0, 0x00, 0x00, 0xf0, 0xf0, 0x00)
+        masks = (0x00, 0xe0, 0xd0, 0x00, 0x00, 0xe0, 0xd0, 0x00)
         for index, mask in enumerate(masks):
             capture._process_sample(index, 100.0, mask)
         capture._sample_index = len(masks)
@@ -343,8 +479,8 @@ class BenchmarkTests(unittest.TestCase):
         self.assertEqual(values["power_status"], "success")
         self.assertEqual(values["power_profiler_window_count"], 2)
         self.assertEqual(values["total_execution_duration_ms"], "0.020")
-        self.assertEqual(values["client_kem_duration_ms"], "0.020")
-        self.assertEqual(values["client_signature_duration_ms"], "0.020")
+        self.assertEqual(values["client_kem_duration_ms"], "0.010")
+        self.assertEqual(values["client_signature_duration_ms"], "0.010")
 
     def test_distinct_existing_power_device_is_preserved(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -436,6 +572,28 @@ class BenchmarkTests(unittest.TestCase):
         self.assertEqual(result["stage"], "board_fatal")
         self.assertEqual(result["error"], "zephyr_fatal_error")
         self.assertEqual(result["fatal"], "1")
+
+    def test_wait_for_result_detects_reboot_after_transfer_activity(self) -> None:
+        class RebootingSerial:
+            def __init__(self) -> None:
+                self.lines = iter((
+                    b"[BENCH_TRANSFER_RESULT] sequence=1 status=fail error=-5\n",
+                    b"*** Booting nRF Connect SDK v3.3.0 ***\n",
+                ))
+
+            def readline(self) -> bytes:
+                return next(self.lines, b"")
+
+        observations: list[tuple[str, dict[str, str]]] = []
+        with tempfile.TemporaryDirectory() as tmpdir:
+            result = wait_for_result(
+                RebootingSerial(), Path(tmpdir) / "board.log", timeout=30.0,
+                observations=observations,
+            )
+
+        self.assertEqual(result["status"], "fail")
+        self.assertEqual(result["stage"], "board_reboot")
+        self.assertEqual(result["error"], "reboot_before_result")
 
     def test_server_certificate_trust_failure_does_not_retry(self) -> None:
         class QuietSerial:
@@ -627,6 +785,11 @@ class BenchmarkTests(unittest.TestCase):
         )
         self.assertIsNone(server_backend_for_case(lms, "openssl-mosquitto"))
         self.assertIsNone(server_backend_for_case(xmss, "openssl-mosquitto"))
+        homogeneous_lms = {"cert_sig_alg": "LMS-HSS-L2-H10-W4"}
+        self.assertEqual(server_backend_for_case(homogeneous_lms, "auto"), "wolfssl")
+        self.assertIsNone(
+            server_backend_for_case(homogeneous_lms, "openssl-mosquitto")
+        )
         self.assertEqual(
             server_backend_for_case(slh, "openssl-mosquitto"),
             "openssl-mosquitto",
@@ -702,21 +865,21 @@ class BenchmarkTests(unittest.TestCase):
         self.assertEqual(summary["firmware_flash_used_bytes"], "600000")
         self.assertEqual(summary["max_thread_stack_peak_percent"], "72.50")
 
-    def test_heavier_signatures_receive_longer_timeouts(self) -> None:
+    def test_all_handshakes_are_capped_at_sixty_seconds(self) -> None:
         classic = {"kex_group": "ECDHE-P-256", "cert_sig_alg": "ECDSA-P-256"}
         hybrid = {
             "kex_group": "X25519MLKEM768",
             "cert_sig_alg": "SLH-DSA-SHAKE-256s",
         }
         self.assertEqual(timeout_for_case(classic, None), 60.0)
-        self.assertEqual(timeout_for_case(hybrid, None), 210.0)
+        self.assertEqual(timeout_for_case(hybrid, None), 60.0)
         self.assertEqual(
             timeout_for_case({"kex_group": "ECDHE-P-256", "cert_sig_alg": "LMS-HSS-L2-H10-W4"}, None),
-            180.0,
+            60.0,
         )
         self.assertEqual(
             timeout_for_case({"kex_group": "ECDHE-P-256", "cert_sig_alg": "XMSS-SHA2_20_256"}, None),
-            210.0,
+            60.0,
         )
         self.assertEqual(timeout_for_case(hybrid, 12.0), 12.0)
         self.assertEqual(
@@ -724,15 +887,16 @@ class BenchmarkTests(unittest.TestCase):
                 {"kex_group": "ECDHE-P-256", "cert_sig_alg": "RSA-PSS-7680"},
                 None,
             ),
-            900.0,
+            60.0,
         )
         self.assertEqual(
             timeout_for_case(
                 {"kex_group": "ECDHE-P-256", "cert_sig_alg": "RSA-PSS-15360"},
                 None,
             ),
-            3600.0,
+            60.0,
         )
+        self.assertEqual(timeout_for_case(classic, 600.0), 60.0)
 
     def test_gateway_start_does_not_evict_bluez_cache(self) -> None:
         class FakeGateway(PiGateway):
@@ -838,6 +1002,14 @@ class BenchmarkTests(unittest.TestCase):
         self.assertIn("WOLFSSL_VERIFY_NONE", source)
         self.assertIn('strncmp(name, "mldsa", 5)', source)
         self.assertIn("sigalg_list[0] != '\\0'", source)
+
+    def test_wolfssl_server_waits_for_board_shutdown_after_connack(self) -> None:
+        source = (ROOT / "gateway" / "wolfssl_tls_server.c").read_text()
+        self.assertIn("static void wait_for_client_shutdown", source)
+        self.assertLess(
+            source.index("wait_for_client_shutdown(ssl);"),
+            source.index("(void)wolfSSL_shutdown(ssl);"),
+        )
 
     def test_gateway_command_creates_log_parent(self) -> None:
         class TrueGateway(PiGateway):

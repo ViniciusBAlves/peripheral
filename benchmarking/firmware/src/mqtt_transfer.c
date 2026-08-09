@@ -1,5 +1,8 @@
 #include "mqtt_transfer.h"
 
+#define BENCH_TRANSFER_MAX_OPERATIONS 4096U
+#define BENCH_TRANSFER_TIMEOUT_MS 30000
+
 #include <errno.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -11,9 +14,11 @@
 
 #include "benchmark_dwt.h"
 #include "benchmark_metrics.h"
+#include "power_markers.h"
 
-#define MQTT_IO_CHUNK 512
-#define MQTT_TIMEOUT_MS 600000
+#define MQTT_RX_CHUNK 512
+#define MQTT_TX_CHUNK (16 * 1024)
+#define MQTT_TIMEOUT_MS BENCH_TRANSFER_TIMEOUT_MS
 #define TOPIC_CONTROL "bench/control"
 #define TOPIC_DOWN "bench/down"
 #define TOPIC_UP "bench/up"
@@ -194,13 +199,16 @@ static int publish_pattern(WOLFSSL *ssl, const char *topic, uint32_t seed,
                            uint32_t payload_size, uint16_t *packet_id_out,
                            char hash_hex[65])
 {
-    uint8_t chunk[MQTT_IO_CHUNK];
+    void *heap = wolfSSL_CTX_GetHeap(NULL, ssl);
+    uint8_t *chunk = XMALLOC(
+        MQTT_TX_CHUNK, heap, DYNAMIC_TYPE_TMP_BUFFER);
     uint8_t digest[WC_SHA256_DIGEST_SIZE];
     wc_Sha256 sha;
     uint16_t packet_id;
     uint32_t sent = 0;
 
-    if (wc_InitSha256(&sha) != 0) {
+    if (chunk == NULL || wc_InitSha256(&sha) != 0) {
+        XFREE(chunk, heap, DYNAMIC_TYPE_TMP_BUFFER);
         return -EIO;
     }
     packet_id = next_packet_id++;
@@ -213,27 +221,37 @@ static int publish_pattern(WOLFSSL *ssl, const char *topic, uint32_t seed,
     header[offset++] = topic_size >> 8; header[offset++] = topic_size & 0xff;
     memcpy(header + offset, topic, topic_size); offset += topic_size;
     header[offset++] = packet_id >> 8; header[offset++] = packet_id & 0xff;
-    if (tls_write_all(ssl, header, offset) != 0) {
+    int ret = tls_write_all(ssl, header, offset);
+    if (ret != 0) {
         wc_Sha256Free(&sha);
-        return -EIO;
+        XFREE(chunk, heap, DYNAMIC_TYPE_TMP_BUFFER);
+        return ret;
     }
     while (sent < payload_size) {
-        size_t count = MIN(sizeof(chunk), payload_size - sent);
+        size_t count = MIN((size_t)MQTT_TX_CHUNK, payload_size - sent);
         for (size_t i = 0; i < count; i++) {
             chunk[i] = pattern_byte(seed, sent + i);
         }
-        if (wc_Sha256Update(&sha, chunk, count) != 0 ||
-            tls_write_all(ssl, chunk, count) != 0) {
+        if (wc_Sha256Update(&sha, chunk, count) != 0) {
             wc_Sha256Free(&sha);
+            XFREE(chunk, heap, DYNAMIC_TYPE_TMP_BUFFER);
             return -EIO;
+        }
+        ret = tls_write_all(ssl, chunk, count);
+        if (ret != 0) {
+            wc_Sha256Free(&sha);
+            XFREE(chunk, heap, DYNAMIC_TYPE_TMP_BUFFER);
+            return ret;
         }
         sent += count;
     }
     if (wc_Sha256Final(&sha, digest) != 0) {
         wc_Sha256Free(&sha);
+        XFREE(chunk, heap, DYNAMIC_TYPE_TMP_BUFFER);
         return -EIO;
     }
     wc_Sha256Free(&sha);
+    XFREE(chunk, heap, DYNAMIC_TYPE_TMP_BUFFER);
     hash_to_hex(digest, hash_hex);
     *packet_id_out = packet_id;
     return 0;
@@ -246,7 +264,7 @@ static int read_publish(WOLFSSL *ssl, char *topic, size_t topic_capacity,
                         bool *integrity_out, char hash_hex[65])
 {
     struct mqtt_packet packet;
-    uint8_t prefix[2], chunk[MQTT_IO_CHUNK], digest[WC_SHA256_DIGEST_SIZE];
+    uint8_t prefix[2], chunk[MQTT_RX_CHUNK], digest[WC_SHA256_DIGEST_SIZE];
     uint16_t topic_size;
     uint32_t consumed = 0;
     wc_Sha256 sha;
@@ -326,7 +344,8 @@ static int subscribe_topics(WOLFSSL *ssl)
 
 static void emit_transfer_result(uint32_t sequence, const char *direction,
                                  uint32_t payload_size, bool success,
-                                 uint16_t packet_id, const char *hash,
+                                 int error_code, uint16_t packet_id,
+                                 const char *hash,
                                  int64_t data_us, int64_t ack_us,
                                  int64_t end_to_end_us,
                                  const struct cpu_snapshot *cpu_start,
@@ -347,10 +366,10 @@ static void emit_transfer_result(uint32_t sequence, const char *direction,
             10000ULL / all, 10000ULL);
     }
     printk("[BENCH_TRANSFER_RESULT] sequence=%u direction=%s payload_bytes=%u "
-           "status=%s integrity_match=%u sha256=%s transfer_us=%lld "
+           "status=%s error=%d integrity_match=%u sha256=%s transfer_us=%lld "
            "ack_us=%lld end_to_end_us=%lld packet_id=%u\n",
            sequence, direction, payload_size, success ? "success" : "fail",
-           success, hash, data_us, ack_us, end_to_end_us, packet_id);
+           error_code, success, hash, data_us, ack_us, end_to_end_us, packet_id);
     k_sleep(K_MSEC(300));
     printk("[BENCH_TRANSFER_RESOURCE] sequence=%u client_cpu_cycles=%llu "
            "client_cycle_hz=%u client_cpu_usage_bp=%u system_cpu_usage_bp=%u "
@@ -375,7 +394,8 @@ static void emit_transfer_result(uint32_t sequence, const char *direction,
 
 static int publish_transfer_metrics(
     WOLFSSL *ssl, uint32_t sequence, const char *direction,
-    uint32_t payload_size, bool success, uint16_t data_packet_id,
+    uint32_t payload_size, bool success, int error_code,
+    uint16_t data_packet_id,
     const char *hash, int64_t data_us, int64_t ack_us, int64_t end_to_end_us,
     const struct cpu_snapshot *cpu_start, const struct cpu_snapshot *cpu_end,
     const struct benchmark_dwt_delta *dwt,
@@ -396,7 +416,7 @@ static int publish_transfer_metrics(
     }
     int length = snprintk(
         payload, sizeof(payload),
-        "sequence=%u direction=%s payload_bytes=%u status=%s "
+        "sequence=%u direction=%s payload_bytes=%u status=%s error=%d "
         "integrity_match=%u sha256=%s transfer_us=%lld ack_us=%lld "
         "end_to_end_us=%lld packet_id=%u client_cpu_cycles=%llu "
         "client_cycle_hz=%u client_cpu_usage_bp=%u system_cpu_usage_bp=%u "
@@ -405,7 +425,8 @@ static int publish_transfer_metrics(
         "l2cap_rx_packets=%u l2cap_rx_bytes=%u l2cap_tx_retries=%u "
         "l2cap_tx_wait_us=%llu l2cap_rx_overflows=%u " BENCHMARK_DWT_FORMAT,
         sequence, direction, payload_size, success ? "success" : "fail",
-        success, hash, data_us, ack_us, end_to_end_us, data_packet_id, cycles,
+        error_code, success, hash, data_us, ack_us, end_to_end_us,
+        data_packet_id, cycles,
         sys_clock_hw_cycles_per_sec(), cpu_bp, system_bp,
         (unsigned int)heap->allocated_bytes,
         (unsigned int)heap->max_allocated_bytes,
@@ -434,7 +455,29 @@ int benchmark_mqtt_transfer_run(WOLFSSL *ssl, struct k_heap *heap,
         return -EIO;
     }
 
-    for (int operation = 0; operation < 6; operation++) {
+    char begin_topic[32], begin_control[64] = {0}, begin_hash[65];
+    uint32_t begin_size;
+    uint16_t begin_id;
+    bool begin_integrity;
+    unsigned int operation_count;
+    if (read_publish(ssl, begin_topic, sizeof(begin_topic),
+                     (uint8_t *)begin_control, sizeof(begin_control) - 1,
+                     0, 0, &begin_size, &begin_id, &begin_integrity,
+                     begin_hash) != 0 ||
+        strcmp(begin_topic, TOPIC_CONTROL) != 0 ||
+        begin_size >= sizeof(begin_control) ||
+        send_puback(ssl, begin_id) != 0) {
+        return -EINVAL;
+    }
+    begin_control[begin_size] = '\0';
+    if (sscanf(begin_control, "BEGIN %u", &operation_count) != 1 ||
+        operation_count == 0 ||
+        operation_count > BENCH_TRANSFER_MAX_OPERATIONS) {
+        return -EINVAL;
+    }
+
+    for (unsigned int operation = 0; operation < operation_count;
+         operation++) {
         char topic[32], control[192] = {0}, expected_hash[65] = {0};
         char actual_hash[65] = {0};
         uint32_t control_size, sequence, payload_size, payload_seed;
@@ -453,8 +496,7 @@ int benchmark_mqtt_transfer_run(WOLFSSL *ssl, struct k_heap *heap,
                    &payload_size, &payload_seed, expected_hash) != 5) {
             return -EINVAL;
         }
-        mqtt_timeout_ms = payload_size <= 1024U ? 30000 :
-                          payload_size <= 10240U ? 120000 : 600000;
+        mqtt_timeout_ms = BENCH_TRANSFER_TIMEOUT_MS;
 
         benchmark_metrics_reset();
         benchmark_hardware_counters_start();
@@ -465,6 +507,7 @@ int benchmark_mqtt_transfer_run(WOLFSSL *ssl, struct k_heap *heap,
         bool valid = false;
         int ret;
         uint16_t result_packet_id = 0;
+        benchmark_power_total_set(true);
         if (strcmp(direction, "DOWN") == 0) {
             uint32_t received_size;
             ret = read_publish(ssl, topic, sizeof(topic), NULL, 0, payload_size,
@@ -501,9 +544,11 @@ int benchmark_mqtt_transfer_run(WOLFSSL *ssl, struct k_heap *heap,
                     strcmp(ack_hash, actual_hash) == 0;
             }
         } else {
+            benchmark_power_total_set(false);
             return -EINVAL;
         }
         int64_t ended = k_uptime_ticks();
+        benchmark_power_total_set(false);
         struct cpu_snapshot cpu_end = cpu_snapshot_get();
         benchmark_hardware_counters_stop();
         struct benchmark_dwt_delta dwt = benchmark_dwt_delta_get(&dwt_start);
@@ -515,7 +560,7 @@ int benchmark_mqtt_transfer_run(WOLFSSL *ssl, struct k_heap *heap,
             sequence,
             strcmp(direction, "DOWN") == 0 ? "server_to_device" :
                                                "device_to_server",
-            payload_size, valid, result_packet_id, actual_hash,
+            payload_size, valid, ret, result_packet_id, actual_hash,
             k_ticks_to_us_floor64(data_done - started),
             k_ticks_to_us_floor64(ended - data_done),
             k_ticks_to_us_floor64(ended - started),
@@ -524,7 +569,7 @@ int benchmark_mqtt_transfer_run(WOLFSSL *ssl, struct k_heap *heap,
                 ssl, sequence,
                 strcmp(direction, "DOWN") == 0 ? "server_to_device" :
                                                    "device_to_server",
-                payload_size, valid, result_packet_id, actual_hash,
+                payload_size, valid, ret, result_packet_id, actual_hash,
                 k_ticks_to_us_floor64(data_done - started),
                 k_ticks_to_us_floor64(ended - data_done),
                 k_ticks_to_us_floor64(ended - started),

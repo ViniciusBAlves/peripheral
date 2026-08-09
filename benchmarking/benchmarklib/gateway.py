@@ -388,7 +388,7 @@ class PiGateway:
                 f"setsid python3 {self.workdir}/bin/mqtt_transfer_controller.py "
                 f"--plan {shlex.quote(transfer_json)} "
                 "--port 18884 "
-                f"--timeout {max(600, int(tls_timeout_sec))} "
+                f"--timeout {max(30, int(tls_timeout_sec))} "
                 f"> {controller_log} 2>&1 < /dev/null & "
                 f"echo $! > {self.workdir}/controller.pid; "
             )
@@ -397,9 +397,10 @@ class PiGateway:
             f"LD_PRELOAD={self.workdir}/bin/server_crypto_metrics.so "
             f"{server_command}; "
             "sleep 1; "
-            f"kill -0 $(cat {self.workdir}/broker.pid) 2>/dev/null && "
+            f"if kill -0 $(cat {self.workdir}/broker.pid) 2>/dev/null; then "
             f"{controller_command}"
-            f"{bridge_command}"
+            f"{bridge_command}; "
+            "else exit 1; fi"
         )
         self.command(script, log)
         checks = max(1, int(ready_timeout * 4))
