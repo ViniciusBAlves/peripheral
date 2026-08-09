@@ -17,6 +17,7 @@
 #define MQTT_CONNECT_PACKET 0x10
 #define DEFAULT_PORT 8883
 #define LISTEN_BACKLOG 1
+#define IO_TIMEOUT_SEC 900
 
 static volatile sig_atomic_t keep_running = 1;
 
@@ -366,7 +367,7 @@ int main(int argc, char** argv)
     while (keep_running) {
         struct sockaddr_in peer;
         socklen_t peer_len = sizeof(peer);
-        struct timeval timeout = { .tv_sec = 45, .tv_usec = 0 };
+        struct timeval timeout = { .tv_sec = IO_TIMEOUT_SEC, .tv_usec = 0 };
 
         client_fd = accept(listen_fd, (struct sockaddr*)&peer, &peer_len);
         if (client_fd < 0) {
@@ -391,6 +392,7 @@ int main(int argc, char** argv)
         if (accept_ret != WOLFSSL_SUCCESS) {
             int err = wolfSSL_get_error(ssl, accept_ret);
             fprintf(stderr, "wolfSSL_accept failed: %d\n", err);
+            print_wolfssl_errors("wolfSSL_accept error stack");
             goto cleanup;
         }
         fprintf(stderr, "[wolfssl-server] TLS handshake complete\n");

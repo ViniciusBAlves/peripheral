@@ -11,12 +11,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-from benchmarklib.certificates import (
-    ensure_image,
-    generate_client_identity,
-    generate_universal_header,
-)
-from benchmarklib.algorithms import SIGNATURES_BY_NAME
+from benchmarklib.algorithms import SIGNATURES_BY_NAME, slug
 from benchmarklib.firmware import build as build_firmware
 from benchmarklib.firmware import flash as flash_firmware
 from run_benchmarks import (
@@ -33,8 +28,25 @@ ROOT = Path(__file__).resolve().parent
 RESULTS = ROOT / "results"
 WORK = ROOT / "work"
 SLOW_SIGNATURE_TIMEOUT_SEC = 2000.0
-PHASES = ["keygen", "make_cert", "sign_cert", "parse_cert", "key_export"]
+SIGNATURE_TIMEOUTS_SEC = {
+    "RSA-PSS-3072": 2400.0,
+    "RSA-PSS-7680": 43200.0,
+    "RSA-PSS-15360": 604800.0,
+    "SLH-DSA-SHAKE-128s": 2400.0,
+    "SLH-DSA-SHAKE-128f": 2400.0,
+    "SLH-DSA-SHAKE-192s": 4200.0,
+    "SLH-DSA-SHAKE-192f": 4200.0,
+    "SLH-DSA-SHAKE-256s": 4200.0,
+    "SLH-DSA-SHAKE-256f": 4200.0,
+}
+PHASES = [
+    "keygen", "make_cert", "sign_cert", "parse_cert", "key_export",
+]
 PHASE_THREAD_BUCKETS = ["main", "sysworkq", "bt_rx", "bt_tx", "idle", "other"]
+PHASE_DWT_METRICS = [
+    ("core", "cycles"), ("lsu", "cycles"), ("cpi", "cycles"),
+    ("exc", "cycles"), ("sleep", "cycles"), ("fold", "events"),
+]
 
 ATTEMPT_FIELDS = [
     "attempt_index", "component", "owner", "cert_sig_alg", "builder",
@@ -54,15 +66,21 @@ ATTEMPT_FIELDS = [
     ],
     *[f"{phase}_heap_current_bytes" for phase in PHASES],
     *[f"{phase}_heap_peak_bytes" for phase in PHASES],
-    "keygen_lsu_cycles", "make_cert_lsu_cycles", "sign_cert_lsu_cycles",
-    "parse_cert_lsu_cycles", "key_export_lsu_cycles",
-    "phase_lsu_total_cycles", "keygen_cpi_cycles",
-    "make_cert_cpi_cycles", "sign_cert_cpi_cycles", "parse_cert_cpi_cycles",
-    "key_export_cpi_cycles", "phase_cpi_total_cycles",
+    *[
+        f"{phase}_{counter}_{suffix}"
+        for counter, suffix in PHASE_DWT_METRICS
+        for phase in PHASES
+    ],
+    *[
+        f"phase_{counter}_total_{suffix}"
+        for counter, suffix in PHASE_DWT_METRICS
+    ],
     "phase_dwt_samples", "dwt_counters_supported", "dwt_wrap_risk",
     "client_heap_current_bytes",
     "client_heap_peak_bytes", "client_heap_free_bytes",
-    "client_heap_capacity_bytes", "thread_stack_used_bytes",
+    "client_heap_capacity_bytes", "firmware_static_ram_used_bytes",
+    "firmware_ram_capacity_bytes", "firmware_static_ram_usage_percent",
+    "thread_stack_used_bytes",
     "thread_stack_capacity_bytes", "thread_stack_peak_percent",
     "client_cert_der_bytes", "client_key_der_bytes",
     "client_cert_der_capacity_bytes", "client_key_der_capacity_bytes",
@@ -86,13 +104,21 @@ SUMMARY_FIELDS = [
         for phase in PHASES
     ],
     *[f"max_{phase}_heap_peak_bytes" for phase in PHASES],
-    *[f"mean_{phase}_lsu_cycles" for phase in PHASES],
-    *[f"mean_{phase}_cpi_cycles" for phase in PHASES],
-    "phase_cpu_verify", "mean_phase_lsu_total_cycles",
-    "mean_phase_cpi_total_cycles", "max_phase_dwt_samples",
+    *[
+        f"mean_{phase}_{counter}_{suffix}"
+        for counter, suffix in PHASE_DWT_METRICS
+        for phase in PHASES
+    ],
+    "phase_cpu_verify",
+    *[
+        f"mean_phase_{counter}_total_{suffix}"
+        for counter, suffix in PHASE_DWT_METRICS
+    ],
+    "max_phase_dwt_samples",
     "dwt_counters_supported", "dwt_wrap_risk", "max_client_heap_peak_bytes",
-    "max_thread_stack_peak_percent", "client_cert_der_bytes",
-    "client_key_der_bytes",
+    "firmware_static_ram_used_bytes", "firmware_ram_capacity_bytes",
+    "firmware_static_ram_usage_percent", "max_thread_stack_peak_percent",
+    "client_cert_der_bytes", "client_key_der_bytes",
 ]
 
 
@@ -130,6 +156,17 @@ def us_to_ms(value: str | None) -> str:
         return f"{int(value) / 1000.0:.3f}"
     except ValueError:
         return ""
+
+
+def usage_percent(values: dict[str, str], used_key: str, capacity_key: str) -> str:
+    try:
+        used = float(values.get(used_key, ""))
+        capacity = float(values.get(capacity_key, ""))
+    except ValueError:
+        return ""
+    if capacity <= 0:
+        return ""
+    return f"{100.0 * used / capacity:.2f}"
 
 
 def wait_for_certgen_result(
@@ -185,18 +222,6 @@ def attempt_row(values: dict[str, str]) -> dict[str, object]:
         "key_export_cpu_ms": us_to_ms(values.get("key_export_cpu_us")),
         "phase_cpu_total_ms": us_to_ms(values.get("phase_cpu_total_us")),
         "phase_cpu_verify": values.get("phase_cpu_verify", ""),
-        "keygen_lsu_cycles": values.get("keygen_lsu_cycles", ""),
-        "make_cert_lsu_cycles": values.get("make_cert_lsu_cycles", ""),
-        "sign_cert_lsu_cycles": values.get("sign_cert_lsu_cycles", ""),
-        "parse_cert_lsu_cycles": values.get("parse_cert_lsu_cycles", ""),
-        "key_export_lsu_cycles": values.get("key_export_lsu_cycles", ""),
-        "phase_lsu_total_cycles": values.get("phase_lsu_total_cycles", ""),
-        "keygen_cpi_cycles": values.get("keygen_cpi_cycles", ""),
-        "make_cert_cpi_cycles": values.get("make_cert_cpi_cycles", ""),
-        "sign_cert_cpi_cycles": values.get("sign_cert_cpi_cycles", ""),
-        "parse_cert_cpi_cycles": values.get("parse_cert_cpi_cycles", ""),
-        "key_export_cpi_cycles": values.get("key_export_cpi_cycles", ""),
-        "phase_cpi_total_cycles": values.get("phase_cpi_total_cycles", ""),
         "phase_dwt_samples": values.get("phase_dwt_samples", ""),
         "dwt_counters_supported": values.get("dwt_counters_supported", ""),
         "dwt_wrap_risk": values.get("dwt_wrap_risk", ""),
@@ -204,6 +229,13 @@ def attempt_row(values: dict[str, str]) -> dict[str, object]:
         "client_heap_peak_bytes": values.get("client_heap_peak_bytes", ""),
         "client_heap_free_bytes": values.get("client_heap_free_bytes", ""),
         "client_heap_capacity_bytes": values.get("client_heap_capacity_bytes", ""),
+        "firmware_static_ram_used_bytes": values.get(
+            "firmware_static_ram_used_bytes", ""
+        ),
+        "firmware_ram_capacity_bytes": values.get("firmware_ram_capacity_bytes", ""),
+        "firmware_static_ram_usage_percent": usage_percent(
+            values, "firmware_static_ram_used_bytes", "firmware_ram_capacity_bytes"
+        ),
         "thread_stack_used_bytes": values.get("thread_stack_used_bytes", ""),
         "thread_stack_capacity_bytes": values.get("thread_stack_capacity_bytes", ""),
         "thread_stack_peak_percent": bp_to_percent(
@@ -223,6 +255,14 @@ def attempt_row(values: dict[str, str]) -> dict[str, object]:
         "error_code": values.get("error", ""),
         "message": "" if status == "success" else values.get("stage", ""),
     }
+    for counter, suffix in PHASE_DWT_METRICS:
+        row[f"phase_{counter}_total_{suffix}"] = values.get(
+            f"phase_{counter}_total_{suffix}", ""
+        )
+        for phase in PHASES:
+            row[f"{phase}_{counter}_{suffix}"] = values.get(
+                f"{phase}_{counter}_{suffix}", ""
+            )
     for phase in PHASES:
         row[f"{phase}_wall_ms"] = values.get(f"{phase}_wall_ms", "")
         row[f"{phase}_heap_current_bytes"] = values.get(
@@ -250,6 +290,8 @@ def unsupported_row(signature: str, message: str) -> dict[str, object]:
 
 
 def serial_timeout_for(signature: str, requested: float) -> float:
+    if signature in SIGNATURE_TIMEOUTS_SEC:
+        return max(requested, SIGNATURE_TIMEOUTS_SEC[signature])
     if signature.startswith(("RSA-PSS-", "SLH-DSA-SHAKE-")) or signature in {
         "LMS-HSS-L2-H10-W4",
         "XMSS-SHA2_20_256",
@@ -296,33 +338,38 @@ def summarize(row: dict[str, object]) -> list[dict[str, object]]:
         "mean_key_export_cpu_ms": row["key_export_cpu_ms"] if success else "",
         "mean_phase_cpu_total_ms": row["phase_cpu_total_ms"] if success else "",
         "phase_cpu_verify": row["phase_cpu_verify"] if success else "",
-        "mean_phase_lsu_total_cycles": (
-            row["phase_lsu_total_cycles"] if success else ""
-        ),
-        "mean_phase_cpi_total_cycles": (
-            row["phase_cpi_total_cycles"] if success else ""
-        ),
         "max_phase_dwt_samples": row["phase_dwt_samples"] if success else "",
         "dwt_counters_supported": row["dwt_counters_supported"] if success else "",
         "dwt_wrap_risk": row["dwt_wrap_risk"] if success else "",
         "max_client_heap_peak_bytes": row["client_heap_peak_bytes"] if success else "",
+        "firmware_static_ram_used_bytes": (
+            row["firmware_static_ram_used_bytes"] if success else ""
+        ),
+        "firmware_ram_capacity_bytes": (
+            row["firmware_ram_capacity_bytes"] if success else ""
+        ),
+        "firmware_static_ram_usage_percent": (
+            row["firmware_static_ram_usage_percent"] if success else ""
+        ),
         "max_thread_stack_peak_percent": (
             row["thread_stack_peak_percent"] if success else ""
         ),
         "client_cert_der_bytes": row["client_cert_der_bytes"] if success else "",
         "client_key_der_bytes": row["client_key_der_bytes"] if success else "",
     }
+    for counter, suffix in PHASE_DWT_METRICS:
+        summary[f"mean_phase_{counter}_total_{suffix}"] = (
+            row[f"phase_{counter}_total_{suffix}"] if success else ""
+        )
     for phase in PHASES:
         summary[f"mean_{phase}_wall_ms"] = row[f"{phase}_wall_ms"] if success else ""
         summary[f"max_{phase}_heap_peak_bytes"] = (
             row[f"{phase}_heap_peak_bytes"] if success else ""
         )
-        summary[f"mean_{phase}_lsu_cycles"] = (
-            row[f"{phase}_lsu_cycles"] if success else ""
-        )
-        summary[f"mean_{phase}_cpi_cycles"] = (
-            row[f"{phase}_cpi_cycles"] if success else ""
-        )
+        for counter, suffix in PHASE_DWT_METRICS:
+            summary[f"mean_{phase}_{counter}_{suffix}"] = (
+                row[f"{phase}_{counter}_{suffix}"] if success else ""
+            )
         for bucket in PHASE_THREAD_BUCKETS:
             summary[f"mean_{phase}_thread_{bucket}_cpu_percent"] = (
                 row[f"{phase}_thread_{bucket}_cpu_percent"] if success else ""
@@ -354,6 +401,25 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return args
 
 
+def write_certgen_placeholder_credentials(output: Path) -> None:
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(
+        "#ifndef BENCHMARK_CREDENTIALS_H\n"
+        "#define BENCHMARK_CREDENTIALS_H\n\n"
+        "#include <stddef.h>\n\n"
+        "static const unsigned char benchmark_client_cert[] = { 0x00 };\n"
+        "static const unsigned char benchmark_client_key[] = { 0x00 };\n"
+        "static const unsigned char benchmark_server_root[] = { 0x00 };\n\n"
+        "struct benchmark_ca_entry { const unsigned char *data; size_t length; };\n"
+        "static const struct benchmark_ca_entry benchmark_ca_bundle[] = {\n"
+        "    { benchmark_server_root, sizeof(benchmark_server_root) }\n"
+        "};\n"
+        "#define BENCHMARK_CA_COUNT "
+        "(sizeof(benchmark_ca_bundle) / sizeof(benchmark_ca_bundle[0]))\n"
+        "#endif\n"
+    )
+
+
 def run_board_client_certificate_benchmark(
     args: argparse.Namespace,
     *,
@@ -365,15 +431,13 @@ def run_board_client_certificate_benchmark(
     if signature not in SIGNATURES_BY_NAME:
         return unsupported_row(signature, "unknown signature")
 
-    docker_log = run_dir / "docker.log"
-    ensure_image(ROOT / "docker" / "Dockerfile.pqc", docker_log)
-    client_dir = run_dir / "generated-client"
-    generate_client_identity(client_dir, docker_log)
-    generated_dir = WORK / "generated" / run_id / f"board-certgen-{signature}"
-    generate_universal_header(client_dir, [], generated_dir / "benchmark_credentials.h")
+    signature_slug = slug(signature)
+    generated_dir = WORK / "generated" / "board-certgen" / signature_slug
+    write_certgen_placeholder_credentials(generated_dir / "benchmark_credentials.h")
 
-    build_dir = WORK / "firmware-build" / f"{run_id}-client-certgen-{signature}"
+    build_dir = WORK / "firmware-build" / f"client-certgen-{signature_slug}"
     if not args.skip_build:
+        print(f"[firmware] Building/updating board certgen profile={signature}...", flush=True)
         build_firmware(
             firmware_dir=ROOT / "firmware",
             build_dir=build_dir,
@@ -390,7 +454,9 @@ def run_board_client_certificate_benchmark(
                 f"-DBENCH_CLIENT_CERTGEN_SIG={signature}",
             ],
         )
+        print("[firmware] Build completed.", flush=True)
     if not args.skip_flash:
+        print(f"[firmware] Flashing board certgen profile={signature}...", flush=True)
         flash_firmware(
             build_dir=build_dir,
             log=run_dir / "flash.log",
@@ -398,6 +464,7 @@ def run_board_client_certificate_benchmark(
             ncs_version=args.ncs_version,
             ncs_chdir=args.ncs_chdir,
         )
+        print("[firmware] Flash completed.", flush=True)
 
     try:
         import serial

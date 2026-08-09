@@ -5,16 +5,15 @@ import re
 import shlex
 import shutil
 import subprocess
-import hashlib
 from pathlib import Path
 
 from .algorithms import KEMS_BY_NAME, SIGNATURES_BY_NAME, Signature, slug
 from .server_backends import HASH_BASED_SIGNATURES
 
 
-IMAGE = "peripheral-pqc-openssl:3.7"
+IMAGE = "peripheral-pqc-openssl:3.10"
 ROOT = Path(__file__).resolve().parents[1]
-CERT_CACHE = ROOT / "work" / "certificate-cache" / "v3"
+CERT_CACHE = ROOT / "work" / "certificate-cache" / "v9"
 LEGACY_CERT_CACHES = (ROOT / "work" / "certificate-cache" / "v1",)
 MIN_CACHE_VALID_SECONDS = 7 * 24 * 60 * 60
 CERT_NOT_BEFORE = "20200101000000Z"
@@ -80,9 +79,16 @@ def _rsa_bits(key_type: str) -> int | None:
 
 
 def _key_args(key_type: str) -> str:
+    ecdsa_curves = {
+        "ECDSA-P-256": "prime256v1",
+        "ECDSA-P-384": "secp384r1",
+        "ECDSA-P-521": "secp521r1",
+    }
     bits = _rsa_bits(key_type)
     if bits:
         return f"-newkey rsa:{bits}"
+    if key_type in ecdsa_curves:
+        return f"-newkey ec -pkeyopt ec_paramgen_curve:{ecdsa_curves[key_type]}"
     if key_type.startswith("ec:"):
         return f"-newkey ec -pkeyopt ec_paramgen_curve:{key_type.split(':', 1)[1]}"
     return f"-newkey {key_type}"
@@ -93,6 +99,20 @@ def _hash_arg(key_type: str) -> str:
     if not bits:
         return ""
     return "-sha256" if bits <= 3072 else "-sha384" if bits <= 7680 else "-sha512"
+
+
+def _client_signature_algorithms(name: str) -> str:
+    ecdsa = {
+        "ECDSA-P-256": "ECDSA+SHA256",
+        "ECDSA-P-384": "ECDSA+SHA384",
+        "ECDSA-P-521": "ECDSA+SHA512",
+    }
+    rsa_pss = {
+        "RSA-PSS-3072": "rsa_pss_rsae_sha256",
+        "RSA-PSS-7680": "rsa_pss_rsae_sha384",
+        "RSA-PSS-15360": "rsa_pss_rsae_sha512",
+    }
+    return ecdsa.get(name) or rsa_pss.get(name) or name
 
 
 def _docker_script(output: Path, script: str, log: Path) -> None:
@@ -139,14 +159,6 @@ def _cert_is_valid(path: Path, *, min_valid_seconds: int = MIN_CACHE_VALID_SECON
 
 def _all_present(directory: Path, names: tuple[str, ...]) -> bool:
     return all((directory / name).exists() for name in names)
-
-
-def _digest_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as stream:
-        for block in iter(lambda: stream.read(1024 * 1024), b""):
-            digest.update(block)
-    return digest.hexdigest()[:16]
 
 
 def generate_client_identity(
@@ -268,9 +280,8 @@ def generate_server_case(case: dict[str, str], output: Path, client_dir: Path, l
         write_case_configs(case, output)
         return
     cached_required = (
-        "server_root.crt", "server_root.key", "server_intermediate.crt",
-        "server_intermediate.key", "server.crt", "server.key",
-        "server_chain.crt",
+        "server_root.crt", "server_root.key", "server_root.der",
+        "server.crt", "server.key", "server_chain.crt",
     )
     output_required = (
         *cached_required, "client_ca.crt", "client_ca.der",
@@ -278,18 +289,17 @@ def generate_server_case(case: dict[str, str], output: Path, client_dir: Path, l
     )
     if (
         _all_present(output, output_required)
-        and _cert_is_valid(output / "server_intermediate.crt")
+        and _cert_is_valid(output / "server_root.crt")
         and _cert_is_valid(output / "server.crt")
     ):
         shutil.copy2(client_dir / "client_ca.crt", output / "client_ca.crt")
         shutil.copy2(client_dir / "client_ca.der", output / "client_ca.der")
         write_case_configs(case, output)
         return
-    root_digest = _digest_file(client_dir / "server_root.crt")
-    cache = CERT_CACHE / "server" / f"{root_digest}_{slug(signature.name)}"
+    cache = CERT_CACHE / "server" / slug(signature.name)
     if (
         _all_present(cache, cached_required)
-        and _cert_is_valid(cache / "server_intermediate.crt")
+        and _cert_is_valid(cache / "server_root.crt")
         and _cert_is_valid(cache / "server.crt")
     ):
         _append_log(log, f"[cert-cache] Reusing {signature.name} server chain from {cache}")
@@ -305,29 +315,27 @@ def generate_server_case(case: dict[str, str], output: Path, client_dir: Path, l
     leaf_args = _key_args(signature.leaf_key_type)
     issuer_hash = _hash_arg(signature.issuer_key_type)
     leaf_hash = _hash_arg(signature.leaf_key_type)
-    shutil.copy2(client_dir / "server_root.crt", cache / "server_root.crt")
-    shutil.copy2(client_dir / "server_root.key", cache / "server_root.key")
+    root_setup = f"""
+openssl req -x509 -new {issuer_args} \
+  -keyout /out/server_root.key -out /out/server_root.crt -nodes \
+  -subj /CN=Peripheral_Benchmark_{signature.name}_Server_Root \
+  -not_before {CERT_NOT_BEFORE} -not_after {CERT_NOT_AFTER} \
+  -addext basicConstraints=critical,CA:TRUE \
+  -addext keyUsage=critical,keyCertSign,cRLSign
+openssl x509 -in /out/server_root.crt -outform DER -out /out/server_root.der
+"""
     script = f"""
-printf 'basicConstraints=critical,CA:TRUE\\nkeyUsage=critical,keyCertSign,cRLSign\\nsubjectKeyIdentifier=hash\\nauthorityKeyIdentifier=keyid,issuer\\n' \
-  > /out/intermediate.ext
+{root_setup}
 printf 'basicConstraints=critical,CA:FALSE\\nkeyUsage=critical,digitalSignature,keyEncipherment\\nextendedKeyUsage=critical,serverAuth\\nsubjectAltName=DNS:localhost,IP:127.0.0.1\\nsubjectKeyIdentifier=hash\\nauthorityKeyIdentifier=keyid,issuer\\n' \
   > /out/server.ext
-openssl req -new {issuer_args} -keyout /out/server_intermediate.key \
-  -out /out/server_intermediate.csr -nodes -subj /CN={signature.name}_Intermediate \
-  {issuer_hash}
-openssl x509 -req -in /out/server_intermediate.csr -CA /out/server_root.crt \
-  -CAkey /out/server_root.key -CAcreateserial -out /out/server_intermediate.crt \
-  -not_before {CERT_NOT_BEFORE} -not_after {CERT_NOT_AFTER} \
-  -extfile /out/intermediate.ext
 openssl req -new {leaf_args} -keyout /out/server.key -out /out/server.csr \
   -nodes -subj /CN=localhost {leaf_hash}
-openssl x509 -req -in /out/server.csr -CA /out/server_intermediate.crt \
-  -CAkey /out/server_intermediate.key -CAcreateserial -out /out/server.crt \
+openssl x509 -req -in /out/server.csr -CA /out/server_root.crt \
+  -CAkey /out/server_root.key -CAcreateserial -out /out/server.crt \
   -not_before {CERT_NOT_BEFORE} -not_after {CERT_NOT_AFTER} \
   -extfile /out/server.ext {issuer_hash}
-cat /out/server.crt /out/server_intermediate.crt > /out/server_chain.crt
-openssl verify -purpose sslserver -CAfile /out/server_root.crt \
-  -untrusted /out/server_intermediate.crt /out/server.crt
+cp /out/server.crt /out/server_chain.crt
+openssl verify -purpose sslserver -CAfile /out/server_root.crt /out/server.crt
 """
     _docker_script(cache, script, log)
     _copy_files(cache, output, cached_required)
@@ -350,6 +358,9 @@ def generate_hash_based_server_case(
 
 def write_case_configs(case: dict[str, str], output: Path) -> None:
     kem = KEMS_BY_NAME[case["kex_group"]]
+    client_sigalgs = _client_signature_algorithms(
+        case.get("certificate_verify_alg") or case.get("cert_sig_alg", "ECDSA-P-256")
+    )
     max_send_fragment = (
         "MaxSendFragment = 2048\n"
         if case.get("cert_sig_alg", "").startswith("SLH-DSA-SHAKE-")
@@ -366,6 +377,7 @@ def write_case_configs(case: dict[str, str], output: Path) -> None:
         "[system_default_sect]\nMinProtocol = TLSv1.3\n"
         f"Groups = {kem.openssl_group}\n"
         f"{max_send_fragment}"
+        f"ClientSignatureAlgorithms = {client_sigalgs}\n"
     )
     (output / "mosquitto.conf").write_text(
         "listener 8883\n"

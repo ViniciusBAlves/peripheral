@@ -19,8 +19,8 @@ from benchmarklib.certificates import (
     CERT_NOT_BEFORE,
     IMAGE,
     ensure_image,
-    generate_client_identity,
 )
+from benchmarklib.gateway import PiGateway
 from benchmarklib.server_backends import HASH_BASED_SIGNATURES
 from generate_cases import FIELDS as INPUT_FIELDS
 from run_benchmarks import (
@@ -29,6 +29,7 @@ from run_benchmarks import (
     default_ncs_chdir,
     default_nrfutil,
     load_config,
+    resolve_pi_workdir,
     resolve_serial_device,
 )
 from run_board_certificate_benchmark import run_board_client_certificate_benchmark
@@ -42,11 +43,21 @@ WOLFSSL_COMPAT_CFLAGS = (
 )
 PHASES = ["keygen", "make_cert", "sign_cert", "parse_cert", "key_export"]
 PHASE_THREAD_BUCKETS = ["main", "sysworkq", "bt_rx", "bt_tx", "idle", "other"]
+PHASE_DWT_METRICS = [
+    ("core", "cycles"), ("lsu", "cycles"), ("cpi", "cycles"),
+    ("exc", "cycles"), ("sleep", "cycles"), ("fold", "events"),
+]
+SERVER_RESOURCE_METRICS = [
+    "voluntary_context_switches", "involuntary_context_switches",
+    "minor_page_faults", "major_page_faults",
+    "block_input_ops", "block_output_ops",
+]
 
 ATTEMPT_FIELDS = [
     "attempt_index", "component", "owner", "cert_sig_alg", "sig_family",
     "sig_nist_level", "builder", "generation_scope", "status",
     "wall_ms", "cpu_ms", "user_cpu_ms", "sys_cpu_ms", "max_rss_kb",
+    *SERVER_RESOURCE_METRICS,
     "server_root_der_bytes", "server_root_crt_bytes",
     "server_intermediate_crt_bytes", "server_leaf_crt_bytes",
     "server_chain_crt_bytes", "server_key_bytes",
@@ -68,14 +79,20 @@ ATTEMPT_FIELDS = [
     ],
     *[f"{phase}_heap_current_bytes" for phase in PHASES],
     *[f"{phase}_heap_peak_bytes" for phase in PHASES],
-    "keygen_lsu_cycles", "make_cert_lsu_cycles", "sign_cert_lsu_cycles",
-    "parse_cert_lsu_cycles", "key_export_lsu_cycles",
-    "phase_lsu_total_cycles", "keygen_cpi_cycles",
-    "make_cert_cpi_cycles", "sign_cert_cpi_cycles", "parse_cert_cpi_cycles",
-    "key_export_cpi_cycles", "phase_cpi_total_cycles",
+    *[
+        f"{phase}_{counter}_{suffix}"
+        for counter, suffix in PHASE_DWT_METRICS
+        for phase in PHASES
+    ],
+    *[
+        f"phase_{counter}_total_{suffix}"
+        for counter, suffix in PHASE_DWT_METRICS
+    ],
     "phase_dwt_samples", "dwt_counters_supported", "dwt_wrap_risk",
     "client_heap_current_bytes", "client_heap_peak_bytes",
     "client_heap_free_bytes", "client_heap_capacity_bytes",
+    "firmware_static_ram_used_bytes", "firmware_ram_capacity_bytes",
+    "firmware_static_ram_usage_percent",
     "thread_stack_used_bytes", "thread_stack_capacity_bytes",
     "thread_stack_peak_percent", "client_cert_der_bytes",
     "client_key_der_bytes", "client_cert_der_capacity_bytes",
@@ -88,7 +105,8 @@ SUMMARY_FIELDS = [
     "builder", "generation_scope", "status", "success_count", "fail_count",
     "mean_wall_ms", "min_wall_ms", "max_wall_ms",
     "mean_cpu_ms", "mean_user_cpu_ms", "mean_sys_cpu_ms",
-    "max_rss_kb", "mean_output_total_bytes",
+    "max_rss_kb", *[f"mean_{metric}" for metric in SERVER_RESOURCE_METRICS],
+    "mean_output_total_bytes",
     "server_chain_crt_bytes", "server_key_bytes",
     "client_cert_crt_bytes", "client_key_bytes",
     "client_csr_der_bytes", "client_csr_pem_bytes",
@@ -96,6 +114,8 @@ SUMMARY_FIELDS = [
     "mean_thread_sysworkq_cpu_percent", "mean_thread_bt_rx_cpu_percent",
     "mean_thread_bt_tx_cpu_percent", "mean_thread_idle_cpu_percent",
     "mean_thread_other_cpu_percent", "max_client_heap_peak_bytes",
+    "firmware_static_ram_used_bytes", "firmware_ram_capacity_bytes",
+    "firmware_static_ram_usage_percent",
     "mean_keygen_cpu_ms", "mean_make_cert_cpu_ms",
     "mean_sign_cert_cpu_ms", "mean_parse_cert_cpu_ms",
     "mean_key_export_cpu_ms", "mean_phase_cpu_total_ms",
@@ -106,10 +126,17 @@ SUMMARY_FIELDS = [
         for phase in PHASES
     ],
     *[f"max_{phase}_heap_peak_bytes" for phase in PHASES],
-    *[f"mean_{phase}_lsu_cycles" for phase in PHASES],
-    *[f"mean_{phase}_cpi_cycles" for phase in PHASES],
-    "phase_cpu_verify", "mean_phase_lsu_total_cycles",
-    "mean_phase_cpi_total_cycles", "max_phase_dwt_samples",
+    *[
+        f"mean_{phase}_{counter}_{suffix}"
+        for counter, suffix in PHASE_DWT_METRICS
+        for phase in PHASES
+    ],
+    "phase_cpu_verify",
+    *[
+        f"mean_phase_{counter}_total_{suffix}"
+        for counter, suffix in PHASE_DWT_METRICS
+    ],
+    "max_phase_dwt_samples",
     "dwt_counters_supported", "dwt_wrap_risk",
     "max_thread_stack_peak_percent", "client_cert_der_bytes",
     "client_key_der_bytes",
@@ -183,11 +210,16 @@ int main(int argc, char** argv)
         exit_code = 2;
     }
     printf("[CERT_BENCH] status=%d wall_us=%lld user_cpu_us=%lld "
-           "sys_cpu_us=%lld cpu_us=%lld max_rss_kb=%ld\n",
+           "sys_cpu_us=%lld cpu_us=%lld max_rss_kb=%ld "
+           "voluntary_context_switches=%ld involuntary_context_switches=%ld "
+           "minor_page_faults=%ld major_page_faults=%ld "
+           "block_input_ops=%ld block_output_ops=%ld\n",
            exit_code, elapsed_us(start, end), timeval_us(usage.ru_utime),
            timeval_us(usage.ru_stime),
            timeval_us(usage.ru_utime) + timeval_us(usage.ru_stime),
-           usage.ru_maxrss);
+           usage.ru_maxrss, usage.ru_nvcsw, usage.ru_nivcsw,
+           usage.ru_minflt, usage.ru_majflt, usage.ru_inblock,
+           usage.ru_oublock);
     fflush(stdout);
     return exit_code;
 }
@@ -247,6 +279,17 @@ def ms(values: dict[str, str], key: str) -> str:
         return ""
 
 
+def usage_percent(values: dict[str, object], used_key: str, capacity_key: str) -> str:
+    try:
+        used = float(values.get(used_key, ""))
+        capacity = float(values.get(capacity_key, ""))
+    except (TypeError, ValueError):
+        return ""
+    if capacity <= 0:
+        return ""
+    return f"{100.0 * used / capacity:.2f}"
+
+
 def file_size(path: Path) -> int:
     return path.stat().st_size if path.exists() else 0
 
@@ -299,9 +342,16 @@ chmod +x /tmp/cert_bench.sh
 
 
 def key_args(key_type: str) -> str:
+    ecdsa_curves = {
+        "ECDSA-P-256": "prime256v1",
+        "ECDSA-P-384": "secp384r1",
+        "ECDSA-P-521": "secp521r1",
+    }
     match = re.fullmatch(r"RSA-PSS-(\d+)", key_type)
     if match:
         return f"-newkey rsa:{match.group(1)}"
+    if key_type in ecdsa_curves:
+        return f"-newkey ec -pkeyopt ec_paramgen_curve:{ecdsa_curves[key_type]}"
     if key_type.startswith("ec:"):
         return f"-newkey ec -pkeyopt ec_paramgen_curve:{key_type.split(':', 1)[1]}"
     return f"-newkey {key_type}"
@@ -313,6 +363,248 @@ def hash_arg(key_type: str) -> str:
         return ""
     bits = int(match.group(1))
     return "-sha256" if bits <= 3072 else "-sha384" if bits <= 7680 else "-sha512"
+
+
+class PiCertificateRunner:
+    def __init__(self, host: str, workdir: str, ssh_key: str, run_id: str) -> None:
+        self.gateway = PiGateway(host, workdir, ssh_key)
+        self.remote_run_dir = f"{workdir.rstrip('/')}/certgen/{slug(run_id)}"
+        self._prepared_roots: set[str] = set()
+
+    def start(self, log: Path) -> None:
+        self.gateway.start_master(log)
+
+    def stop(self) -> None:
+        self.gateway.stop_master()
+
+    def prepare(self, log: Path, builders: set[str]) -> None:
+        workdir = shlex.quote(self.gateway.workdir)
+        warmup_dir = shlex.quote(f"{self.remote_run_dir}/warmup/openssl")
+        hbs_warmup_dir = shlex.quote(f"{self.remote_run_dir}/warmup/hbs")
+        self.gateway.command(
+            f"""
+set -eu
+mkdir -p {workdir}/bin {workdir}/certgen {workdir}/logs {workdir}/deps
+cat > {workdir}/bin/measure_exec.c <<'MEASURE_C'
+{MEASURE_EXEC_C}
+MEASURE_C
+cat > {workdir}/bin/openssl-oqs.cnf <<'OPENSSL_OQS_CONF'
+openssl_conf = openssl_init
+
+[openssl_init]
+providers = provider_sect
+
+[provider_sect]
+default = default_sect
+oqsprovider = oqsprovider_sect
+
+[default_sect]
+activate = 1
+
+[oqsprovider_sect]
+activate = 1
+module = /usr/local/lib/ossl-modules/oqsprovider.so
+OPENSSL_OQS_CONF
+cd {workdir}
+gcc -O2 -Wall -Wextra -o bin/measure_exec bin/measure_exec.c
+OPENSSL_CONF="$PWD/bin/openssl-oqs.cnf" \\
+  OPENSSL_MODULES=/usr/local/lib/ossl-modules \\
+  openssl list -providers | grep -q oqsprovider
+mkdir -p {warmup_dir}
+export OPENSSL_CONF="$PWD/bin/openssl-oqs.cnf"
+export OPENSSL_MODULES=/usr/local/lib/ossl-modules
+openssl list -signature-algorithms >/dev/null
+openssl req -x509 -new -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \\
+  -keyout {warmup_dir}/root.key -out {warmup_dir}/root.crt -nodes \\
+  -subj /CN=Peripheral_Benchmark_Warmup_Root \\
+  -not_before {CERT_NOT_BEFORE} -not_after {CERT_NOT_AFTER} \\
+  -addext basicConstraints=critical,CA:TRUE \\
+  -addext keyUsage=critical,keyCertSign,cRLSign >/dev/null 2>&1
+openssl x509 -in {warmup_dir}/root.crt -outform DER \\
+  -out {warmup_dir}/root.der
+printf 'basicConstraints=critical,CA:FALSE\\nkeyUsage=critical,digitalSignature,keyEncipherment\\nextendedKeyUsage=critical,serverAuth\\nsubjectAltName=DNS:localhost,IP:127.0.0.1\\n' \\
+  > {warmup_dir}/server.ext
+openssl req -new -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \\
+  -keyout {warmup_dir}/server.key -out {warmup_dir}/server.csr \\
+  -nodes -subj /CN=localhost >/dev/null 2>&1
+openssl x509 -req -in {warmup_dir}/server.csr -CA {warmup_dir}/root.crt \\
+  -CAkey {warmup_dir}/root.key -CAcreateserial -out {warmup_dir}/server.crt \\
+  -not_before {CERT_NOT_BEFORE} -not_after {CERT_NOT_AFTER} \\
+  -extfile {warmup_dir}/server.ext >/dev/null 2>&1
+openssl verify -purpose sslserver -CAfile {warmup_dir}/root.crt \\
+  {warmup_dir}/server.crt >/dev/null
+cat {warmup_dir}/root.crt {warmup_dir}/root.key {warmup_dir}/root.der \\
+  {warmup_dir}/server.crt {warmup_dir}/server.key >/dev/null
+""",
+            log,
+        )
+        if not ({"wolfssl", "wolfssl-hbs"} & builders):
+            return
+        self.gateway.deploy_file(
+            ROOT / "tools" / "hbs_certgen.c",
+            f"{self.gateway.workdir}/bin/hbs_certgen.c",
+            log,
+        )
+        self.gateway.deploy_file(
+            ROOT / "tools" / "wolfssl_certgen.c",
+            f"{self.gateway.workdir}/bin/wolfssl_certgen.c",
+            log,
+        )
+        self.gateway.deploy_file(
+            ROOT / "gateway" / "setup_pi_wolfssl.sh",
+            f"{self.gateway.workdir}/bin/setup_pi_wolfssl.sh",
+            log,
+        )
+        self.gateway.command(
+            f"""
+set -eu
+cd {workdir}
+chmod +x bin/setup_pi_wolfssl.sh
+./bin/setup_pi_wolfssl.sh deps/wolfssl
+export PKG_CONFIG_PATH="$PWD/deps/wolfssl/lib/pkgconfig"
+pkg-config --exists wolfssl
+gcc -O2 -Wall -Wextra \\
+  -DWOLFSSL_HAVE_LMS -DWOLFSSL_HAVE_XMSS {WOLFSSL_COMPAT_CFLAGS} \\
+  -o bin/hbs_certgen bin/hbs_certgen.c \\
+  $(pkg-config --cflags --libs wolfssl) \\
+  -Wl,-rpath,"$PWD/deps/wolfssl/lib"
+gcc -O2 -Wall -Wextra {WOLFSSL_COMPAT_CFLAGS} \\
+  -o bin/wolfssl_certgen bin/wolfssl_certgen.c \\
+  $(pkg-config --cflags --libs wolfssl) \\
+  -Wl,-rpath,"$PWD/deps/wolfssl/lib"
+test -x bin/hbs_certgen
+test -x bin/wolfssl_certgen
+bin/hbs_certgen >/dev/null 2>&1 || true
+bin/wolfssl_certgen >/dev/null 2>&1 || true
+cat bin/hbs_certgen bin/wolfssl_certgen deps/wolfssl/lib/libwolfssl.so* \\
+  >/dev/null 2>&1 || true
+mkdir -p {hbs_warmup_dir}/lms
+bin/hbs_certgen LMS-HSS-L2-H10-W4 {hbs_warmup_dir}/lms >/dev/null 2>&1 || true
+""",
+            log,
+        )
+
+    def command_capture(
+        self,
+        script: str,
+        log: Path,
+        *,
+        check: bool = False,
+    ) -> subprocess.CompletedProcess[str]:
+        command = [
+            *self.gateway.ssh_base(),
+            self.gateway.host,
+            f"bash -lc {shlex.quote(script)}",
+        ]
+        log.parent.mkdir(parents=True, exist_ok=True)
+        with log.open("a") as stream:
+            stream.write(f"$ remote: {script}\n")
+            proc = subprocess.run(
+                command, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT
+            )
+            stream.write(proc.stdout)
+        if check and proc.returncode:
+            raise subprocess.CalledProcessError(proc.returncode, command)
+        return proc
+
+    def copy_from(self, remote_dir: str, destination: Path, log: Path) -> None:
+        destination.mkdir(parents=True, exist_ok=True)
+        ssh_transport = " ".join(shlex.quote(part) for part in self.gateway.ssh_base())
+        command = [
+            "rsync", "-a", "-e", ssh_transport,
+            f"{self.gateway.host}:{remote_dir.rstrip('/')}/",
+            f"{destination}/",
+        ]
+        with log.open("a") as stream:
+            stream.write(f"$ {' '.join(shlex.quote(part) for part in command)}\n")
+            proc = subprocess.run(command, text=True, stdout=stream, stderr=subprocess.STDOUT)
+        if proc.returncode:
+            raise subprocess.CalledProcessError(proc.returncode, command)
+
+    def remote_attempt_dir(self, signature: Signature, attempt: int) -> str:
+        return (
+            f"{self.remote_run_dir}/attempts/"
+            f"{slug(signature.name)}/{attempt:03d}"
+        )
+
+    def remote_root_dir(self, signature: Signature) -> str:
+        return f"{self.remote_run_dir}/roots/{slug(signature.issuer_key_type)}"
+
+    def ensure_server_root(
+        self,
+        signature: Signature,
+        local_dir: Path,
+        log: Path,
+    ) -> str:
+        remote_dir = self.remote_root_dir(signature)
+        if remote_dir in self._prepared_roots:
+            return remote_dir
+        issuer_args = key_args(signature.issuer_key_type)
+        issuer_hash = hash_arg(signature.issuer_key_type)
+        root_name = f"Peripheral_Benchmark_{slug(signature.name)}_Server_Root"
+        qremote = shlex.quote(remote_dir)
+        qworkdir = shlex.quote(self.gateway.workdir)
+        self.command_capture(
+            f"""
+set -eu
+mkdir -p {qremote}
+cd {qworkdir}
+export OPENSSL_CONF="$PWD/bin/openssl-oqs.cnf"
+export OPENSSL_MODULES=/usr/local/lib/ossl-modules
+if [ -s {qremote}/server_root.crt ] \\
+   && [ -s {qremote}/server_root.key ] \\
+   && [ -s {qremote}/server_root.der ]; then
+  exit 0
+fi
+openssl req -x509 -new {issuer_args} \\
+  -keyout {qremote}/server_root.key -out {qremote}/server_root.crt -nodes \\
+  -subj /CN={root_name} \\
+  -not_before {CERT_NOT_BEFORE} -not_after {CERT_NOT_AFTER} {issuer_hash} \\
+  -addext basicConstraints=critical,CA:TRUE \\
+  -addext keyUsage=critical,keyCertSign,cRLSign
+openssl x509 -in {qremote}/server_root.crt -outform DER \\
+  -out {qremote}/server_root.der
+openssl x509 -in {qremote}/server_root.crt -noout >/dev/null
+cat {qremote}/server_root.crt {qremote}/server_root.key \\
+  {qremote}/server_root.der >/dev/null
+""",
+            log,
+            check=True,
+        )
+        self.copy_from(remote_dir, local_dir, log)
+        self._prepared_roots.add(remote_dir)
+        return remote_dir
+
+    def run_measured(
+        self,
+        output: Path,
+        remote_output: str,
+        script: str,
+        log: Path,
+    ) -> tuple[int, dict[str, str], str]:
+        qout = shlex.quote(remote_output)
+        qscript = shlex.quote(f"{remote_output}/cert_bench.sh")
+        qworkdir = shlex.quote(self.gateway.workdir)
+        proc = self.command_capture(
+            f"""
+set -eu
+mkdir -p {qout}
+cat > {qscript} <<'CERT_SCRIPT'
+{script.rstrip()}
+CERT_SCRIPT
+chmod +x {qscript}
+cd {qworkdir}
+export PATH="$PWD/bin:$PATH"
+export OPENSSL_CONF="$PWD/bin/openssl-oqs.cnf"
+export OPENSSL_MODULES=/usr/local/lib/ossl-modules
+export PKG_CONFIG_PATH="$PWD/deps/wolfssl/lib/pkgconfig"
+export LD_LIBRARY_PATH="$PWD/deps/wolfssl/lib:${{LD_LIBRARY_PATH:-}}"
+bin/measure_exec /bin/sh {qscript}
+""",
+            log,
+        )
+        self.copy_from(remote_output, output, log)
+        return proc.returncode, parse_cert_bench(proc.stdout), proc.stdout
 
 
 WOLFSSL_CLIENT_IDENTITY_C = r"""
@@ -487,42 +779,38 @@ def client_identity_script() -> str:
 """
 
 
-def openssl_server_chain_script(signature: Signature) -> str:
-    issuer_args = key_args(signature.issuer_key_type)
+def openssl_server_chain_script(
+    signature: Signature,
+    *,
+    output_dir: str = "/out",
+    client_dir: str = "/client",
+) -> str:
     leaf_args = key_args(signature.leaf_key_type)
     issuer_hash = hash_arg(signature.issuer_key_type)
     leaf_hash = hash_arg(signature.leaf_key_type)
+    out = shlex.quote(output_dir)
+    client = shlex.quote(client_dir)
     return f"""
-cp /client/server_root.crt /client/server_root.key /out/
-printf 'basicConstraints=critical,CA:TRUE\\nkeyUsage=critical,keyCertSign,cRLSign\\nsubjectKeyIdentifier=hash\\nauthorityKeyIdentifier=keyid,issuer\\n' \\
-  > /out/intermediate.ext
+cp {client}/server_root.crt {client}/server_root.key {client}/server_root.der {out}/
 printf 'basicConstraints=critical,CA:FALSE\\nkeyUsage=critical,digitalSignature,keyEncipherment\\nextendedKeyUsage=critical,serverAuth\\nsubjectAltName=DNS:localhost,IP:127.0.0.1\\nsubjectKeyIdentifier=hash\\nauthorityKeyIdentifier=keyid,issuer\\n' \\
-  > /out/server.ext
-openssl req -new {issuer_args} -keyout /out/server_intermediate.key \\
-  -out /out/server_intermediate.csr -nodes -subj /CN={signature.name}_Intermediate \\
-  {issuer_hash}
-openssl x509 -req -in /out/server_intermediate.csr -CA /out/server_root.crt \\
-  -CAkey /out/server_root.key -CAcreateserial -out /out/server_intermediate.crt \\
-  -not_before {CERT_NOT_BEFORE} -not_after {CERT_NOT_AFTER} \\
-  -extfile /out/intermediate.ext
-openssl req -new {leaf_args} -keyout /out/server.key -out /out/server.csr \\
+  > {out}/server.ext
+openssl req -new {leaf_args} -keyout {out}/server.key -out {out}/server.csr \\
   -nodes -subj /CN=localhost {leaf_hash}
-openssl x509 -req -in /out/server.csr -CA /out/server_intermediate.crt \\
-  -CAkey /out/server_intermediate.key -CAcreateserial -out /out/server.crt \\
+openssl x509 -req -in {out}/server.csr -CA {out}/server_root.crt \\
+  -CAkey {out}/server_root.key -CAcreateserial -out {out}/server.crt \\
   -not_before {CERT_NOT_BEFORE} -not_after {CERT_NOT_AFTER} \\
-  -extfile /out/server.ext {issuer_hash}
-cat /out/server.crt /out/server_intermediate.crt > /out/server_chain.crt
-openssl verify -purpose sslserver -CAfile /out/server_root.crt \\
-  -untrusted /out/server_intermediate.crt /out/server.crt
+  -extfile {out}/server.ext {issuer_hash}
+cp {out}/server.crt {out}/server_chain.crt
+openssl verify -purpose sslserver -CAfile {out}/server_root.crt {out}/server.crt
 """
 
 
-def hbs_server_chain_script(signature: Signature) -> str:
-    return f"hbs_certgen {shlex.quote(signature.name)} /out"
+def hbs_server_chain_script(signature: Signature, *, output_dir: str = "/out") -> str:
+    return f"hbs_certgen {shlex.quote(signature.name)} {shlex.quote(output_dir)}"
 
 
-def wolfssl_server_chain_script(signature: Signature) -> str:
-    return f"wolfssl_certgen {shlex.quote(signature.name)} /out"
+def wolfssl_server_chain_script(signature: Signature, *, output_dir: str = "/out") -> str:
+    return f"wolfssl_certgen {shlex.quote(signature.name)} {shlex.quote(output_dir)}"
 
 
 def server_builder_for(signature: Signature, requested: str) -> str:
@@ -538,15 +826,23 @@ def server_generation_scope(builder: str) -> str:
         return "hash_based_root_and_leaf"
     if builder == "wolfssl":
         return "wolfssl_root_and_leaf"
-    return "leaf_and_intermediate_under_existing_root"
+    return "leaf_under_existing_root"
 
 
-def server_script_for(signature: Signature, builder: str) -> str:
+def server_script_for(
+    signature: Signature,
+    builder: str,
+    *,
+    output_dir: str = "/out",
+    client_dir: str = "/client",
+) -> str:
     if builder == "wolfssl-hbs":
-        return hbs_server_chain_script(signature)
+        return hbs_server_chain_script(signature, output_dir=output_dir)
     if builder == "wolfssl":
-        return wolfssl_server_chain_script(signature)
-    return openssl_server_chain_script(signature)
+        return wolfssl_server_chain_script(signature, output_dir=output_dir)
+    return openssl_server_chain_script(
+        signature, output_dir=output_dir, client_dir=client_dir
+    )
 
 
 def attempt_row(
@@ -578,6 +874,7 @@ def attempt_row(
         "user_cpu_ms": ms(metrics, "user_cpu_us"),
         "sys_cpu_ms": ms(metrics, "sys_cpu_us"),
         "max_rss_kb": metrics.get("max_rss_kb", ""),
+        **{metric: metrics.get(metric, "") for metric in SERVER_RESOURCE_METRICS},
         "server_root_der_bytes": file_size(output / "server_root.der"),
         "server_root_crt_bytes": file_size(output / "server_root.crt"),
         "server_intermediate_crt_bytes": file_size(output / "server_intermediate.crt"),
@@ -625,6 +922,10 @@ def summarize(rows: list[dict[str, object]]) -> list[dict[str, object]]:
         user_cpu = numbers(success, "user_cpu_ms")
         sys_cpu = numbers(success, "sys_cpu_ms")
         rss = numbers(success, "max_rss_kb")
+        server_resources = {
+            metric: numbers(success, metric)
+            for metric in SERVER_RESOURCE_METRICS
+        }
         output_bytes = numbers(success, "output_total_bytes")
         client_cpu = numbers(success, "client_cpu_ms")
         thread_main_cpu = numbers(success, "thread_main_cpu_percent")
@@ -655,16 +956,15 @@ def summarize(rows: list[dict[str, object]]) -> list[dict[str, object]]:
             phase: numbers(success, f"{phase}_heap_peak_bytes")
             for phase in PHASES
         }
-        phase_lsu = {
-            phase: numbers(success, f"{phase}_lsu_cycles")
+        phase_counters = {
+            (phase, counter, suffix): numbers(success, f"{phase}_{counter}_{suffix}")
             for phase in PHASES
+            for counter, suffix in PHASE_DWT_METRICS
         }
-        phase_cpi = {
-            phase: numbers(success, f"{phase}_cpi_cycles")
-            for phase in PHASES
+        phase_counter_totals = {
+            (counter, suffix): numbers(success, f"phase_{counter}_total_{suffix}")
+            for counter, suffix in PHASE_DWT_METRICS
         }
-        phase_lsu_total = numbers(success, "phase_lsu_total_cycles")
-        phase_cpi_total = numbers(success, "phase_cpi_total_cycles")
         phase_dwt_samples = numbers(success, "phase_dwt_samples")
         phase_verify_values = [
             str(item.get("phase_cpu_verify", ""))
@@ -689,6 +989,20 @@ def summarize(rows: list[dict[str, object]]) -> list[dict[str, object]]:
             if item.get("dwt_wrap_risk", "") != ""
         ]
         client_heap_peak = numbers(success, "client_heap_peak_bytes")
+        firmware_ram = numbers(success, "firmware_static_ram_used_bytes")
+        firmware_ram_percent = numbers(success, "firmware_static_ram_usage_percent")
+        if not firmware_ram_percent:
+            firmware_ram_percent = [
+                float(value) for value in (
+                    usage_percent(
+                        item,
+                        "firmware_static_ram_used_bytes",
+                        "firmware_ram_capacity_bytes",
+                    )
+                    for item in success
+                )
+                if value != ""
+            ]
         thread_stack_peak = numbers(success, "thread_stack_peak_percent")
         summary = {
             "component": base["component"],
@@ -714,6 +1028,12 @@ def summarize(rows: list[dict[str, object]]) -> list[dict[str, object]]:
                 f"{sum(sys_cpu) / len(sys_cpu):.3f}" if sys_cpu else ""
             ),
             "max_rss_kb": f"{max(rss):.0f}" if rss else "",
+            **{
+                f"mean_{metric}": (
+                    f"{sum(values) / len(values):.3f}" if values else ""
+                )
+                for metric, values in server_resources.items()
+            },
             "mean_output_total_bytes": (
                 f"{sum(output_bytes) / len(output_bytes):.0f}"
                 if output_bytes else ""
@@ -783,14 +1103,12 @@ def summarize(rows: list[dict[str, object]]) -> list[dict[str, object]]:
                 if phase_cpu_total else ""
             ),
             "phase_cpu_verify": phase_verify,
-            "mean_phase_lsu_total_cycles": (
-                f"{sum(phase_lsu_total) / len(phase_lsu_total):.3f}"
-                if phase_lsu_total else ""
-            ),
-            "mean_phase_cpi_total_cycles": (
-                f"{sum(phase_cpi_total) / len(phase_cpi_total):.3f}"
-                if phase_cpi_total else ""
-            ),
+            **{
+                f"mean_phase_{counter}_total_{suffix}": (
+                    f"{sum(values) / len(values):.3f}" if values else ""
+                )
+                for (counter, suffix), values in phase_counter_totals.items()
+            },
             "max_phase_dwt_samples": (
                 f"{max(phase_dwt_samples):.0f}" if phase_dwt_samples else ""
             ),
@@ -804,6 +1122,15 @@ def summarize(rows: list[dict[str, object]]) -> list[dict[str, object]]:
             ),
             "max_client_heap_peak_bytes": (
                 f"{max(client_heap_peak):.0f}" if client_heap_peak else ""
+            ),
+            "firmware_static_ram_used_bytes": (
+                f"{max(firmware_ram):.0f}" if firmware_ram else ""
+            ),
+            "firmware_ram_capacity_bytes": (
+                success[0].get("firmware_ram_capacity_bytes", "") if success else ""
+            ),
+            "firmware_static_ram_usage_percent": (
+                f"{max(firmware_ram_percent):.2f}" if firmware_ram_percent else ""
             ),
             "max_thread_stack_peak_percent": (
                 f"{max(thread_stack_peak):.2f}" if thread_stack_peak else ""
@@ -825,16 +1152,11 @@ def summarize(rows: list[dict[str, object]]) -> list[dict[str, object]]:
             summary[f"max_{phase}_heap_peak_bytes"] = (
                 f"{max(heap_values):.0f}" if heap_values else ""
             )
-            lsu_values = phase_lsu[phase]
-            cpi_values = phase_cpi[phase]
-            summary[f"mean_{phase}_lsu_cycles"] = (
-                f"{sum(lsu_values) / len(lsu_values):.3f}"
-                if lsu_values else ""
-            )
-            summary[f"mean_{phase}_cpi_cycles"] = (
-                f"{sum(cpi_values) / len(cpi_values):.3f}"
-                if cpi_values else ""
-            )
+            for counter, suffix in PHASE_DWT_METRICS:
+                values = phase_counters[(phase, counter, suffix)]
+                summary[f"mean_{phase}_{counter}_{suffix}"] = (
+                    f"{sum(values) / len(values):.3f}" if values else ""
+                )
             for bucket in PHASE_THREAD_BUCKETS:
                 values = phase_thread_cpu[(phase, bucket)]
                 summary[f"mean_{phase}_thread_{bucket}_cpu_percent"] = (
@@ -886,11 +1208,21 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--serial-device", default=config["serial-device"])
     parser.add_argument("--serial-baud", type=int, default=115200)
     parser.add_argument("--serial-timeout-sec", type=float, default=30.0)
+    parser.add_argument("--pi-host", default=config["pi-host"])
+    parser.add_argument(
+        "--pi-workdir",
+        default="",
+        help="remote workspace; defaults to /home/<SSH user>/peripheral-benchmark",
+    )
+    parser.add_argument("--ssh-key", default=config["ssh-key"])
     parser.add_argument("--nrfutil", default=default_nrfutil())
     parser.add_argument("--ncs-version", default=DEFAULT_NCS_VERSION)
     parser.add_argument("--ncs-chdir", default=default_ncs_chdir())
     parser.add_argument("--board", default="nrf52840dk/nrf52840")
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    args.ssh_key = os.path.expandvars(os.path.expanduser(args.ssh_key))
+    args.pi_workdir = resolve_pi_workdir(args.pi_host, args.pi_workdir)
+    return args
 
 
 def board_args_from(args: argparse.Namespace) -> argparse.Namespace:
@@ -943,10 +1275,6 @@ def main(argv: list[str] | None = None) -> int:
     run_dir.mkdir(parents=True)
     log = run_dir / "certificate-benchmark.log"
 
-    ensure_image(ROOT / "docker" / "Dockerfile.pqc", log)
-    client_dir = run_dir / "trust-anchors"
-    generate_client_identity(client_dir, log)
-
     cases = signature_cases(read_cases(args.cases))
     if args.only_signature:
         wanted = set(args.only_signature)
@@ -961,6 +1289,7 @@ def main(argv: list[str] | None = None) -> int:
 
     attempts: list[dict[str, object]] = []
     if args.host_client_identity:
+        ensure_image(ROOT / "docker" / "Dockerfile.pqc", log)
         client_case = {
             "case_id": "client_identity",
             "cert_sig_alg": "ECDSA-P-256",
@@ -1025,37 +1354,67 @@ def main(argv: list[str] | None = None) -> int:
                 attempts.append(board_row)
                 write_csv(run_dir / "attempts.csv", ATTEMPT_FIELDS, attempts)
 
-    for case in cases:
-        signature = SIGNATURES_BY_NAME[case["cert_sig_alg"]]
-        builder = server_builder_for(signature, args.server_builder)
-        generation_scope = server_generation_scope(builder)
-        script = server_script_for(signature, builder)
-        mounts = [] if builder != "openssl" else [(client_dir, "/client", True)]
-        for attempt in range(1, args.iterations + 1):
-            output = (
-                run_dir / "attempts" / slug(signature.name) / f"{attempt:03d}"
-            )
-            print(
-                f"[cert-chain] {signature.name} attempt={attempt}/{args.iterations}",
-                flush=True,
-            )
-            rc, metrics, stdout = run_measured_container(
-                output, script, log, mounts=mounts
-            )
-            attempts.append(attempt_row(
-                attempt_index=attempt,
-                component="server_chain",
-                owner="server",
-                case=case,
-                signature=signature,
-                builder=builder,
-                generation_scope=generation_scope,
-                output=output,
-                status="success" if rc == 0 else "fail",
-                metrics=metrics,
-                message="" if rc == 0 else stdout.splitlines()[-1] if stdout else "",
-            ))
-            write_csv(run_dir / "attempts.csv", ATTEMPT_FIELDS, attempts)
+    server_builders = {
+        server_builder_for(SIGNATURES_BY_NAME[case["cert_sig_alg"]], args.server_builder)
+        for case in cases
+    }
+    pi_runner = PiCertificateRunner(
+        args.pi_host, args.pi_workdir, args.ssh_key, run_id
+    )
+    print(
+        f"[setup] Preparing Raspberry Pi certificate generator on {args.pi_host}; "
+        f"log={log}",
+        flush=True,
+    )
+    pi_runner.start(log)
+    try:
+        pi_runner.prepare(log, server_builders)
+        for case in cases:
+            signature = SIGNATURES_BY_NAME[case["cert_sig_alg"]]
+            builder = server_builder_for(signature, args.server_builder)
+            generation_scope = server_generation_scope(builder)
+            remote_root = ""
+            if builder == "openssl":
+                remote_root = pi_runner.ensure_server_root(
+                    signature,
+                    run_dir / "trust-anchors" / slug(signature.issuer_key_type),
+                    log,
+                )
+            for attempt in range(1, args.iterations + 1):
+                output = (
+                    run_dir / "attempts" / slug(signature.name) / f"{attempt:03d}"
+                )
+                remote_output = pi_runner.remote_attempt_dir(signature, attempt)
+                script = server_script_for(
+                    signature,
+                    builder,
+                    output_dir=remote_output,
+                    client_dir=remote_root,
+                )
+                print(
+                    f"[cert-chain] Raspberry Pi {signature.name} "
+                    f"attempt={attempt}/{args.iterations}",
+                    flush=True,
+                )
+                rc, metrics, stdout = pi_runner.run_measured(
+                    output, remote_output, script, log
+                )
+                attempts.append(attempt_row(
+                    attempt_index=attempt,
+                    component="server_chain",
+                    owner="server",
+                    case=case,
+                    signature=signature,
+                    builder=builder,
+                    generation_scope=generation_scope,
+                    output=output,
+                    status="success" if rc == 0 else "fail",
+                    metrics=metrics,
+                    message="" if rc == 0 else stdout.splitlines()[-1] if stdout else "",
+                ))
+                write_csv(run_dir / "attempts.csv", ATTEMPT_FIELDS, attempts)
+    finally:
+        pi_runner.stop()
 
     write_csv(run_dir / "summary.csv", SUMMARY_FIELDS, summarize(attempts))
     shutil.copy2(args.cases, run_dir / "input_cases.csv")

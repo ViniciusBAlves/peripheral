@@ -7,13 +7,19 @@ set(BENCH_MLKEM_BACKEND "pqm4-m4fstack" CACHE STRING "ML-KEM implementation")
 option(BENCH_POWER_MARKERS "Enable PPK2 GPIO timing markers" OFF)
 set_property(CACHE BENCH_MLKEM_BACKEND PROPERTY STRINGS wolfssl pqm4-m4fstack)
 option(BENCH_CLIENT_CERTGEN "Run board-side client certificate generation benchmark" OFF)
+option(BENCH_KEM_OPERATIONS "Run board-side key-exchange operation benchmark" OFF)
 set(BENCH_CLIENT_CERTGEN_SIG "ECDSA-P-256" CACHE STRING
     "Signature algorithm for board-side client certificate generation")
 
-if(NOT DEFINED BENCH_GENERATED_DIR)
+if(BENCH_CLIENT_CERTGEN AND BENCH_KEM_OPERATIONS)
+    message(FATAL_ERROR "BENCH_CLIENT_CERTGEN and BENCH_KEM_OPERATIONS are mutually exclusive")
+endif()
+
+if(NOT BENCH_KEM_OPERATIONS AND NOT DEFINED BENCH_GENERATED_DIR)
     message(FATAL_ERROR "BENCH_GENERATED_DIR must contain benchmark_credentials.h")
 endif()
-if(NOT EXISTS "${BENCH_GENERATED_DIR}/benchmark_credentials.h")
+if(NOT BENCH_KEM_OPERATIONS AND
+   NOT EXISTS "${BENCH_GENERATED_DIR}/benchmark_credentials.h")
     message(FATAL_ERROR "Missing ${BENCH_GENERATED_DIR}/benchmark_credentials.h")
 endif()
 
@@ -38,6 +44,17 @@ set(WOLFSSL_ROOT_DIR "${wolfssl_upstream_SOURCE_DIR}")
 # Add benchmark-only timing hooks to the disposable wolfSSL source copy.
 set(WOLFSSL_ASN_C "${WOLFSSL_ROOT_DIR}/wolfcrypt/src/asn.c")
 file(READ "${WOLFSSL_ASN_C}" WOLFSSL_ASN_TEXT)
+string(REPLACE "#include \"benchmark_metrics.h\"\n" ""
+    WOLFSSL_ASN_TEXT "${WOLFSSL_ASN_TEXT}"
+)
+string(REPLACE
+    "    benchmark_timepoint_t benchmark_verify_start = benchmark_crypto_metric_start(BENCH_CRYPTO_CERT_VERIFY);\n"
+    "" WOLFSSL_ASN_TEXT "${WOLFSSL_ASN_TEXT}"
+)
+string(REPLACE
+    "    benchmark_metric_stop(BENCH_CRYPTO_CERT_VERIFY, benchmark_verify_start);\n"
+    "" WOLFSSL_ASN_TEXT "${WOLFSSL_ASN_TEXT}"
+)
 string(REPLACE
     "    WOLFSSL_ENTER(\"ConfirmSignature\");"
     "    benchmark_timepoint_t benchmark_verify_start = benchmark_crypto_metric_start(BENCH_CRYPTO_CERT_VERIFY);\n    WOLFSSL_ENTER(\"ConfirmSignature\");"
@@ -58,6 +75,23 @@ file(WRITE "${WOLFSSL_ASN_C}" "${WOLFSSL_ASN_TEXT}")
 if(NOT BENCH_MLKEM_BACKEND STREQUAL "pqm4-m4fstack")
 set(WOLFSSL_MLKEM_C "${WOLFSSL_ROOT_DIR}/wolfcrypt/src/wc_mlkem.c")
 file(READ "${WOLFSSL_MLKEM_C}" WOLFSSL_MLKEM_TEXT)
+string(REPLACE "#include \"benchmark_metrics.h\"\n" ""
+    WOLFSSL_MLKEM_TEXT "${WOLFSSL_MLKEM_TEXT}"
+)
+foreach(METRIC_NAME IN ITEMS
+    BENCH_CRYPTO_KEM_KEYGEN
+    BENCH_CRYPTO_KEM_ENCAPSULATE
+    BENCH_CRYPTO_KEM_DECAPSULATE
+)
+    string(REPLACE
+        "    benchmark_timepoint_t benchmark_kem_start = benchmark_crypto_metric_start(${METRIC_NAME});\n"
+        "" WOLFSSL_MLKEM_TEXT "${WOLFSSL_MLKEM_TEXT}"
+    )
+    string(REPLACE
+        "    benchmark_metric_stop(${METRIC_NAME}, benchmark_kem_start);\n"
+        "" WOLFSSL_MLKEM_TEXT "${WOLFSSL_MLKEM_TEXT}"
+    )
+endforeach()
 string(REPLACE
     "#include <wolfssl/wolfcrypt/wc_mlkem.h>"
     "#include <wolfssl/wolfcrypt/wc_mlkem.h>\n#include \"benchmark_metrics.h\""
@@ -100,6 +134,17 @@ endif()
 # bypassing the X25519SharedSecret wrapper instrumented below.
 set(WOLFSSL_TLS_C "${WOLFSSL_ROOT_DIR}/src/tls.c")
 file(READ "${WOLFSSL_TLS_C}" WOLFSSL_TLS_TEXT)
+string(REPLACE "#include \"benchmark_metrics.h\"\n" ""
+    WOLFSSL_TLS_TEXT "${WOLFSSL_TLS_TEXT}"
+)
+string(REPLACE
+    "            benchmark_timepoint_t benchmark_x25519_hybrid_start =\n                benchmark_crypto_metric_start(BENCH_CRYPTO_CLASSICAL_KEX_SHARED_SECRET);\n"
+    "" WOLFSSL_TLS_TEXT "${WOLFSSL_TLS_TEXT}"
+)
+string(REPLACE
+    "            benchmark_metric_stop(BENCH_CRYPTO_CLASSICAL_KEX_SHARED_SECRET,\n                                  benchmark_x25519_hybrid_start);\n"
+    "" WOLFSSL_TLS_TEXT "${WOLFSSL_TLS_TEXT}"
+)
 string(REPLACE
     "#include <wolfssl/wolfcrypt/libwolfssl_sources.h>"
     "#include <wolfssl/wolfcrypt/libwolfssl_sources.h>\n#include \"benchmark_metrics.h\""
@@ -118,6 +163,15 @@ file(WRITE "${WOLFSSL_TLS_C}" "${WOLFSSL_TLS_TEXT}")
 if(BENCH_LARGE_RSA)
     set(WOLFSSL_INTEGER_C "${WOLFSSL_ROOT_DIR}/wolfcrypt/src/integer.c")
     file(READ "${WOLFSSL_INTEGER_C}" WOLFSSL_INTEGER_TEXT)
+    string(REPLACE "#include \"benchmark_metrics.h\"\n" ""
+        WOLFSSL_INTEGER_TEXT "${WOLFSSL_INTEGER_TEXT}"
+    )
+    string(REPLACE "    benchmark_crypto_reschedule();\n" ""
+        WOLFSSL_INTEGER_TEXT "${WOLFSSL_INTEGER_TEXT}"
+    )
+    string(REPLACE "    if ((ix & 31) == 0) benchmark_crypto_reschedule();\n" ""
+        WOLFSSL_INTEGER_TEXT "${WOLFSSL_INTEGER_TEXT}"
+    )
     string(REPLACE
         "#include <wolfssl/wolfcrypt/libwolfssl_sources.h>"
         "#include <wolfssl/wolfcrypt/libwolfssl_sources.h>\n#include \"benchmark_metrics.h\""
@@ -150,6 +204,9 @@ endif()
 # mTLS CertificateVerify signature in wolfSSL's TLS wrappers.
 set(WOLFSSL_INTERNAL_C "${WOLFSSL_ROOT_DIR}/src/internal.c")
 file(READ "${WOLFSSL_INTERNAL_C}" WOLFSSL_INTERNAL_TEXT)
+string(REPLACE "#include \"benchmark_metrics.h\"\n" ""
+    WOLFSSL_INTERNAL_TEXT "${WOLFSSL_INTERNAL_TEXT}"
+)
 string(REPLACE
     "#include <wolfssl/wolfcrypt/libwolfssl_sources.h>"
     "#include <wolfssl/wolfcrypt/libwolfssl_sources.h>\n#include \"benchmark_metrics.h\""
@@ -165,6 +222,14 @@ foreach(PAIR IN ITEMS
     string(REPLACE "|" ";" PAIR_PARTS "${PAIR}")
     list(GET PAIR_PARTS 0 FUNCTION_NAME)
     list(GET PAIR_PARTS 1 METRIC_NAME)
+    string(REPLACE
+        "    benchmark_timepoint_t benchmark_${FUNCTION_NAME}_start = benchmark_crypto_metric_start(${METRIC_NAME});\n"
+        "" WOLFSSL_INTERNAL_TEXT "${WOLFSSL_INTERNAL_TEXT}"
+    )
+    string(REPLACE
+        "    benchmark_metric_stop(${METRIC_NAME}, benchmark_${FUNCTION_NAME}_start);\n"
+        "" WOLFSSL_INTERNAL_TEXT "${WOLFSSL_INTERNAL_TEXT}"
+    )
     string(REPLACE
         "    WOLFSSL_ENTER(\"${FUNCTION_NAME}\");"
         "    benchmark_timepoint_t benchmark_${FUNCTION_NAME}_start = benchmark_crypto_metric_start(${METRIC_NAME});\n    WOLFSSL_ENTER(\"${FUNCTION_NAME}\");"
@@ -182,6 +247,17 @@ file(WRITE "${WOLFSSL_INTERNAL_C}" "${WOLFSSL_INTERNAL_TEXT}")
 # from X.509 chain signature verification.
 set(WOLFSSL_TLS13_C "${WOLFSSL_ROOT_DIR}/src/tls13.c")
 file(READ "${WOLFSSL_TLS13_C}" WOLFSSL_TLS13_TEXT)
+string(REPLACE "#include \"benchmark_metrics.h\"\n" ""
+    WOLFSSL_TLS13_TEXT "${WOLFSSL_TLS13_TEXT}"
+)
+string(REPLACE
+    "    benchmark_timepoint_t benchmark_tls_cert_verify_start = benchmark_crypto_metric_start(BENCH_CRYPTO_TLS_CERT_VERIFY);\n"
+    "" WOLFSSL_TLS13_TEXT "${WOLFSSL_TLS13_TEXT}"
+)
+string(REPLACE
+    "    benchmark_metric_stop(BENCH_CRYPTO_TLS_CERT_VERIFY, benchmark_tls_cert_verify_start);\n"
+    "" WOLFSSL_TLS13_TEXT "${WOLFSSL_TLS13_TEXT}"
+)
 string(REPLACE
     "#include <wolfssl/wolfcrypt/libwolfssl_sources.h>"
     "#include <wolfssl/wolfcrypt/libwolfssl_sources.h>\n#include \"benchmark_metrics.h\""
@@ -225,8 +301,14 @@ string(REPLACE
 )
 file(WRITE "${WOLFSSL_INTERNAL_H}" "${WOLFSSL_INTERNAL_TEXT}")
 
+if(BENCH_KEM_OPERATIONS)
+    set(BENCH_APP_ENTRY src/kem_bench_main.c)
+else()
+    set(BENCH_APP_ENTRY src/main.c)
+endif()
+
 # 1. Bind EVERYTHING directly to the 'app' target
-target_sources(app PRIVATE src/main.c src/benchmark_metrics.c src/power_markers.c
+target_sources(app PRIVATE ${BENCH_APP_ENTRY} src/benchmark_metrics.c src/power_markers.c
     # --- Post Quantum Math ---
     ${WOLFSSL_ROOT_DIR}/wolfcrypt/src/wc_mlkem.c
     ${WOLFSSL_ROOT_DIR}/wolfcrypt/src/wc_mlkem_poly.c
@@ -292,10 +374,12 @@ endif()
 target_include_directories(app PRIVATE 
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/src
-    ${BENCH_GENERATED_DIR}
     ${WOLFSSL_ROOT_DIR}
     ${WOLFSSL_ROOT_DIR}/wolfssl
 )
+if(DEFINED BENCH_GENERATED_DIR)
+    target_include_directories(app PRIVATE ${BENCH_GENERATED_DIR})
+endif()
 
 # CRITICAL FIX: Target-specific definitions and includes (NOT Global)
 target_compile_definitions(app PRIVATE
@@ -314,6 +398,9 @@ if(BENCH_CLIENT_CERTGEN)
         BENCH_CLIENT_CERTGEN
         BENCH_CLIENT_CERTGEN_SIG="${BENCH_CLIENT_CERTGEN_SIG}"
     )
+endif()
+if(BENCH_KEM_OPERATIONS)
+    target_compile_definitions(app PRIVATE BENCH_KEM_OPERATIONS)
 endif()
 
 if(BENCH_MLKEM_BACKEND STREQUAL "pqm4-m4fstack")

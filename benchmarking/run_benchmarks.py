@@ -61,10 +61,53 @@ POWER_ATTEMPT_FIELDS = [
     for window in POWER_WINDOWS for metric in POWER_METRICS
 ]
 TLS_PHASES = ("tls_setup", "tls_handshake", "mqtt_connect")
+TLS_DWT_METRICS = (
+    ("core", "cycles"), ("lsu", "cycles"), ("cpi", "cycles"),
+    ("exc", "cycles"), ("sleep", "cycles"), ("fold", "events"),
+)
+PI_PROCESS_PREFIXES = ("pi_broker", "pi_bridge")
+PI_PROCESS_METRICS = (
+    "utime_ticks", "stime_ticks", "minor_page_faults", "major_page_faults",
+    "threads", "vmrss_kb", "vmhwm_kb", "voluntary_context_switches",
+    "involuntary_context_switches", "read_bytes", "write_bytes",
+    "perf_available", "perf_metrics_collected", "perf_task_clock_ms",
+    "perf_cpu_clock_ms", "perf_cycles", "perf_instructions",
+    "perf_cache_references", "perf_cache_misses",
+    "perf_branch_instructions", "perf_branch_misses",
+    "perf_stalled_cycles_frontend", "perf_stalled_cycles_backend",
+    "perf_l1_dcache_loads", "perf_l1_dcache_load_misses",
+    "perf_l1_icache_load_misses", "perf_dtlb_load_misses",
+    "perf_itlb_load_misses", "perf_crypto_spec", "perf_simd_spec",
+    "perf_context_switches", "perf_cpu_migrations", "perf_minor_faults",
+    "perf_major_faults",
+)
+PI_PROCESS_ATTEMPT_FIELDS = [
+    f"{prefix}_{metric}"
+    for prefix in PI_PROCESS_PREFIXES
+    for metric in PI_PROCESS_METRICS
+]
+PI_PROCESS_SUMMARY_FIELDS = [
+    f"mean_{field}" for field in PI_PROCESS_ATTEMPT_FIELDS
+]
 FATAL_SERVER_LOG_PATTERNS = (
     r"unknown ca",
     r"certificate verify failed",
 )
+FATAL_SERVER_START_PATTERNS = (
+    r"failed to load server private key",
+    r"failed to load server certificate chain",
+    r"Error: Unable to load server certificate",
+    r"unknown certificate type",
+)
+
+
+def unsupported_case_reason(case: dict[str, str]) -> str | None:
+    if case.get("certificate_verify_alg", "").startswith("SLH-DSA-SHAKE-"):
+        return (
+            "wolfSSL TLS on the board does not support SLH-DSA "
+            "CertificateVerify private-key loading/signature schemes"
+        )
+    return None
 
 ATTEMPT_FIELDS = [
     "attempt_index", "schedule_index", "session", "attempt_in_session", "warmup",
@@ -87,8 +130,11 @@ ATTEMPT_FIELDS = [
     "client_cpu_cycles", "client_cycle_hz", "client_cpu_ms",
     "client_cpu_usage_percent", "system_cpu_usage_percent",
     *[f"{phase}_cpu_ms" for phase in TLS_PHASES],
-    *[f"{phase}_lsu_cycles" for phase in TLS_PHASES],
-    *[f"{phase}_cpi_cycles" for phase in TLS_PHASES],
+    *[
+        f"{phase}_{counter}_{suffix}"
+        for counter, suffix in TLS_DWT_METRICS
+        for phase in TLS_PHASES
+    ],
     *[f"{phase}_heap_peak_bytes" for phase in TLS_PHASES],
     *[f"{phase}_thread_main_cpu_percent" for phase in TLS_PHASES],
     *[f"{phase}_thread_idle_cpu_percent" for phase in TLS_PHASES],
@@ -107,6 +153,7 @@ ATTEMPT_FIELDS = [
     "thread_stack_peak_percent",
     "l2cap_rx_ring_peak_bytes", "l2cap_rx_ring_capacity_bytes",
     "l2cap_rx_ring_peak_percent",
+    *PI_PROCESS_ATTEMPT_FIELDS,
     *POWER_ATTEMPT_FIELDS,
     "power_status", "power_profiler_sample_count",
     "power_profiler_window_count", "power_profiler_vdd_mv",
@@ -127,8 +174,11 @@ SUMMARY_FIELDS = [
     "mean_end_to_end_ms", "connections_per_second", "mean_client_cpu_ms",
     "mean_client_cpu_usage_percent", "mean_system_cpu_usage_percent",
     *[f"mean_{phase}_cpu_ms" for phase in TLS_PHASES],
-    *[f"mean_{phase}_lsu_cycles" for phase in TLS_PHASES],
-    *[f"mean_{phase}_cpi_cycles" for phase in TLS_PHASES],
+    *[
+        f"mean_{phase}_{counter}_{suffix}"
+        for counter, suffix in TLS_DWT_METRICS
+        for phase in TLS_PHASES
+    ],
     *[f"max_{phase}_heap_peak_bytes" for phase in TLS_PHASES],
     *[f"mean_{phase}_thread_main_cpu_percent" for phase in TLS_PHASES],
     *[f"mean_{phase}_thread_idle_cpu_percent" for phase in TLS_PHASES],
@@ -161,6 +211,7 @@ SUMMARY_FIELDS = [
     "max_thread_stack_peak_percent",
     "max_l2cap_rx_ring_peak_bytes", "l2cap_rx_ring_capacity_bytes",
     "max_l2cap_rx_ring_peak_percent",
+    *PI_PROCESS_SUMMARY_FIELDS,
     *[
         f"mean_{window}_{metric}"
         for window in POWER_WINDOWS
@@ -434,23 +485,29 @@ def timeout_for_case(case: dict[str, str], override: float | None) -> float:
         return override
     signature = case["cert_sig_alg"]
     if signature.startswith("SLH-DSA-SHAKE-256"):
-        timeout = 180.0
+        timeout = 600.0
     elif signature.startswith("SLH-DSA-SHAKE-192"):
-        timeout = 120.0
+        timeout = 420.0
     elif signature.startswith("SLH-DSA-SHAKE-128"):
-        timeout = 75.0
+        timeout = 180.0
     elif signature == "RSA-PSS-15360":
-        timeout = 240.0
+        timeout = 1200.0
     elif signature == "RSA-PSS-7680":
-        timeout = 120.0
+        timeout = 420.0
     elif signature == "RSA-PSS-3072":
         timeout = 45.0
     elif signature == "LMS-HSS-L2-H10-W4":
-        timeout = 180.0
+        timeout = 900.0
     elif signature == "XMSS-SHA2_20_256":
-        timeout = 210.0
+        timeout = 900.0
+    elif signature == "ML-DSA-87":
+        timeout = 300.0
+    elif signature == "ML-DSA-65":
+        timeout = 180.0
+    elif signature == "ML-DSA-44":
+        timeout = 120.0
     elif signature.startswith("ML-DSA"):
-        timeout = 45.0
+        timeout = 180.0
     else:
         timeout = 60.0
     group = case["kex_group"].upper()
@@ -480,8 +537,29 @@ def classify_gateway_start_failure(
             final["stage"] = "ble_l2cap_ready_timeout"
         else:
             final["stage"] = "ble_l2cap_connect"
-    elif "TCP connect failed" in text:
+    elif "TCP connect failed" in text or "TCP connection failed" in text:
         final["stage"] = "gateway_tcp_connect"
+    return final
+
+
+def classify_server_start_failure(
+    broker_log: Path,
+    final: dict[str, str],
+) -> dict[str, str]:
+    if final.get("stage") not in {"gateway_start", "gateway_tcp_connect"}:
+        return final
+    try:
+        text = broker_log.read_text(errors="replace")
+    except OSError:
+        return final
+    for pattern in FATAL_SERVER_START_PATTERNS:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            final["stage"] = "server_start"
+            final["error"] = "fatal_server_log"
+            final["fatal"] = "1"
+            final["fatal_message"] = match.group(0)
+            break
     return final
 
 
@@ -522,19 +600,19 @@ def run_job(
             serial_port.reset_input_buffer()
             try:
                 gateway.start_session(
-                case_id=case["case_id"],
-                remote_case_dir=remote_case,
-                ble_addr=args.ble_addr,
-                ble_name=args.ble_name,
-                ble_addr_type=args.ble_addr_type,
-                psm=args.psm,
-                mtu=args.mtu,
-                adapter=args.pi_adapter,
-                disable_wifi=args.disable_pi_wifi,
-                ready_timeout=args.gateway_ready_timeout_sec,
-                log=case_dir / "gateway-control.log",
-                server_backend=server_backend,
-                wolfssl_group=KEMS_BY_NAME[case["kex_group"]].wolfssl_group,
+                    case_id=case["case_id"],
+                    remote_case_dir=remote_case,
+                    ble_addr=args.ble_addr,
+                    ble_name=args.ble_name,
+                    ble_addr_type=args.ble_addr_type,
+                    psm=args.psm,
+                    mtu=args.mtu,
+                    adapter=args.pi_adapter,
+                    disable_wifi=args.disable_pi_wifi,
+                    ready_timeout=args.gateway_ready_timeout_sec,
+                    log=case_dir / "gateway-control.log",
+                    server_backend=server_backend,
+                    wolfssl_group=KEMS_BY_NAME[case["kex_group"]].wolfssl_group,
                 )
                 remote_broker_log = f"{gateway.workdir}/logs/{case['case_id']}.broker.log"
                 final = wait_for_result(
@@ -560,6 +638,7 @@ def run_job(
                     case_dir / "gateway-control.log",
                 )
                 final = classify_gateway_start_failure(gateway_log, final)
+                final = classify_server_start_failure(broker_log, final)
                 try:
                     wait_for_board_ready(
                         serial_port, board_log, args.board_rearm_timeout_sec
@@ -737,12 +816,17 @@ def run_job(
         "_fatal": final.get("fatal", ""),
         "_fatal_message": final.get("fatal_message", ""),
     }
+    for prefix, values in (("pi_broker", server_values), ("pi_bridge", gateway_values)):
+        for metric in PI_PROCESS_METRICS:
+            row[f"{prefix}_{metric}"] = values.get(f"{prefix}_{metric}", "")
     for phase in TLS_PHASES:
         row[f"{phase}_cpu_ms"] = microseconds_as_milliseconds(
             final, f"{phase}_cpu_us"
         )
-        row[f"{phase}_lsu_cycles"] = final.get(f"{phase}_lsu_cycles", "")
-        row[f"{phase}_cpi_cycles"] = final.get(f"{phase}_cpi_cycles", "")
+        for counter, suffix in TLS_DWT_METRICS:
+            row[f"{phase}_{counter}_{suffix}"] = final.get(
+                f"{phase}_{counter}_{suffix}", ""
+            )
         row[f"{phase}_heap_peak_bytes"] = final.get(
             f"{phase}_heap_peak_bytes", ""
         )
@@ -810,8 +894,13 @@ def summarize(case: dict[str, str], attempts: list[dict[str, object]]) -> dict[s
     rx_ring_percent = successful_numbers("l2cap_rx_ring_peak_percent")
     tls_phase_summary: dict[str, str] = {}
     for phase in TLS_PHASES:
-        for metric in ("cpu_ms", "lsu_cycles", "cpi_cycles",
-                       "thread_main_cpu_percent", "thread_idle_cpu_percent"):
+        metrics = (
+            "cpu_ms",
+            *(f"{counter}_{suffix}" for counter, suffix in TLS_DWT_METRICS),
+            "thread_main_cpu_percent",
+            "thread_idle_cpu_percent",
+        )
+        for metric in metrics:
             values = successful_numbers(f"{phase}_{metric}")
             tls_phase_summary[f"mean_{phase}_{metric}"] = (
                 f"{sum(values) / len(values):.3f}" if values else ""
@@ -819,6 +908,12 @@ def summarize(case: dict[str, str], attempts: list[dict[str, object]]) -> dict[s
         values = successful_numbers(f"{phase}_heap_peak_bytes")
         tls_phase_summary[f"max_{phase}_heap_peak_bytes"] = (
             f"{max(values):.0f}" if values else ""
+        )
+    pi_process_summary: dict[str, str] = {}
+    for field in PI_PROCESS_ATTEMPT_FIELDS:
+        values = successful_numbers(field)
+        pi_process_summary[f"mean_{field}"] = (
+            f"{sum(values) / len(values):.3f}" if values else ""
         )
     dwt_supported = [str(row.get("dwt_counters_supported", "")) for row in success]
     dwt_wrap = [str(row.get("dwt_wrap_risk", "")) for row in success]
@@ -1032,6 +1127,7 @@ def summarize(case: dict[str, str], attempts: list[dict[str, object]]) -> dict[s
         "max_l2cap_rx_ring_peak_percent": (
             f"{max(rx_ring_percent):.2f}" if rx_ring_percent else ""
         ),
+        **pi_process_summary,
         **power_summary,
     }
 
@@ -1440,9 +1536,14 @@ def main() -> int:
 
     supported: list[dict[str, str]] = []
     unsupported: dict[str, str] = {}
+    preparation_failures: dict[str, str] = {}
     server_backends: dict[str, str] = {}
     signature_templates: dict[tuple[str, str], Path] = {}
     for case in cases:
+        reason = unsupported_case_reason(case)
+        if reason is not None:
+            unsupported[case["case_id"]] = reason
+            continue
         server_backend = server_backend_for_case(case, args.server_backend)
         if server_backend is None:
             unsupported[case["case_id"]] = unsupported_backend_reason(
@@ -1473,9 +1574,46 @@ def main() -> int:
             supported.append(case)
         except Exception as error:
             unsupported[case["case_id"]] = str(error)
+            preparation_failures[case["case_id"]] = str(error)
 
     if not supported:
-        raise RuntimeError("none of the selected cases passed certificate preparation")
+        if preparation_failures:
+            raise RuntimeError("none of the selected cases passed certificate preparation")
+        for execution_order, job in scheduled_jobs:
+            case = case_by_id[job.case_id]
+            row = {
+                "attempt_index": len(attempts[job.case_id]) + 1,
+                "schedule_index": job.sequence,
+                "session": job.session,
+                "attempt_in_session": job.attempt_in_session,
+                "warmup": job.warmup,
+                "status": "unsupported",
+                "reconnect_count": 0,
+                **case_metadata(case),
+                "mlkem_backend": args.mlkem_backend,
+                "rsa_profile": "fast-math",
+                "message": unsupported[job.case_id],
+            }
+            attempts[job.case_id].append(row)
+            write_csv(
+                case_dirs[job.case_id] / "attempts.csv",
+                ATTEMPT_FIELDS,
+                attempts[job.case_id],
+            )
+            write_checkpoint(
+                run_dir,
+                execution_order=execution_order,
+                total_jobs=len(jobs),
+                job=job,
+            )
+        summaries = [summarize(case, attempts[case["case_id"]]) for case in cases]
+        for row in summaries:
+            row["mlkem_backend"] = args.mlkem_backend
+            row["rsa_profile"] = "fast-math"
+        write_csv(run_dir / "summary.csv", SUMMARY_FIELDS, summaries)
+        print("[selection] No runnable cases for the selected server backend.", flush=True)
+        print(f"results={run_dir}")
+        return 0
     generated_root = WORK / "generated" / run_id
     all_case_dirs = [
         (case["case_id"], case_dirs[case["case_id"]] / "generated")
@@ -1633,20 +1771,40 @@ def main() -> int:
     current_firmware_profile: str | None = profiles[0] if len(profiles) == 1 else None
 
     def open_serial_and_wait(profile: str):
-        port = serial.Serial(
-            args.serial_device, args.serial_baud, timeout=0.25
-        )
-        port.reset_input_buffer()
+        deadline = time.monotonic() + args.board_ready_timeout_sec
+        last_error: Exception | None = None
         print(
             f"[board] Waiting for BENCH_READY on {args.serial_device} "
             f"client-auth={profile}...",
             flush=True,
         )
-        wait_for_board_ready(
-            port, run_dir / "board.log", args.board_ready_timeout_sec
+        while time.monotonic() < deadline:
+            port = None
+            try:
+                port = serial.Serial(
+                    args.serial_device, args.serial_baud, timeout=0.25
+                )
+                port.reset_input_buffer()
+                wait_for_board_ready(
+                    port,
+                    run_dir / "board.log",
+                    max(0.1, deadline - time.monotonic()),
+                )
+                print("[board] Firmware is ready.", flush=True)
+                return port
+            except serial.SerialException as error:
+                last_error = error
+                if port is not None and port.is_open:
+                    port.close()
+                time.sleep(0.5)
+        if last_error is not None:
+            raise TimeoutError(
+                f"board serial reset while waiting for BENCH_READY: {last_error}"
+            ) from last_error
+        raise TimeoutError(
+            f"board did not print BENCH_READY on {args.serial_device} "
+            f"within {args.board_ready_timeout_sec:g}s"
         )
-        print("[board] Firmware is ready.", flush=True)
-        return port
 
     try:
         if args.skip_flash:

@@ -5,7 +5,8 @@ WOLFSSL = "wolfssl"
 AUTO = "auto"
 
 SERVER_BACKEND_CHOICES = (AUTO, OPENSSL_MOSQUITTO, WOLFSSL)
-HASH_BASED_SIGNATURES = {"LMS-HSS-L2-H10-W4", "XMSS-SHA2_20_256"}
+WOLFSSL_CERTIFICATE_SIGNATURES = {"LMS-HSS-L2-H10-W4", "XMSS-SHA2_20_256"}
+HASH_BASED_SIGNATURES = WOLFSSL_CERTIFICATE_SIGNATURES
 
 
 def server_backend_for_case(
@@ -13,9 +14,10 @@ def server_backend_for_case(
     requested: str,
 ) -> str | None:
     signature = case["cert_sig_alg"]
+    requires_wolfssl = signature in WOLFSSL_CERTIFICATE_SIGNATURES
     if requested == AUTO:
-        return WOLFSSL if signature in HASH_BASED_SIGNATURES else OPENSSL_MOSQUITTO
-    if requested == OPENSSL_MOSQUITTO and signature in HASH_BASED_SIGNATURES:
+        return WOLFSSL if requires_wolfssl else OPENSSL_MOSQUITTO
+    if requested == OPENSSL_MOSQUITTO and requires_wolfssl:
         return None
     return requested
 

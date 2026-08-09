@@ -9,7 +9,7 @@ import random
 from datetime import datetime
 from pathlib import Path
 
-from benchmarklib.algorithms import KEMS, SIGNATURES, slug
+from benchmarklib.algorithms import KEMS, SIGNATURE_PROFILES, slug
 
 
 ROOT = Path(__file__).resolve().parent
@@ -27,12 +27,16 @@ FIELDS = [
 def build_cases(iterations: int, warmups: int, separate: bool) -> list[dict[str, str]]:
     rows: list[dict[str, str]] = []
     for kem in KEMS:
-        for signature in SIGNATURES:
+        for signature in SIGNATURE_PROFILES:
             if separate and kem.family != signature.family:
                 continue
+            profile_suffix = (
+                f"__client_{slug(signature.certificate_verify)}"
+                if signature.certificate_verify != signature.name else ""
+            )
             rows.append(
                 {
-                    "case_id": f"{slug(kem.name)}__{slug(signature.name)}",
+                    "case_id": f"{slug(kem.name)}__{slug(signature.name)}{profile_suffix}",
                     "enabled": "1",
                     "kex_group": kem.name,
                     "kex_family": kem.family,
@@ -51,7 +55,8 @@ def build_cases(iterations: int, warmups: int, separate: bool) -> list[dict[str,
                     "warmup_iterations": str(warmups),
                     "expected_support": signature.expected_support,
                     "notes": signature.notes or (
-                        "SLH-DSA signs the chain; TLS CertificateVerify uses ECDSA"
+                        f"{signature.name} signs the server certificate; "
+                        f"TLS CertificateVerify uses {signature.certificate_verify}"
                         if signature.name.startswith("SLH-DSA") else ""
                     ),
                 }

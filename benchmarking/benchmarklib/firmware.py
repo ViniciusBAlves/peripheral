@@ -153,7 +153,7 @@ def build(
         west_args=[
             "build",
             "-d", str(build_dir),
-            "-p", "always",
+            "-p", "auto",
             "--no-sysbuild",
             "-b", board,
             str(firmware_dir),

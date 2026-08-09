@@ -65,35 +65,54 @@ SIGNATURES = (
               "RSA-PSS-7680", "RSA-PSS-7680", "RSA-PSS-7680"),
     Signature("RSA-PSS-15360", 5, 1920, 1920, 1920, "classic",
               "RSA-PSS-15360", "RSA-PSS-15360", "RSA-PSS-15360"),
+
     Signature("ML-DSA-44", 2, 1312, 2560, 2420, "pqc",
               "ML-DSA-44", "ML-DSA-44", "ML-DSA-44"),
     Signature("ML-DSA-65", 3, 1952, 4032, 3309, "pqc",
               "ML-DSA-65", "ML-DSA-65", "ML-DSA-65"),
     Signature("ML-DSA-87", 5, 2592, 4896, 4627, "pqc",
               "ML-DSA-87", "ML-DSA-87", "ML-DSA-87"),
-    # Current OpenSSL/wolfSSL TLS stacks use an ECDSA leaf for CertificateVerify.
     Signature("SLH-DSA-SHAKE-128s", 1, 32, 64, 7856, "pqc",
-              "SLH-DSA-SHAKE-128s", "ec:prime256v1", "ECDSA-P-256"),
+              "SLH-DSA-SHAKE-128s", "ML-DSA-44", "ML-DSA-44"),
     Signature("SLH-DSA-SHAKE-192s", 3, 48, 96, 16224, "pqc",
-              "SLH-DSA-SHAKE-192s", "ec:secp384r1", "ECDSA-P-384"),
+              "SLH-DSA-SHAKE-192s", "ML-DSA-65", "ML-DSA-65"),
     Signature("SLH-DSA-SHAKE-256s", 5, 64, 128, 29792, "pqc",
-              "SLH-DSA-SHAKE-256s", "ec:secp521r1", "ECDSA-P-521"),
+              "SLH-DSA-SHAKE-256s", "ML-DSA-87", "ML-DSA-87"),
     Signature("SLH-DSA-SHAKE-128f", 1, 32, 64, 7856, "pqc",
-              "SLH-DSA-SHAKE-128f", "ec:prime256v1", "ECDSA-P-256"),
+              "SLH-DSA-SHAKE-128f", "ML-DSA-44", "ML-DSA-44"),
     Signature("SLH-DSA-SHAKE-192f", 3, 48, 96, 16224, "pqc",
-              "SLH-DSA-SHAKE-192f", "ec:secp384r1", "ECDSA-P-384"),
+              "SLH-DSA-SHAKE-192f", "ML-DSA-65", "ML-DSA-65"),
     Signature("SLH-DSA-SHAKE-256f", 5, 64, 128, 29792, "pqc",
-              "SLH-DSA-SHAKE-256sf", "ec:secp521r1", "ECDSA-P-521"),
+              "SLH-DSA-SHAKE-256f", "ML-DSA-87", "ML-DSA-87"),
     Signature("LMS-HSS-L2-H10-W4", 5, 60, 64, 5076, "pqc",
-              "LMS-HSS-L2-H10-W4", "LMS-HSS-L2-H10-W4", "ECDSA-P-256",
-              notes="LMS/HSS signs the chain; TLS CertificateVerify uses ECDSA"),
+              "LMS-HSS-L2-H10-W4", "LMS-HSS-L2-H10-W4", "ML-DSA-87",
+              notes="LMS/HSS signs the server certificate; TLS CertificateVerify uses ML-DSA-87"),
     Signature("XMSS-SHA2_20_256", 5, 68, 2573, 2820, "pqc",
-              "XMSS-SHA2_20_256", "XMSS-SHA2_20_256", "ECDSA-P-256",
-              notes="XMSS signs the chain; TLS CertificateVerify uses ECDSA"),
+              "XMSS-SHA2_20_256", "XMSS-SHA2_20_256", "ML-DSA-87",
+              notes="XMSS signs the server certificate; TLS CertificateVerify uses ML-DSA-87"),
+)
+
+SIGNATURE_PROFILES = SIGNATURES + tuple(
+    Signature(
+        item.name,
+        item.nist_level,
+        item.public_key_bytes,
+        item.private_key_bytes,
+        item.signature_bytes,
+        item.family,
+        item.issuer_key_type,
+        item.leaf_key_type,
+        item.name,
+    )
+    for item in SIGNATURES
+    if item.name.startswith("SLH-DSA-SHAKE-")
 )
 
 KEMS_BY_NAME = {item.name: item for item in KEMS}
 SIGNATURES_BY_NAME = {item.name: item for item in SIGNATURES}
+
+if len(SIGNATURES_BY_NAME) != len(SIGNATURES):
+    raise ValueError("SIGNATURES must contain unique server certificate algorithms")
 
 
 def slug(value: str) -> str:

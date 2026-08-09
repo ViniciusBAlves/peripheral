@@ -320,8 +320,12 @@ struct benchmark_cpu_phase {
     int64_t wall_ms;
     uint64_t cycles;
     uint64_t us;
+    uint64_t dwt_core_cycles;
     uint64_t dwt_lsu_cycles;
     uint64_t dwt_cpi_cycles;
+    uint64_t dwt_exc_cycles;
+    uint64_t dwt_sleep_cycles;
+    uint64_t dwt_fold_events;
     uint32_t heap_current_bytes;
     uint32_t heap_peak_bytes;
     uint32_t dwt_samples;
@@ -334,6 +338,9 @@ struct benchmark_dwt_sampler {
     uint32_t last_cyccnt;
     uint8_t last_lsu;
     uint8_t last_cpi;
+    uint8_t last_exc;
+    uint8_t last_sleep;
+    uint8_t last_fold;
     bool active;
     bool supported;
 };
@@ -362,6 +369,15 @@ static void benchmark_dwt_enable(void)
 #if defined(DWT_CTRL_LSUEVTENA_Msk)
     DWT->CTRL |= DWT_CTRL_LSUEVTENA_Msk;
 #endif
+#if defined(DWT_CTRL_EXCEVTENA_Msk)
+    DWT->CTRL |= DWT_CTRL_EXCEVTENA_Msk;
+#endif
+#if defined(DWT_CTRL_SLEEPEVTENA_Msk)
+    DWT->CTRL |= DWT_CTRL_SLEEPEVTENA_Msk;
+#endif
+#if defined(DWT_CTRL_FOLDEVTENA_Msk)
+    DWT->CTRL |= DWT_CTRL_FOLDEVTENA_Msk;
+#endif
 #endif
 }
 
@@ -371,9 +387,16 @@ static void benchmark_dwt_sampler_sample(void)
     struct benchmark_dwt_sampler *sampler = &certgen_dwt_sampler;
     uint8_t lsu;
     uint8_t cpi;
+    uint8_t exc;
+    uint8_t sleep;
+    uint8_t fold;
     uint32_t cyccnt;
+    uint32_t cyccnt_delta;
     uint8_t lsu_delta;
     uint8_t cpi_delta;
+    uint8_t exc_delta;
+    uint8_t sleep_delta;
+    uint8_t fold_delta;
 
     if (!sampler->active || !sampler->supported ||
         sampler->phase == NULL) {
@@ -382,20 +405,37 @@ static void benchmark_dwt_sampler_sample(void)
 
     lsu = (uint8_t)DWT->LSUCNT;
     cpi = (uint8_t)DWT->CPICNT;
+    exc = (uint8_t)DWT->EXCCNT;
+    sleep = (uint8_t)DWT->SLEEPCNT;
+    fold = (uint8_t)DWT->FOLDCNT;
     cyccnt = DWT->CYCCNT;
+    cyccnt_delta = cyccnt - sampler->last_cyccnt;
     lsu_delta = (uint8_t)(lsu - sampler->last_lsu);
     cpi_delta = (uint8_t)(cpi - sampler->last_cpi);
+    exc_delta = (uint8_t)(exc - sampler->last_exc);
+    sleep_delta = (uint8_t)(sleep - sampler->last_sleep);
+    fold_delta = (uint8_t)(fold - sampler->last_fold);
 
+    sampler->phase->dwt_core_cycles += cyccnt_delta;
     sampler->phase->dwt_lsu_cycles += lsu_delta;
     sampler->phase->dwt_cpi_cycles += cpi_delta;
+    sampler->phase->dwt_exc_cycles += exc_delta;
+    sampler->phase->dwt_sleep_cycles += sleep_delta;
+    sampler->phase->dwt_fold_events += fold_delta;
     sampler->phase->dwt_samples++;
     if (lsu_delta >= CERTGEN_DWT_WRAP_RISK_THRESHOLD ||
-        cpi_delta >= CERTGEN_DWT_WRAP_RISK_THRESHOLD) {
+        cpi_delta >= CERTGEN_DWT_WRAP_RISK_THRESHOLD ||
+        exc_delta >= CERTGEN_DWT_WRAP_RISK_THRESHOLD ||
+        sleep_delta >= CERTGEN_DWT_WRAP_RISK_THRESHOLD ||
+        fold_delta >= CERTGEN_DWT_WRAP_RISK_THRESHOLD) {
         sampler->phase->dwt_wrap_risk = true;
     }
 
     sampler->last_lsu = lsu;
     sampler->last_cpi = cpi;
+    sampler->last_exc = exc;
+    sampler->last_sleep = sleep;
+    sampler->last_fold = fold;
     sampler->last_cyccnt = cyccnt;
 #endif
 }
@@ -420,8 +460,12 @@ static void benchmark_cpu_phase_begin(struct benchmark_cpu_phase *phase)
     phase->wall_ms = 0;
     phase->cycles = 0;
     phase->us = 0;
+    phase->dwt_core_cycles = 0;
     phase->dwt_lsu_cycles = 0;
     phase->dwt_cpi_cycles = 0;
+    phase->dwt_exc_cycles = 0;
+    phase->dwt_sleep_cycles = 0;
+    phase->dwt_fold_events = 0;
     phase->heap_current_bytes = (uint32_t)stats.allocated_bytes;
     phase->heap_peak_bytes = (uint32_t)stats.max_allocated_bytes;
     phase->dwt_samples = 0;
@@ -436,6 +480,9 @@ static void benchmark_cpu_phase_begin(struct benchmark_cpu_phase *phase)
     phase->dwt_supported = certgen_dwt_sampler.supported;
     certgen_dwt_sampler.last_lsu = (uint8_t)DWT->LSUCNT;
     certgen_dwt_sampler.last_cpi = (uint8_t)DWT->CPICNT;
+    certgen_dwt_sampler.last_exc = (uint8_t)DWT->EXCCNT;
+    certgen_dwt_sampler.last_sleep = (uint8_t)DWT->SLEEPCNT;
+    certgen_dwt_sampler.last_fold = (uint8_t)DWT->FOLDCNT;
     certgen_dwt_sampler.last_cyccnt = DWT->CYCCNT;
     if (certgen_dwt_sampler.supported) {
         k_timer_start(
@@ -448,17 +495,9 @@ static void benchmark_cpu_phase_begin(struct benchmark_cpu_phase *phase)
 
 static void benchmark_cpu_phase_end(struct benchmark_cpu_phase *phase)
 {
-    struct benchmark_cpu_snapshot end = benchmark_cpu_snapshot_get();
+    struct benchmark_cpu_snapshot end;
     struct benchmark_thread_cpu_snapshot thread_end;
     struct sys_memory_stats stats = {0};
-
-    phase->wall_ms = k_uptime_get() - phase->wall_start_ms;
-    thread_end = benchmark_thread_cpu_snapshot_get();
-    phase->thread_delta = benchmark_thread_cpu_delta_get(
-        &phase->thread_start, &thread_end);
-    (void)sys_heap_runtime_stats_get(&wolfssl_heap.heap, &stats);
-    phase->heap_current_bytes = (uint32_t)stats.allocated_bytes;
-    phase->heap_peak_bytes = (uint32_t)stats.max_allocated_bytes;
 
 #if defined(CONFIG_CPU_CORTEX_M_HAS_DWT)
     if (certgen_dwt_sampler.phase == phase) {
@@ -468,16 +507,24 @@ static void benchmark_cpu_phase_end(struct benchmark_cpu_phase *phase)
         certgen_dwt_sampler.phase = NULL;
     }
 #endif
+    end = benchmark_cpu_snapshot_get();
+    phase->wall_ms = k_uptime_get() - phase->wall_start_ms;
 
     if (!phase->start.valid || !end.valid ||
         end.thread_cycles < phase->start.thread_cycles) {
         phase->cycles = 0;
         phase->us = 0;
-        return;
+    } else {
+        phase->cycles = end.thread_cycles - phase->start.thread_cycles;
+        phase->us = k_cyc_to_us_floor64(phase->cycles);
     }
 
-    phase->cycles = end.thread_cycles - phase->start.thread_cycles;
-    phase->us = k_cyc_to_us_floor64(phase->cycles);
+    thread_end = benchmark_thread_cpu_snapshot_get();
+    phase->thread_delta = benchmark_thread_cpu_delta_get(
+        &phase->thread_start, &thread_end);
+    (void)sys_heap_runtime_stats_get(&wolfssl_heap.heap, &stats);
+    phase->heap_current_bytes = (uint32_t)stats.allocated_bytes;
+    phase->heap_peak_bytes = (uint32_t)stats.max_allocated_bytes;
 }
 
 static void benchmark_stack_analyzer_cb(struct thread_analyzer_info *info)
@@ -536,6 +583,9 @@ static void benchmark_runtime_report(const char *where)
 #define CLIENT_CERTGEN_SLHDSA_128_DER_CAP 16384
 #define CLIENT_CERTGEN_SLHDSA_192_DER_CAP 28672
 #define CLIENT_CERTGEN_SLHDSA_256_DER_CAP 49152
+#define CLIENT_CERTGEN_SLHDSA_128F_DER_CAP 24576
+#define CLIENT_CERTGEN_SLHDSA_192F_DER_CAP 49152
+#define CLIENT_CERTGEN_SLHDSA_256F_DER_CAP 65536
 #define CLIENT_CERTGEN_SLHDSA_KEY_CAP 4096
 #define CLIENT_CERTGEN_LMS_DER_CAP 8192
 #define CLIENT_CERTGEN_LMS_KEY_CAP 4096
@@ -624,14 +674,29 @@ static const struct client_certgen_algorithm client_certgen_algorithms[] = {
         SLHDSA_SHAKE128S, NULL
     },
     {
+        "SLH-DSA-SHAKE-128f", CLIENT_CERTGEN_KEY_SLHDSA,
+        SLH_DSA_SHAKE_128F_TYPE, CTC_SLH_DSA_SHAKE_128F, 0, 0, 0,
+        SLHDSA_SHAKE128F, NULL
+    },
+    {
         "SLH-DSA-SHAKE-192s", CLIENT_CERTGEN_KEY_SLHDSA,
         SLH_DSA_SHAKE_192S_TYPE, CTC_SLH_DSA_SHAKE_192S, 0, 0, 0,
         SLHDSA_SHAKE192S, NULL
     },
     {
+        "SLH-DSA-SHAKE-192f", CLIENT_CERTGEN_KEY_SLHDSA,
+        SLH_DSA_SHAKE_192F_TYPE, CTC_SLH_DSA_SHAKE_192F, 0, 0, 0,
+        SLHDSA_SHAKE192F, NULL
+    },
+    {
         "SLH-DSA-SHAKE-256s", CLIENT_CERTGEN_KEY_SLHDSA,
         SLH_DSA_SHAKE_256S_TYPE, CTC_SLH_DSA_SHAKE_256S, 0, 0, 0,
         SLHDSA_SHAKE256S, NULL
+    },
+    {
+        "SLH-DSA-SHAKE-256f", CLIENT_CERTGEN_KEY_SLHDSA,
+        SLH_DSA_SHAKE_256F_TYPE, CTC_SLH_DSA_SHAKE_256F, 0, 0, 0,
+        SLHDSA_SHAKE256F, NULL
     },
     {
         "XMSS-SHA2_20_256", CLIENT_CERTGEN_KEY_XMSS, XMSS_TYPE,
@@ -689,6 +754,12 @@ static word32 client_certgen_cert_der_cap(
             return CLIENT_CERTGEN_MLDSA_65_DER_CAP;
         return CLIENT_CERTGEN_MLDSA_87_DER_CAP;
     case CLIENT_CERTGEN_KEY_SLHDSA:
+        if (alg->slhdsa_param == SLHDSA_SHAKE128F)
+            return CLIENT_CERTGEN_SLHDSA_128F_DER_CAP;
+        if (alg->slhdsa_param == SLHDSA_SHAKE192F)
+            return CLIENT_CERTGEN_SLHDSA_192F_DER_CAP;
+        if (alg->slhdsa_param == SLHDSA_SHAKE256F)
+            return CLIENT_CERTGEN_SLHDSA_256F_DER_CAP;
         if (alg->slhdsa_param == SLHDSA_SHAKE128S)
             return CLIENT_CERTGEN_SLHDSA_128_DER_CAP;
         if (alg->slhdsa_param == SLHDSA_SHAKE192S)
@@ -952,8 +1023,12 @@ static void benchmark_client_certgen(void)
     uint64_t client_cpu_cycles = 0;
     uint64_t client_cpu_us = 0;
     uint64_t phase_cpu_total_us = 0;
+    uint64_t phase_core_total_cycles = 0;
     uint64_t phase_lsu_total_cycles = 0;
     uint64_t phase_cpi_total_cycles = 0;
+    uint64_t phase_exc_total_cycles = 0;
+    uint64_t phase_sleep_total_cycles = 0;
+    uint64_t phase_fold_total_events = 0;
     uint32_t phase_dwt_samples = 0;
     bool dwt_supported = false;
     bool dwt_wrap_risk = false;
@@ -1136,12 +1211,24 @@ static void benchmark_client_certgen(void)
     client_cpu_us = k_cyc_to_us_floor64(client_cpu_cycles);
     phase_cpu_total_us = keygen_phase.us + make_cert_phase.us +
         sign_cert_phase.us + parse_cert_phase.us + key_export_phase.us;
+    phase_core_total_cycles = keygen_phase.dwt_core_cycles +
+        make_cert_phase.dwt_core_cycles + sign_cert_phase.dwt_core_cycles +
+        parse_cert_phase.dwt_core_cycles + key_export_phase.dwt_core_cycles;
     phase_lsu_total_cycles = keygen_phase.dwt_lsu_cycles +
         make_cert_phase.dwt_lsu_cycles + sign_cert_phase.dwt_lsu_cycles +
         parse_cert_phase.dwt_lsu_cycles + key_export_phase.dwt_lsu_cycles;
     phase_cpi_total_cycles = keygen_phase.dwt_cpi_cycles +
         make_cert_phase.dwt_cpi_cycles + sign_cert_phase.dwt_cpi_cycles +
         parse_cert_phase.dwt_cpi_cycles + key_export_phase.dwt_cpi_cycles;
+    phase_exc_total_cycles = keygen_phase.dwt_exc_cycles +
+        make_cert_phase.dwt_exc_cycles + sign_cert_phase.dwt_exc_cycles +
+        parse_cert_phase.dwt_exc_cycles + key_export_phase.dwt_exc_cycles;
+    phase_sleep_total_cycles = keygen_phase.dwt_sleep_cycles +
+        make_cert_phase.dwt_sleep_cycles + sign_cert_phase.dwt_sleep_cycles +
+        parse_cert_phase.dwt_sleep_cycles + key_export_phase.dwt_sleep_cycles;
+    phase_fold_total_events = keygen_phase.dwt_fold_events +
+        make_cert_phase.dwt_fold_events + sign_cert_phase.dwt_fold_events +
+        parse_cert_phase.dwt_fold_events + key_export_phase.dwt_fold_events;
     phase_dwt_samples = keygen_phase.dwt_samples + make_cert_phase.dwt_samples +
         sign_cert_phase.dwt_samples + parse_cert_phase.dwt_samples +
         key_export_phase.dwt_samples;
@@ -1192,16 +1279,29 @@ static void benchmark_client_certgen(void)
         "keygen_heap_peak_bytes=%u make_cert_heap_peak_bytes=%u "
         "sign_cert_heap_peak_bytes=%u parse_cert_heap_peak_bytes=%u "
         "key_export_heap_peak_bytes=%u "
+        "keygen_core_cycles=%llu make_cert_core_cycles=%llu "
+        "sign_cert_core_cycles=%llu parse_cert_core_cycles=%llu "
+        "key_export_core_cycles=%llu phase_core_total_cycles=%llu "
         "keygen_lsu_cycles=%llu make_cert_lsu_cycles=%llu "
         "sign_cert_lsu_cycles=%llu parse_cert_lsu_cycles=%llu "
         "key_export_lsu_cycles=%llu phase_lsu_total_cycles=%llu "
         "keygen_cpi_cycles=%llu make_cert_cpi_cycles=%llu "
         "sign_cert_cpi_cycles=%llu parse_cert_cpi_cycles=%llu "
         "key_export_cpi_cycles=%llu phase_cpi_total_cycles=%llu "
+        "keygen_exc_cycles=%llu make_cert_exc_cycles=%llu "
+        "sign_cert_exc_cycles=%llu parse_cert_exc_cycles=%llu "
+        "key_export_exc_cycles=%llu phase_exc_total_cycles=%llu "
+        "keygen_sleep_cycles=%llu make_cert_sleep_cycles=%llu "
+        "sign_cert_sleep_cycles=%llu parse_cert_sleep_cycles=%llu "
+        "key_export_sleep_cycles=%llu phase_sleep_total_cycles=%llu "
+        "keygen_fold_events=%llu make_cert_fold_events=%llu "
+        "sign_cert_fold_events=%llu parse_cert_fold_events=%llu "
+        "key_export_fold_events=%llu phase_fold_total_events=%llu "
         "phase_dwt_samples=%u dwt_counters_supported=%u "
         "dwt_wrap_risk=%u "
         "client_heap_current_bytes=%u client_heap_peak_bytes=%u "
         "client_heap_free_bytes=%u client_heap_capacity_bytes=%u "
+        "firmware_static_ram_used_bytes=%u firmware_ram_capacity_bytes=%u "
         "thread_stack_used_bytes=%llu thread_stack_capacity_bytes=%llu "
         "thread_stack_peak_percent_bp=%u client_cert_der_bytes=%d "
         "client_key_der_bytes=%d client_cert_der_capacity_bytes=%u "
@@ -1243,17 +1343,31 @@ static void benchmark_client_certgen(void)
         keygen_phase.heap_peak_bytes, make_cert_phase.heap_peak_bytes,
         sign_cert_phase.heap_peak_bytes, parse_cert_phase.heap_peak_bytes,
         key_export_phase.heap_peak_bytes,
+        keygen_phase.dwt_core_cycles, make_cert_phase.dwt_core_cycles,
+        sign_cert_phase.dwt_core_cycles, parse_cert_phase.dwt_core_cycles,
+        key_export_phase.dwt_core_cycles, phase_core_total_cycles,
         keygen_phase.dwt_lsu_cycles, make_cert_phase.dwt_lsu_cycles,
         sign_cert_phase.dwt_lsu_cycles, parse_cert_phase.dwt_lsu_cycles,
         key_export_phase.dwt_lsu_cycles, phase_lsu_total_cycles,
         keygen_phase.dwt_cpi_cycles, make_cert_phase.dwt_cpi_cycles,
         sign_cert_phase.dwt_cpi_cycles, parse_cert_phase.dwt_cpi_cycles,
         key_export_phase.dwt_cpi_cycles, phase_cpi_total_cycles,
+        keygen_phase.dwt_exc_cycles, make_cert_phase.dwt_exc_cycles,
+        sign_cert_phase.dwt_exc_cycles, parse_cert_phase.dwt_exc_cycles,
+        key_export_phase.dwt_exc_cycles, phase_exc_total_cycles,
+        keygen_phase.dwt_sleep_cycles, make_cert_phase.dwt_sleep_cycles,
+        sign_cert_phase.dwt_sleep_cycles, parse_cert_phase.dwt_sleep_cycles,
+        key_export_phase.dwt_sleep_cycles, phase_sleep_total_cycles,
+        keygen_phase.dwt_fold_events, make_cert_phase.dwt_fold_events,
+        sign_cert_phase.dwt_fold_events, parse_cert_phase.dwt_fold_events,
+        key_export_phase.dwt_fold_events, phase_fold_total_events,
         phase_dwt_samples, dwt_supported ? 1U : 0U,
         dwt_wrap_risk ? 1U : 0U,
         (unsigned int)stats.allocated_bytes,
         (unsigned int)stats.max_allocated_bytes,
         (unsigned int)stats.free_bytes, WOLFSSL_HEAP_SIZE,
+        (unsigned int)(uintptr_t)_image_ram_size,
+        (unsigned int)(CONFIG_SRAM_SIZE * 1024U),
         stacks.used_bytes, stacks.capacity_bytes, stacks.peak_percent_bp,
         cert_der_sz, key_der_sz, cert_der_cap, key_der_cap, hbs_state_cap);
 
@@ -1311,6 +1425,7 @@ RING_BUF_DECLARE(rx_ringbuf, TLS_RX_RINGBUF_SIZE);
 K_SEM_DEFINE(rx_sem, 0, 1);
 K_SEM_DEFINE(l2cap_connected_sem, 0, 1);
 K_SEM_DEFINE(conn_params_ready_sem, 0, 1);
+K_SEM_DEFINE(l2cap_tx_sent_sem, 0, 1);
 
 /* --- WOLFSSL TIME HOOKS --- */
 time_t time_sec(time_t *timer) {
@@ -1367,8 +1482,8 @@ static void update_led(bool on)
  * truncated/stalled after the second chunk; Mosquitto then waits forever for
  * the rest of the TLS record and the board only sees WANT_READ until timeout.
  */
-NET_BUF_POOL_DEFINE(l2cap_tx_pool, 5, BT_L2CAP_BUF_SIZE(L2CAP_SDU_MTU), 8, NULL);
-NET_BUF_POOL_DEFINE(l2cap_rx_pool, 8, BT_L2CAP_BUF_SIZE(L2CAP_SDU_MTU), 8, NULL);
+NET_BUF_POOL_DEFINE(l2cap_tx_pool, 5, BT_L2CAP_SDU_BUF_SIZE(L2CAP_SDU_MTU), 8, NULL);
+NET_BUF_POOL_DEFINE(l2cap_rx_pool, 8, BT_L2CAP_SDU_BUF_SIZE(L2CAP_SDU_MTU), 8, NULL);
 
 static struct bt_l2cap_le_chan l2cap_chan;
 static volatile bool l2cap_rx_overflow;
@@ -1464,15 +1579,22 @@ static void l2cap_connected(struct bt_l2cap_chan *chan) {
     l2cap_rx_overflow = false;
     disconnect_requested = false;
     l2cap_connected_ms = k_uptime_get();
+    k_sem_reset(&l2cap_tx_sent_sem);
 
     BENCH_LOG("[L2CAP] Channel connected. RX MTU=%u TX MTU=%u\n",
            le_chan->rx.mtu, le_chan->tx.mtu);
     k_sem_give(&l2cap_connected_sem);
 }
 
+static void l2cap_sent(struct bt_l2cap_chan *chan)
+{
+    k_sem_give(&l2cap_tx_sent_sem);
+}
+
 static void l2cap_disconnected(struct bt_l2cap_chan *chan) {
     BENCH_LOG("[L2CAP] Disconnected.\n");
     l2cap_peer_disconnected = true;
+    k_sem_give(&l2cap_tx_sent_sem);
     k_sem_give(&rx_sem); /* Wake up any waiting read operations to fail gracefully */
 }
 
@@ -1480,6 +1602,7 @@ static struct bt_l2cap_chan_ops l2cap_ops = {
     .alloc_buf = l2cap_alloc_buf,
     .connected = l2cap_connected,
     .recv = l2cap_recv,
+    .sent = l2cap_sent,
     .disconnected = l2cap_disconnected,
 };
 
@@ -1613,6 +1736,13 @@ int l2cap_wolfssl_send(WOLFSSL* ssl, char* buf, int sz, void* ctx) {
             }
             
         } while (err == -EAGAIN || err == -ENOMEM);
+
+        if (k_sem_take(&l2cap_tx_sent_sem, K_SECONDS(2)) != 0) {
+            SEND_RETURN(sent > 0 ? sent : WOLFSSL_CBIO_ERR_GENERAL);
+        }
+        if (!chan || !chan->conn || l2cap_peer_disconnected) {
+            SEND_RETURN(sent > 0 ? sent : WOLFSSL_CBIO_ERR_CONN_CLOSE);
+        }
 
         benchmark_l2cap_tx(chunk);
         sent += chunk;
@@ -1884,7 +2014,7 @@ void start_secure_mqtt_session(struct bt_l2cap_chan *chan)
     }
 
     unsigned char rx_buf[128];
-    int64_t mqtt_deadline_ms = mqtt_start_ms + 30000;
+    int64_t mqtt_deadline_ms = mqtt_start_ms + 900000;
     while (chan->conn && k_uptime_get() < mqtt_deadline_ms) {
         int bytes_read = wolfSSL_read(ssl, rx_buf, sizeof(rx_buf));
         if (bytes_read >= 4 && rx_buf[0] == 0x20 && rx_buf[1] == 0x02) {
@@ -1911,10 +2041,18 @@ void start_secure_mqtt_session(struct bt_l2cap_chan *chan)
                 "system_cpu_usage_bp=%u "
                 "tls_setup_cpu_us=%llu tls_handshake_cpu_us=%llu "
                 "mqtt_connect_cpu_us=%llu "
+                "tls_setup_core_cycles=%llu tls_handshake_core_cycles=%llu "
+                "mqtt_connect_core_cycles=%llu "
                 "tls_setup_lsu_cycles=%llu tls_handshake_lsu_cycles=%llu "
                 "mqtt_connect_lsu_cycles=%llu "
                 "tls_setup_cpi_cycles=%llu tls_handshake_cpi_cycles=%llu "
                 "mqtt_connect_cpi_cycles=%llu "
+                "tls_setup_exc_cycles=%llu tls_handshake_exc_cycles=%llu "
+                "mqtt_connect_exc_cycles=%llu "
+                "tls_setup_sleep_cycles=%llu tls_handshake_sleep_cycles=%llu "
+                "mqtt_connect_sleep_cycles=%llu "
+                "tls_setup_fold_events=%llu tls_handshake_fold_events=%llu "
+                "mqtt_connect_fold_events=%llu "
                 "tls_setup_heap_peak_bytes=%u tls_handshake_heap_peak_bytes=%u "
                 "mqtt_connect_heap_peak_bytes=%u "
                 "tls_setup_thread_main_cpu_bp=%u "
@@ -1953,12 +2091,24 @@ void start_secure_mqtt_session(struct bt_l2cap_chan *chan)
                 client_cpu_usage_bp, system_cpu_usage_bp,
                 tls_setup_phase.us, tls_handshake_phase.us,
                 mqtt_connect_phase.us,
+                tls_setup_phase.dwt_core_cycles,
+                tls_handshake_phase.dwt_core_cycles,
+                mqtt_connect_phase.dwt_core_cycles,
                 tls_setup_phase.dwt_lsu_cycles,
                 tls_handshake_phase.dwt_lsu_cycles,
                 mqtt_connect_phase.dwt_lsu_cycles,
                 tls_setup_phase.dwt_cpi_cycles,
                 tls_handshake_phase.dwt_cpi_cycles,
                 mqtt_connect_phase.dwt_cpi_cycles,
+                tls_setup_phase.dwt_exc_cycles,
+                tls_handshake_phase.dwt_exc_cycles,
+                mqtt_connect_phase.dwt_exc_cycles,
+                tls_setup_phase.dwt_sleep_cycles,
+                tls_handshake_phase.dwt_sleep_cycles,
+                mqtt_connect_phase.dwt_sleep_cycles,
+                tls_setup_phase.dwt_fold_events,
+                tls_handshake_phase.dwt_fold_events,
+                mqtt_connect_phase.dwt_fold_events,
                 tls_setup_phase.heap_peak_bytes,
                 tls_handshake_phase.heap_peak_bytes,
                 mqtt_connect_phase.heap_peak_bytes,
@@ -2141,11 +2291,13 @@ int main(void) {
         
         BENCH_LOG("Session ended. Re-arming for next connection...\n");
 
-        /*
-         * Close the ACL before any reboot. Resetting the nRF controller while
-         * BlueZ still owns an LE CoC can leave stale credits behind for the
-         * next large TLS flight.
-         */
+#if BENCH_REBOOT_AFTER_SESSION
+        BENCH_OUT("[BENCH_RECOVERY] reason=session_complete action=reboot\n");
+        k_msleep(100);
+        sys_reboot(SYS_REBOOT_COLD);
+#endif
+
+        /* Non-reboot builds must close the ACL before advertising again. */
         struct bt_conn *conn_to_disconnect =
             active_conn != NULL ? bt_conn_ref(active_conn) : NULL;
         if (conn_to_disconnect != NULL && !acl_peer_disconnected) {
@@ -2163,12 +2315,6 @@ int main(void) {
                k_uptime_get() < disconnect_deadline) {
             k_sleep(K_MSEC(100));
         }
-
-#if BENCH_REBOOT_AFTER_SESSION
-        BENCH_OUT("[BENCH_RECOVERY] reason=session_complete action=reboot\n");
-        k_msleep(100);
-        sys_reboot(SYS_REBOOT_COLD);
-#endif
 
         if (!acl_peer_disconnected) {
             BENCH_OUT("[BENCH_RECOVERY] reason=disconnect_timeout action=reboot\n");

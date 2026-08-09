@@ -15,6 +15,7 @@ class PiGateway:
         self.ssh_key = ssh_key
         self.control_path = f"/tmp/peripheral-bench-ssh-{os.getpid()}"
         self.ble_addr = ""
+        self.active_case_id = ""
 
     def ssh_base(self) -> list[str]:
         command = [
@@ -95,6 +96,11 @@ class PiGateway:
             log,
         )
         self.deploy_file(
+            bridge_source.parent / "pi_perf_counter.c",
+            f"{self.workdir}/bin/pi_perf_counter.c",
+            log,
+        )
+        self.deploy_file(
             wolfssl_server_source,
             f"{self.workdir}/bin/wolfssl_tls_server.c",
             log,
@@ -104,6 +110,27 @@ class PiGateway:
             f"{self.workdir}/bin/setup_pi_wolfssl.sh",
             log,
         )
+        self.deploy_file(
+            wolfssl_server_source.parent / "setup_pi_mosquitto.sh",
+            f"{self.workdir}/bin/setup_pi_mosquitto.sh",
+            log,
+        )
+        self.deploy_file(
+            wolfssl_server_source.parent / "pi_perf_metrics.sh",
+            f"{self.workdir}/bin/pi_perf_metrics.sh",
+            log,
+        )
+        mosquitto_archive = (
+            wolfssl_server_source.parent.parent
+            / "work"
+            / "mosquitto-2.0.21-source.tar.gz"
+        )
+        if mosquitto_archive.exists():
+            self.deploy_file(
+                mosquitto_archive,
+                f"{self.workdir}/deps/mosquitto-source.tar.gz",
+                log,
+            )
         if wolfssl_source_dir is not None and wolfssl_source_dir.exists():
             remote_archive = f"{self.workdir}/deps/wolfssl/wolfssl-clean-source.tar.gz"
             if wolfssl_source_dir.is_file():
@@ -117,6 +144,8 @@ class PiGateway:
             f"cd {shlex.quote(self.workdir)} && "
             "gcc -O2 -Wall -Wextra -o bin/ble_mqtt_bridge "
             "bin/ble_mqtt_bridge.c $(pkg-config --cflags --libs bluez) && "
+            "gcc -O2 -Wall -Wextra -o bin/pi_perf_counter "
+            "bin/pi_perf_counter.c && "
             "gcc -O2 -Wall -Wextra -shared -fPIC "
             "-o bin/server_crypto_metrics.so bin/server_crypto_metrics.c "
             "-ldl -lcrypto",
@@ -137,11 +166,23 @@ class PiGateway:
         )
         self.command(
             f"cd {shlex.quote(self.workdir)} && "
+            "chmod +x bin/pi_perf_metrics.sh && "
+            "./bin/pi_perf_metrics.sh setup \"$PWD\" && "
+            "cat logs/pi_hardware.log && "
+            "chmod +x bin/setup_pi_mosquitto.sh && "
+            "./bin/setup_pi_mosquitto.sh deps/mosquitto "
+            "deps/mosquitto-source.tar.gz && "
+            "test -x deps/mosquitto/bin/mosquitto",
+            log,
+        )
+        self.command(
+            f"cd {shlex.quote(self.workdir)} && "
             "chmod +x bin/setup_pi_wolfssl.sh && "
             "./bin/setup_pi_wolfssl.sh deps/wolfssl && "
             "export PKG_CONFIG_PATH=\"$PWD/deps/wolfssl/lib/pkgconfig\" && "
             "pkg-config --exists wolfssl && "
-            "gcc -O2 -Wall -Wextra -DWOLFSSL_HAVE_XMSS "
+            "gcc -O2 -Wall -Wextra "
+            "-DWOLFSSL_HAVE_LMS -DWOLFSSL_HAVE_XMSS "
             "  -o bin/wolfssl_tls_server bin/wolfssl_tls_server.c "
             "  $(pkg-config --cflags --libs wolfssl) "
             "  -Wl,-rpath,\"$PWD/deps/wolfssl/lib\" && "
@@ -164,8 +205,57 @@ class PiGateway:
         return remote
 
     def stop_session(self, log: Path, *, reset_adapter: bool = False) -> None:
+        metrics_command = ""
+        if self.active_case_id:
+            broker_log = f"{self.workdir}/logs/{self.active_case_id}.broker.log"
+            gateway_log = f"{self.workdir}/logs/{self.active_case_id}.gateway.log"
+            metrics_command = (
+                f"{shlex.quote(self.workdir)}/bin/pi_perf_metrics.sh stop "
+                f"{shlex.quote(self.workdir)} {shlex.quote(self.active_case_id)} "
+                "pi_broker; "
+                f"{shlex.quote(self.workdir)}/bin/pi_perf_metrics.sh stop "
+                f"{shlex.quote(self.workdir)} {shlex.quote(self.active_case_id)} "
+                "pi_bridge; "
+                "collect_proc_metrics() { "
+                "pid=\"$1\"; out=\"$2\"; tag=\"$3\"; prefix=\"$4\"; "
+                "[ -n \"$pid\" ] && [ -r \"/proc/$pid/stat\" ] || return 0; "
+                "stat_line=$(cat \"/proc/$pid/stat\" 2>/dev/null || true); "
+                "status_file=\"/proc/$pid/status\"; io_file=\"/proc/$pid/io\"; "
+                "minflt=$(printf '%s\\n' \"$stat_line\" | awk '{print $10}'); "
+                "majflt=$(printf '%s\\n' \"$stat_line\" | awk '{print $12}'); "
+                "utime=$(printf '%s\\n' \"$stat_line\" | awk '{print $14}'); "
+                "stime=$(printf '%s\\n' \"$stat_line\" | awk '{print $15}'); "
+                "threads=$(printf '%s\\n' \"$stat_line\" | awk '{print $20}'); "
+                "vmrss=$(awk '/^VmRSS:/ {print $2}' \"$status_file\" 2>/dev/null || true); "
+                "vmhwm=$(awk '/^VmHWM:/ {print $2}' \"$status_file\" 2>/dev/null || true); "
+                "vol=$(awk '/^voluntary_ctxt_switches:/ {print $2}' \"$status_file\" 2>/dev/null || true); "
+                "invol=$(awk '/^nonvoluntary_ctxt_switches:/ {print $2}' \"$status_file\" 2>/dev/null || true); "
+                "read_bytes=$(awk '/^read_bytes:/ {print $2}' \"$io_file\" 2>/dev/null || true); "
+                "write_bytes=$(awk '/^write_bytes:/ {print $2}' \"$io_file\" 2>/dev/null || true); "
+                "printf '[BENCH_%s] %s_utime_ticks=%s %s_stime_ticks=%s "
+                "%s_minor_page_faults=%s %s_major_page_faults=%s "
+                "%s_threads=%s %s_vmrss_kb=%s %s_vmhwm_kb=%s "
+                "%s_voluntary_context_switches=%s "
+                "%s_involuntary_context_switches=%s "
+                "%s_read_bytes=%s %s_write_bytes=%s\\n' "
+                "\"$tag\" \"$prefix\" \"$utime\" \"$prefix\" \"$stime\" "
+                "\"$prefix\" \"$minflt\" \"$prefix\" \"$majflt\" "
+                "\"$prefix\" \"$threads\" \"$prefix\" \"$vmrss\" "
+                "\"$prefix\" \"$vmhwm\" \"$prefix\" \"$vol\" "
+                "\"$prefix\" \"$invol\" \"$prefix\" \"$read_bytes\" "
+                "\"$prefix\" \"$write_bytes\" >> \"$out\"; "
+                "}; "
+                f"broker_pid=$(cat {self.workdir}/broker.pid 2>/dev/null || true); "
+                f"bridge_pid=$(cat {self.workdir}/bridge.pid 2>/dev/null || true); "
+                f"collect_proc_metrics \"$broker_pid\" {shlex.quote(broker_log)} SERVER pi_broker; "
+                f"collect_proc_metrics \"$bridge_pid\" {shlex.quote(gateway_log)} GATEWAY pi_bridge; "
+            )
         bridge_pattern = f"^{self.workdir}/bin/ble_mqtt_bridge( |$)"
         broker_pattern = f"^/usr/sbin/mosquitto -c {self.workdir}/cases/"
+        benchmark_mosquitto_pattern = (
+            f"^{self.workdir}/deps/mosquitto/bin/mosquitto "
+            f"-c {self.workdir}/cases/"
+        )
         wolfssl_pattern = f"^{self.workdir}/bin/wolfssl_tls_server( |$)"
         reset_command = ""
         disconnect_command = ""
@@ -195,6 +285,7 @@ class PiGateway:
                 ">/dev/null 2>&1 || true; sleep 1; "
             )
         self.command(
+            f"{metrics_command}"
             f"if [ -f {self.workdir}/bridge.pid ]; then "
             f"  pid=$(cat {self.workdir}/bridge.pid); "
             "  kill -TERM -- \"-$pid\" \"$pid\" 2>/dev/null || true; "
@@ -214,6 +305,8 @@ class PiGateway:
             "    sudo -n kill -KILL $pids 2>/dev/null || true; "
             f"pids=$(pgrep -f {shlex.quote(broker_pattern)} || true); "
             "  [ -z \"$pids\" ] || kill -KILL $pids 2>/dev/null || true; "
+            f"pids=$(pgrep -f {shlex.quote(benchmark_mosquitto_pattern)} || true); "
+            "  [ -z \"$pids\" ] || kill -KILL $pids 2>/dev/null || true; "
             f"pids=$(pgrep -f {shlex.quote(wolfssl_pattern)} || true); "
             "  [ -z \"$pids\" ] || kill -KILL $pids 2>/dev/null || true; "
             f"{disconnect_command}"
@@ -221,6 +314,7 @@ class PiGateway:
             log,
             check=False,
         )
+        self.active_case_id = ""
 
     def start_session(
         self,
@@ -241,6 +335,7 @@ class PiGateway:
     ) -> None:
         self.stop_session(log, reset_adapter=disable_wifi)
         self.ble_addr = ble_addr
+        self.active_case_id = case_id
         supervision_timeout_path = (
             f"/sys/kernel/debug/bluetooth/{adapter}/supervision_timeout"
         )
@@ -275,7 +370,8 @@ class PiGateway:
         else:
             server_command = (
                 f"setsid env OPENSSL_CONF={remote_case_dir}/openssl.cnf "
-                f"/usr/sbin/mosquitto -c {remote_case_dir}/mosquitto.conf -v "
+                f"{shlex.quote(self.workdir)}/deps/mosquitto/bin/mosquitto "
+                f"-c {remote_case_dir}/mosquitto.conf -v "
                 f"> {broker_log} 2>&1 < /dev/null & "
                 f"echo $! > {self.workdir}/broker.pid"
             )
@@ -284,8 +380,14 @@ class PiGateway:
             f"LD_PRELOAD={self.workdir}/bin/server_crypto_metrics.so "
             f"{server_command}; "
             "sleep 1; "
-            f"kill -0 $(cat {self.workdir}/broker.pid) 2>/dev/null; "
-            f"{bridge_command}"
+            f"kill -0 $(cat {self.workdir}/broker.pid) 2>/dev/null || exit 1; "
+            f"{bridge_command}; "
+            f"{shlex.quote(self.workdir)}/bin/pi_perf_metrics.sh start "
+            f"{shlex.quote(self.workdir)} {shlex.quote(case_id)} "
+            f"pi_broker $(cat {self.workdir}/broker.pid); "
+            f"{shlex.quote(self.workdir)}/bin/pi_perf_metrics.sh start "
+            f"{shlex.quote(self.workdir)} {shlex.quote(case_id)} "
+            f"pi_bridge $(cat {self.workdir}/bridge.pid)"
         )
         self.command(script, log)
         checks = max(1, int(ready_timeout * 4))

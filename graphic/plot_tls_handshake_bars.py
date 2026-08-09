@@ -35,6 +35,30 @@ HEATMAP_CMAP = LinearSegmentedColormap.from_list(
     "benchmark_green_to_red",
     ("#15803d", "#facc15", "#b91c1c"),
 )
+TLS_PHASES = ("tls_setup", "tls_handshake", "mqtt_connect")
+TLS_DWT_METRICS = (
+    ("lsu", "LSUCNT", "cycles"),
+    ("cpi", "CPICNT", "cycles"),
+    ("exc", "EXCCNT", "cycles"),
+    ("sleep", "SLEEPCNT", "cycles"),
+    ("fold", "FOLDCNT", "events"),
+)
+PI_PROCESS_PREFIXES = ("pi_broker", "pi_bridge")
+PI_PROCESS_METRICS = (
+    "utime_ticks", "stime_ticks", "minor_page_faults", "major_page_faults",
+    "threads", "vmrss_kb", "vmhwm_kb", "voluntary_context_switches",
+    "involuntary_context_switches", "read_bytes", "write_bytes",
+    "perf_available", "perf_metrics_collected", "perf_task_clock_ms",
+    "perf_cpu_clock_ms", "perf_cycles", "perf_instructions",
+    "perf_cache_references", "perf_cache_misses",
+    "perf_branch_instructions", "perf_branch_misses",
+    "perf_stalled_cycles_frontend", "perf_stalled_cycles_backend",
+    "perf_l1_dcache_loads", "perf_l1_dcache_load_misses",
+    "perf_l1_icache_load_misses", "perf_dtlb_load_misses",
+    "perf_itlb_load_misses", "perf_crypto_spec", "perf_simd_spec",
+    "perf_context_switches", "perf_cpu_migrations", "perf_minor_faults",
+    "perf_major_faults",
+)
 T_CRITICAL_95 = (
     0.0,
     12.706, 4.303, 3.182, 2.776, 2.571, 2.447, 2.365, 2.306, 2.262,
@@ -277,31 +301,41 @@ def load_from_attempts(run_dir: Path) -> list[dict[str, str]]:
             )
 
         stddev = statistics.stdev(values) if len(values) > 1 else 0.0
-        rows.append(
-            {
-                "case_id": attempts_csv.parent.name.split("_", 1)[-1],
-                "kex_group": first.get("kex_group", ""),
-                "kex_nist_level": first.get("kex_nist_level", ""),
-                "cert_sig_alg": first.get("cert_sig_alg", ""),
-                "sig_nist_level": first.get("sig_nist_level", ""),
-                "mean_handshake_ms": f"{statistics.mean(values):.3f}",
-                "stddev_raw_handshake_ms": f"{stddev:.3f}",
-                "success_count": str(len(successes)),
-                "mean_kem_client_total_ms": attempt_mean(
-                    "kem_client_total_ms"
-                ),
-                "mean_client_signature_total_ms": attempt_mean(
-                    "client_signature_total_ms"
-                ),
-                "mean_communication_overhead_ms": attempt_mean(
-                    "communication_overhead_ms"
-                ),
-                "mean_client_cpu_ms": attempt_mean("client_cpu_ms"),
-                "mean_client_icache_hit_percent": attempt_mean(
-                    "client_icache_hit_percent"
-                ),
-            }
-        )
+        row = {
+            "case_id": attempts_csv.parent.name.split("_", 1)[-1],
+            "kex_group": first.get("kex_group", ""),
+            "kex_nist_level": first.get("kex_nist_level", ""),
+            "cert_sig_alg": first.get("cert_sig_alg", ""),
+            "sig_nist_level": first.get("sig_nist_level", ""),
+            "mean_handshake_ms": f"{statistics.mean(values):.3f}",
+            "stddev_raw_handshake_ms": f"{stddev:.3f}",
+            "success_count": str(len(successes)),
+            "mean_kem_client_total_ms": attempt_mean("kem_client_total_ms"),
+            "mean_client_signature_total_ms": attempt_mean(
+                "client_signature_total_ms"
+            ),
+            "mean_communication_overhead_ms": attempt_mean(
+                "communication_overhead_ms"
+            ),
+            "mean_client_cpu_ms": attempt_mean("client_cpu_ms"),
+            "mean_client_icache_hit_percent": attempt_mean(
+                "client_icache_hit_percent"
+            ),
+        }
+        for phase in TLS_PHASES:
+            row[f"mean_{phase}_core_cycles"] = attempt_mean(
+                f"{phase}_core_cycles"
+            )
+            for counter, _label, suffix in TLS_DWT_METRICS:
+                row[f"mean_{phase}_{counter}_{suffix}"] = attempt_mean(
+                    f"{phase}_{counter}_{suffix}"
+                )
+        for prefix in PI_PROCESS_PREFIXES:
+            for metric in PI_PROCESS_METRICS:
+                row[f"mean_{prefix}_{metric}"] = attempt_mean(
+                    f"{prefix}_{metric}"
+                )
+        rows.append(row)
     return rows
 
 
@@ -348,13 +382,120 @@ def add_attempt_cpu_peaks(rows: list[dict[str, str]], run_dir: Path) -> None:
             )
 
 
+def add_derived_hardware_metrics(rows: list[dict[str, str]]) -> None:
+    for row in rows:
+        for phase in TLS_PHASES:
+            core = float_or_none(row.get(f"mean_{phase}_core_cycles"))
+            if core and core > 0:
+                for counter, _label, suffix in TLS_DWT_METRICS:
+                    value = float_or_none(row.get(f"mean_{phase}_{counter}_{suffix}"))
+                    if value is not None:
+                        row[f"mean_{phase}_{counter}_per_core_percent"] = (
+                            f"{100.0 * value / core:.6f}"
+                        )
+        for prefix in PI_PROCESS_PREFIXES:
+            utime = float_or_none(row.get(f"mean_{prefix}_utime_ticks"))
+            stime = float_or_none(row.get(f"mean_{prefix}_stime_ticks"))
+            if utime is not None or stime is not None:
+                row[f"mean_{prefix}_cpu_ticks"] = (
+                    f"{(utime or 0.0) + (stime or 0.0):.3f}"
+                )
+            voluntary = float_or_none(
+                row.get(f"mean_{prefix}_voluntary_context_switches")
+            )
+            involuntary = float_or_none(
+                row.get(f"mean_{prefix}_involuntary_context_switches")
+            )
+            if voluntary is not None or involuntary is not None:
+                row[f"mean_{prefix}_context_switches"] = (
+                    f"{(voluntary or 0.0) + (involuntary or 0.0):.3f}"
+                )
+            minor = float_or_none(row.get(f"mean_{prefix}_minor_page_faults"))
+            major = float_or_none(row.get(f"mean_{prefix}_major_page_faults"))
+            if minor is not None or major is not None:
+                row[f"mean_{prefix}_page_faults"] = (
+                    f"{(minor or 0.0) + (major or 0.0):.3f}"
+                )
+            read_bytes = float_or_none(row.get(f"mean_{prefix}_read_bytes"))
+            write_bytes = float_or_none(row.get(f"mean_{prefix}_write_bytes"))
+            if read_bytes is not None or write_bytes is not None:
+                row[f"mean_{prefix}_io_bytes"] = (
+                    f"{(read_bytes or 0.0) + (write_bytes or 0.0):.3f}"
+                )
+            cycles = float_or_none(row.get(f"mean_{prefix}_perf_cycles"))
+            instructions = float_or_none(
+                row.get(f"mean_{prefix}_perf_instructions")
+            )
+            if cycles and cycles > 0 and instructions is not None:
+                row[f"mean_{prefix}_perf_ipc"] = (
+                    f"{instructions / cycles:.6f}"
+                )
+                crypto = float_or_none(row.get(f"mean_{prefix}_perf_crypto_spec"))
+                simd = float_or_none(row.get(f"mean_{prefix}_perf_simd_spec"))
+                if crypto is not None and instructions > 0:
+                    row[f"mean_{prefix}_perf_crypto_per_kinstruction"] = (
+                        f"{1000.0 * crypto / instructions:.6f}"
+                    )
+                if simd is not None and instructions > 0:
+                    row[f"mean_{prefix}_perf_simd_per_kinstruction"] = (
+                        f"{1000.0 * simd / instructions:.6f}"
+                    )
+            cache_refs = float_or_none(
+                row.get(f"mean_{prefix}_perf_cache_references")
+            )
+            cache_misses = float_or_none(
+                row.get(f"mean_{prefix}_perf_cache_misses")
+            )
+            if cache_refs and cache_refs > 0 and cache_misses is not None:
+                row[f"mean_{prefix}_perf_cache_miss_percent"] = (
+                    f"{100.0 * cache_misses / cache_refs:.6f}"
+                )
+            branches = float_or_none(
+                row.get(f"mean_{prefix}_perf_branch_instructions")
+            )
+            branch_misses = float_or_none(
+                row.get(f"mean_{prefix}_perf_branch_misses")
+            )
+            if branches and branches > 0 and branch_misses is not None:
+                row[f"mean_{prefix}_perf_branch_miss_percent"] = (
+                    f"{100.0 * branch_misses / branches:.6f}"
+                )
+            l1_loads = float_or_none(
+                row.get(f"mean_{prefix}_perf_l1_dcache_loads")
+            )
+            l1_misses = float_or_none(
+                row.get(f"mean_{prefix}_perf_l1_dcache_load_misses")
+            )
+            if l1_loads and l1_loads > 0 and l1_misses is not None:
+                row[f"mean_{prefix}_perf_l1_dcache_load_miss_percent"] = (
+                    f"{100.0 * l1_misses / l1_loads:.6f}"
+                )
+            frontend = float_or_none(
+                row.get(f"mean_{prefix}_perf_stalled_cycles_frontend")
+            )
+            backend = float_or_none(
+                row.get(f"mean_{prefix}_perf_stalled_cycles_backend")
+            )
+            if cycles and cycles > 0:
+                if frontend is not None:
+                    row[f"mean_{prefix}_perf_frontend_stall_percent"] = (
+                        f"{100.0 * frontend / cycles:.6f}"
+                    )
+                if backend is not None:
+                    row[f"mean_{prefix}_perf_backend_stall_percent"] = (
+                        f"{100.0 * backend / cycles:.6f}"
+                    )
+
+
 def load_rows(run_dir: Path) -> list[dict[str, str]]:
     rows = load_from_summary(run_dir / "summary.csv")
     if rows:
         add_attempt_cpu_peaks(rows, run_dir)
+        add_derived_hardware_metrics(rows)
         return rows
     rows = load_from_attempts(run_dir)
     add_attempt_cpu_peaks(rows, run_dir)
+    add_derived_hardware_metrics(rows)
     return rows
 
 
@@ -899,11 +1040,13 @@ def main() -> int:
     )
 
     if args.heatmap:
+        heatmap_count = 0
         plot_heatmap(
             rows,
             out_dir / f"tls_handshake_heatmap.{extension}",
             run_dir.name,
         )
+        heatmap_count += 1
         hardware_heatmaps = (
             (
                 "peak_system_cpu_usage_percent",
@@ -932,6 +1075,8 @@ def main() -> int:
                 out_dir / f"{filename_prefix}.{extension}",
             )
             print(f"{metric}_heatmap_cells={plotted}")
+            if plotted:
+                heatmap_count += 1
         cache_cells = plot_percent_heatmap(
             rows,
             "mean_client_icache_hit_percent",
@@ -940,6 +1085,8 @@ def main() -> int:
             colorbar_label="Mean instruction-cache hit rate (%)",
         )
         print(f"mean_client_icache_hit_percent_heatmap_cells={cache_cells}")
+        if cache_cells:
+            heatmap_count += 1
         heap_bytes_cells = plot_percent_heatmap(
             rows,
             "max_client_heap_peak_bytes",
@@ -952,6 +1099,103 @@ def main() -> int:
             vmax=None,
         )
         print(f"max_client_heap_peak_bytes_heatmap_cells={heap_bytes_cells}")
+        if heap_bytes_cells:
+            heatmap_count += 1
+        for phase in TLS_PHASES:
+            phase_label = phase.replace("_", " ")
+            for counter, label, _suffix in TLS_DWT_METRICS:
+                metric = f"mean_{phase}_{counter}_per_core_percent"
+                cells = plot_percent_heatmap(
+                    rows,
+                    metric,
+                    f"Board {phase_label} {label} / CYCCNT - {run_dir.name}",
+                    out_dir / f"heatmap_{phase}_{counter}_per_core_percent.{extension}",
+                    value_suffix="%",
+                    value_decimals=3,
+                    colorbar_label=f"{label} / CYCCNT (%)",
+                    vmin=0,
+                    vmax=None,
+                )
+                print(f"{metric}_heatmap_cells={cells}")
+                if cells:
+                    heatmap_count += 1
+        pi_heatmaps = (
+            ("cpu_ticks", "CPU ticks", "Mean user + system CPU ticks"),
+            ("context_switches", "context switches", "Mean context switches"),
+            ("page_faults", "page faults", "Mean page faults"),
+            ("vmhwm_kb", "high-water RSS", "Mean VmHWM (KB)"),
+            ("io_bytes", "I/O bytes", "Mean read + write bytes"),
+            ("perf_task_clock_ms", "perf task-clock", "Mean task-clock (ms)"),
+            ("perf_cycles", "perf cycles", "Mean user-space CPU cycles"),
+            (
+                "perf_instructions", "perf instructions",
+                "Mean user-space retired instructions",
+            ),
+            ("perf_ipc", "perf IPC", "Instructions per cycle"),
+            (
+                "perf_cache_miss_percent", "perf cache miss rate",
+                "Cache misses / references (%)",
+            ),
+            (
+                "perf_branch_miss_percent", "perf branch miss rate",
+                "Branch misses / branch instructions (%)",
+            ),
+            (
+                "perf_frontend_stall_percent", "perf frontend stalls",
+                "Frontend stalled cycles / cycles (%)",
+            ),
+            (
+                "perf_backend_stall_percent", "perf backend stalls",
+                "Backend stalled cycles / cycles (%)",
+            ),
+            (
+                "perf_l1_dcache_load_miss_percent",
+                "perf L1D load miss rate",
+                "L1D load misses / loads (%)",
+            ),
+            (
+                "perf_crypto_spec", "perf crypto instructions",
+                "Arm PMU CRYPTO_SPEC events",
+            ),
+            (
+                "perf_crypto_per_kinstruction",
+                "perf crypto instruction density",
+                "CRYPTO_SPEC events per 1000 instructions",
+            ),
+            (
+                "perf_simd_spec", "perf SIMD instructions",
+                "Arm PMU ASE_SPEC events",
+            ),
+            (
+                "perf_simd_per_kinstruction",
+                "perf SIMD instruction density",
+                "ASE_SPEC events per 1000 instructions",
+            ),
+        )
+        for prefix in PI_PROCESS_PREFIXES:
+            process_label = "broker" if prefix == "pi_broker" else "BLE bridge"
+            for metric, title, colorbar_label in pi_heatmaps:
+                field = f"mean_{prefix}_{metric}"
+                is_percent = metric.endswith("_percent")
+                decimals = 3 if (
+                    is_percent
+                    or metric == "perf_ipc"
+                    or metric.endswith("_per_kinstruction")
+                ) else 0
+                cells = plot_percent_heatmap(
+                    rows,
+                    field,
+                    f"Raspberry Pi {process_label} {title} - {run_dir.name}",
+                    out_dir / f"heatmap_{prefix}_{metric}.{extension}",
+                    value_suffix="%" if is_percent else "",
+                    value_decimals=decimals,
+                    colorbar_label=colorbar_label,
+                    vmin=None,
+                    vmax=None,
+                )
+                print(f"{field}_heatmap_cells={cells}")
+                if cells:
+                    heatmap_count += 1
         reconnect_rows = load_reconnect_count_rows(run_dir)
         reconnect_cells = plot_reconnect_count_heatmap(
             reconnect_rows,
@@ -959,7 +1203,9 @@ def main() -> int:
             run_dir.name,
         )
         print(f"reconnect_count_heatmap_cells={reconnect_cells}")
-        print("heatmaps=8")
+        if reconnect_cells:
+            heatmap_count += 1
+        print(f"heatmaps={heatmap_count}")
 
     print(f"rows={len(rows)}")
     print(f"bar_chart_rows={len(plot_rows)}")
