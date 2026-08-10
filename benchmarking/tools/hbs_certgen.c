@@ -1,6 +1,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/resource.h>
+#include <sys/time.h>
+#include <time.h>
 
 #include <wolfssl/options.h>
 #include <wolfssl/ssl.h>
@@ -17,6 +20,55 @@
 #define CERT_NOT_AFTER  "\x18\x0f""20360101000000Z"
 
 static const char* g_state_path = NULL;
+
+struct PhaseSample {
+    struct timespec wall;
+    struct rusage usage;
+};
+
+static long long timeval_us(struct timeval tv)
+{
+    return (long long)tv.tv_sec * 1000000LL + tv.tv_usec;
+}
+
+static long long elapsed_us(struct timespec start, struct timespec end)
+{
+    return (long long)(end.tv_sec - start.tv_sec) * 1000000LL +
+           (end.tv_nsec - start.tv_nsec) / 1000LL;
+}
+
+static void phase_begin(struct PhaseSample* sample)
+{
+    clock_gettime(CLOCK_MONOTONIC, &sample->wall);
+    getrusage(RUSAGE_SELF, &sample->usage);
+}
+
+static void phase_end(const char* name, const struct PhaseSample* start, int status)
+{
+    struct timespec wall;
+    struct rusage usage;
+    long long user_us;
+    long long sys_us;
+
+    clock_gettime(CLOCK_MONOTONIC, &wall);
+    getrusage(RUSAGE_SELF, &usage);
+    user_us = timeval_us(usage.ru_utime) - timeval_us(start->usage.ru_utime);
+    sys_us = timeval_us(usage.ru_stime) - timeval_us(start->usage.ru_stime);
+    printf("[CERT_PHASE] name=%s status=%d wall_us=%lld user_cpu_us=%lld "
+           "sys_cpu_us=%lld cpu_us=%lld max_rss_kb=%ld "
+           "voluntary_context_switches=%ld involuntary_context_switches=%ld "
+           "minor_page_faults=%ld major_page_faults=%ld "
+           "block_input_ops=%ld block_output_ops=%ld\n",
+           name, status, elapsed_us(start->wall, wall), user_us, sys_us,
+           user_us + sys_us, usage.ru_maxrss,
+           usage.ru_nvcsw - start->usage.ru_nvcsw,
+           usage.ru_nivcsw - start->usage.ru_nivcsw,
+           usage.ru_minflt - start->usage.ru_minflt,
+           usage.ru_majflt - start->usage.ru_majflt,
+           usage.ru_inblock - start->usage.ru_inblock,
+           usage.ru_oublock - start->usage.ru_oublock);
+    fflush(stdout);
+}
 
 static int write_file(const char* path, const unsigned char* data, int len)
 {
@@ -213,6 +265,24 @@ static int make_leaf(void* caKey, int caKeyType, int caSigType, WC_RNG* rng,
     return leafSz;
 }
 
+static int verify_leaf(const unsigned char* rootDer, int rootSz,
+    const unsigned char* leafDer, int leafSz)
+{
+    WOLFSSL_CERT_MANAGER* cm;
+    int ret;
+
+    cm = wolfSSL_CertManagerNew();
+    if (cm == NULL)
+        return MEMORY_E;
+    ret = wolfSSL_CertManagerLoadCABuffer(cm, rootDer, rootSz,
+        WOLFSSL_FILETYPE_ASN1);
+    if (ret == WOLFSSL_SUCCESS)
+        ret = wolfSSL_CertManagerVerifyBuffer(cm, leafDer, leafSz,
+            WOLFSSL_FILETYPE_ASN1);
+    wolfSSL_CertManagerFree(cm);
+    return ret == WOLFSSL_SUCCESS ? 0 : ret;
+}
+
 static int generate_lms(const char* outdir, WC_RNG* rng,
     unsigned char* rootDer, int* rootSzOut, unsigned char* leafDer,
     int* leafSzOut, unsigned char* leafKeyDer, int* leafKeySzOut)
@@ -220,34 +290,53 @@ static int generate_lms(const char* outdir, WC_RNG* rng,
     LmsKey key;
     int rootSz;
     int leafSz;
+    int ret = -1;
+    int keyInitialized = 0;
+    struct PhaseSample phase;
 
+    phase_begin(&phase);
     XMEMSET(&key, 0, sizeof(key));
     g_state_path = "/tmp/peripheral-benchmark-lms.key";
     remove(g_state_path);
     if (wc_LmsKey_Init(&key, NULL, INVALID_DEVID) != 0)
-        return -1;
+        goto keygen_done;
+    keyInitialized = 1;
     if (wc_LmsKey_SetParameters(&key, 2, 10, 4) != 0)
-        return -1;
+        goto keygen_done;
     if (wc_LmsKey_SetWriteCb(&key, hbs_write_key) != 0)
-        return -1;
+        goto keygen_done;
     if (wc_LmsKey_SetReadCb(&key, hbs_read_key) != 0)
-        return -1;
+        goto keygen_done;
     if (wc_LmsKey_SetContext(&key, (void*)g_state_path) != 0)
-        return -1;
+        goto keygen_done;
     if (wc_LmsKey_MakeKey(&key, rng) != 0)
-        return -1;
+        goto keygen_done;
+    ret = 0;
 
+keygen_done:
+    phase_end("keygen", &phase, ret);
+    if (ret != 0) {
+        if (keyInitialized)
+            wc_LmsKey_Free(&key);
+        remove(g_state_path);
+        return ret;
+    }
+
+    phase_begin(&phase);
     rootSz = make_root(&key, LMS_TYPE, CTC_HSS_LMS, rng,
         "LMS-HSS-L2-H10-W4 Root", rootDer);
-    if (rootSz <= 0)
-        return rootSz;
-    leafSz = make_leaf(&key, LMS_TYPE, CTC_HSS_LMS, rng, rootDer, rootSz,
-        leafDer, leafKeyDer, leafKeySzOut);
+    ret = rootSz > 0 ? 0 : rootSz;
+    if (ret == 0) {
+        leafSz = make_leaf(&key, LMS_TYPE, CTC_HSS_LMS, rng, rootDer, rootSz,
+            leafDer, leafKeyDer, leafKeySzOut);
+        ret = leafSz > 0 ? 0 : leafSz;
+    }
+    phase_end("sign_cert", &phase, ret);
     wc_LmsKey_Free(&key);
     remove(g_state_path);
     (void)outdir;
-    if (leafSz <= 0)
-        return leafSz;
+    if (ret != 0)
+        return ret;
     *rootSzOut = rootSz;
     *leafSzOut = leafSz;
     return 0;
@@ -260,34 +349,53 @@ static int generate_xmss(const char* outdir, WC_RNG* rng,
     XmssKey key;
     int rootSz;
     int leafSz;
+    int ret = -1;
+    int keyInitialized = 0;
+    struct PhaseSample phase;
 
+    phase_begin(&phase);
     XMEMSET(&key, 0, sizeof(key));
     g_state_path = "/tmp/peripheral-benchmark-xmss.key";
     remove(g_state_path);
     if (wc_XmssKey_Init(&key, NULL, INVALID_DEVID) != 0)
-        return -1;
+        goto keygen_done;
+    keyInitialized = 1;
     if (wc_XmssKey_SetParamStr(&key, "XMSS-SHA2_20_256") != 0)
-        return -1;
+        goto keygen_done;
     if (wc_XmssKey_SetWriteCb(&key, xmss_write_key) != 0)
-        return -1;
+        goto keygen_done;
     if (wc_XmssKey_SetReadCb(&key, xmss_read_key) != 0)
-        return -1;
+        goto keygen_done;
     if (wc_XmssKey_SetContext(&key, (void*)g_state_path) != 0)
-        return -1;
+        goto keygen_done;
     if (wc_XmssKey_MakeKey(&key, rng) != 0)
-        return -1;
+        goto keygen_done;
+    ret = 0;
 
+keygen_done:
+    phase_end("keygen", &phase, ret);
+    if (ret != 0) {
+        if (keyInitialized)
+            wc_XmssKey_Free(&key);
+        remove(g_state_path);
+        return ret;
+    }
+
+    phase_begin(&phase);
     rootSz = make_root(&key, XMSS_TYPE, CTC_XMSS, rng,
         "XMSS-SHA2_20_256 Root", rootDer);
-    if (rootSz <= 0)
-        return rootSz;
-    leafSz = make_leaf(&key, XMSS_TYPE, CTC_XMSS, rng, rootDer, rootSz,
-        leafDer, leafKeyDer, leafKeySzOut);
+    ret = rootSz > 0 ? 0 : rootSz;
+    if (ret == 0) {
+        leafSz = make_leaf(&key, XMSS_TYPE, CTC_XMSS, rng, rootDer, rootSz,
+            leafDer, leafKeyDer, leafKeySzOut);
+        ret = leafSz > 0 ? 0 : leafSz;
+    }
+    phase_end("sign_cert", &phase, ret);
     wc_XmssKey_Free(&key);
     remove(g_state_path);
     (void)outdir;
-    if (leafSz <= 0)
-        return leafSz;
+    if (ret != 0)
+        return ret;
     *rootSzOut = rootSz;
     *leafSzOut = leafSz;
     return 0;
@@ -305,7 +413,9 @@ int main(int argc, char** argv)
     int leafSz = 0;
     int leafKeySz = 0;
     int genRet;
+    int phaseRet;
     int ret = 1;
+    struct PhaseSample phase;
     WC_RNG rng;
 
     if (argc != 3) {
@@ -343,20 +453,30 @@ int main(int argc, char** argv)
     }
 
     snprintf(path, sizeof(path), "%s/server_root.der", outdir);
-    if (write_file(path, rootDer, rootSz) != 0)
-        goto free_rng;
-    snprintf(path, sizeof(path), "%s/server_root.crt", outdir);
-    if (write_pem_cert(path, rootDer, rootSz) != 0)
+    phaseRet = write_file(path, rootDer, rootSz);
+    if (phaseRet == 0) {
+        snprintf(path, sizeof(path), "%s/server_root.crt", outdir);
+        phaseRet = write_pem_cert(path, rootDer, rootSz);
+    }
+    if (phaseRet == 0) {
+        snprintf(path, sizeof(path), "%s/server.crt", outdir);
+        phaseRet = write_pem_cert(path, leafDer, leafSz);
+    }
+    if (phaseRet == 0) {
+        snprintf(path, sizeof(path), "%s/server_chain.crt", outdir);
+        phaseRet = write_pem_cert(path, leafDer, leafSz);
+    }
+    if (phaseRet == 0) {
+        snprintf(path, sizeof(path), "%s/server.key", outdir);
+        phaseRet = write_pem_key(path, leafKeyDer, leafKeySz);
+    }
+    if (phaseRet != 0)
         goto free_rng;
 
-    snprintf(path, sizeof(path), "%s/server.crt", outdir);
-    if (write_pem_cert(path, leafDer, leafSz) != 0)
-        goto free_rng;
-    snprintf(path, sizeof(path), "%s/server_chain.crt", outdir);
-    if (write_pem_cert(path, leafDer, leafSz) != 0)
-        goto free_rng;
-    snprintf(path, sizeof(path), "%s/server.key", outdir);
-    if (write_pem_key(path, leafKeyDer, leafKeySz) != 0)
+    phase_begin(&phase);
+    phaseRet = verify_leaf(rootDer, rootSz, leafDer, leafSz);
+    phase_end("verify_cert", &phase, phaseRet);
+    if (phaseRet != 0)
         goto free_rng;
 
     ret = 0;

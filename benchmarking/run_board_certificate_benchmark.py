@@ -27,17 +27,17 @@ from run_benchmarks import (
 ROOT = Path(__file__).resolve().parent
 RESULTS = ROOT / "results"
 WORK = ROOT / "work"
-SLOW_SIGNATURE_TIMEOUT_SEC = 2000.0
+SLOW_SIGNATURE_TIMEOUT_SEC = 1.0
 SIGNATURE_TIMEOUTS_SEC = {
-    "RSA-PSS-3072": 2400.0,
-    "RSA-PSS-7680": 43200.0,
-    "RSA-PSS-15360": 604800.0,
-    "SLH-DSA-SHAKE-128s": 2400.0,
-    "SLH-DSA-SHAKE-128f": 2400.0,
-    "SLH-DSA-SHAKE-192s": 4200.0,
-    "SLH-DSA-SHAKE-192f": 4200.0,
-    "SLH-DSA-SHAKE-256s": 4200.0,
-    "SLH-DSA-SHAKE-256f": 4200.0,
+    "RSA-PSS-3072": 1.0,
+    "RSA-PSS-7680": 1.0,
+    "RSA-PSS-15360": 1.0,
+    "SLH-DSA-SHAKE-128s": 1.0,
+    "SLH-DSA-SHAKE-128f": 1.0,
+    "SLH-DSA-SHAKE-192s": 1.0,
+    "SLH-DSA-SHAKE-192f": 1.0,
+    "SLH-DSA-SHAKE-256s": 1.0,
+    "SLH-DSA-SHAKE-256f": 1.0,
 }
 PHASES = [
     "keygen", "make_cert", "sign_cert", "parse_cert", "key_export",

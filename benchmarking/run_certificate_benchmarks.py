@@ -52,12 +52,51 @@ SERVER_RESOURCE_METRICS = [
     "minor_page_faults", "major_page_faults",
     "block_input_ops", "block_output_ops",
 ]
+SERVER_PHASES = [
+    ("keygen", "Keygen"),
+    ("sign_cert", "Sign cert"),
+    ("verify_cert", "Verify cert"),
+]
+SERVER_PHASE_TIME_METRICS = [
+    "wall_ms", "cpu_ms", "user_cpu_ms", "sys_cpu_ms",
+]
+SERVER_PHASE_ATTEMPT_FIELDS = [
+    field
+    for phase, _label in SERVER_PHASES
+    for field in (
+        *[
+            f"server_{phase}_{metric}"
+            for metric in SERVER_PHASE_TIME_METRICS
+        ],
+        f"server_{phase}_rss_kb",
+        *[
+            f"server_{phase}_{metric}"
+            for metric in SERVER_RESOURCE_METRICS
+        ],
+    )
+]
+SERVER_PHASE_SUMMARY_FIELDS = [
+    field
+    for phase, _label in SERVER_PHASES
+    for field in (
+        *[
+            f"mean_server_{phase}_{metric}"
+            for metric in SERVER_PHASE_TIME_METRICS
+        ],
+        f"max_server_{phase}_rss_kb",
+        *[
+            f"mean_server_{phase}_{metric}"
+            for metric in SERVER_RESOURCE_METRICS
+        ],
+    )
+]
 
 ATTEMPT_FIELDS = [
     "attempt_index", "component", "owner", "cert_sig_alg", "sig_family",
     "sig_nist_level", "builder", "generation_scope", "status",
     "wall_ms", "cpu_ms", "user_cpu_ms", "sys_cpu_ms", "max_rss_kb",
     *SERVER_RESOURCE_METRICS,
+    *SERVER_PHASE_ATTEMPT_FIELDS,
     "server_root_der_bytes", "server_root_crt_bytes",
     "server_intermediate_crt_bytes", "server_leaf_crt_bytes",
     "server_chain_crt_bytes", "server_key_bytes",
@@ -106,6 +145,7 @@ SUMMARY_FIELDS = [
     "mean_wall_ms", "min_wall_ms", "max_wall_ms",
     "mean_cpu_ms", "mean_user_cpu_ms", "mean_sys_cpu_ms",
     "max_rss_kb", *[f"mean_{metric}" for metric in SERVER_RESOURCE_METRICS],
+    *SERVER_PHASE_SUMMARY_FIELDS,
     "mean_output_total_bytes",
     "server_chain_crt_bytes", "server_key_bytes",
     "client_cert_crt_bytes", "client_key_bytes",
@@ -260,16 +300,30 @@ def signature_cases(cases: list[dict[str, str]]) -> list[dict[str, str]]:
 
 
 def parse_cert_bench(output: str) -> dict[str, str]:
+    values: dict[str, str] = {}
     for line in output.splitlines():
+        if line.startswith("[CERT_PHASE]"):
+            tokens: dict[str, str] = {}
+            for token in line.removeprefix("[CERT_PHASE]").strip().split():
+                if "=" in token:
+                    key, value = token.split("=", 1)
+                    tokens[key] = value
+            phase = tokens.get("name", "")
+            if phase not in {name for name, _label in SERVER_PHASES}:
+                continue
+            prefix = f"server_{phase}"
+            for key, value in tokens.items():
+                if key in {"name", "status"}:
+                    continue
+                values[f"{prefix}_{key}"] = value
+            continue
         if not line.startswith("[CERT_BENCH]"):
             continue
-        values: dict[str, str] = {}
         for token in line.removeprefix("[CERT_BENCH]").strip().split():
             if "=" in token:
                 key, value = token.split("=", 1)
                 values[key] = value
-        return values
-    return {}
+    return values
 
 
 def ms(values: dict[str, str], key: str) -> str:
@@ -277,6 +331,19 @@ def ms(values: dict[str, str], key: str) -> str:
         return f"{float(values[key]) / 1000.0:.3f}"
     except (KeyError, ValueError):
         return ""
+
+
+def server_phase_attempt_values(metrics: dict[str, str]) -> dict[str, object]:
+    values: dict[str, object] = {}
+    for phase, _label in SERVER_PHASES:
+        prefix = f"server_{phase}"
+        for metric in SERVER_PHASE_TIME_METRICS:
+            source = f"{prefix}_{metric.removesuffix('_ms')}_us"
+            values[f"{prefix}_{metric}"] = ms(metrics, source)
+        values[f"{prefix}_rss_kb"] = metrics.get(f"{prefix}_max_rss_kb", "")
+        for metric in SERVER_RESOURCE_METRICS:
+            values[f"{prefix}_{metric}"] = metrics.get(f"{prefix}_{metric}", "")
+    return values
 
 
 def usage_percent(values: dict[str, object], used_key: str, capacity_key: str) -> str:
@@ -363,6 +430,31 @@ def hash_arg(key_type: str) -> str:
         return ""
     bits = int(match.group(1))
     return "-sha256" if bits <= 3072 else "-sha384" if bits <= 7680 else "-sha512"
+
+
+SERVER_PHASE_SHELL = r"""
+cert_phase() {
+  phase_name="$1"
+  shift
+  phase_output="$(mktemp "${TMPDIR:-/tmp}/cert-phase.XXXXXX")"
+  measure_exec "$@" >"$phase_output" 2>&1
+  phase_rc=$?
+  cat "$phase_output"
+  awk -v name="$phase_name" '
+    /^\[CERT_BENCH\]/ {
+      sub(/^\[CERT_BENCH\] /, "[CERT_PHASE] name=" name " ")
+      print
+    }
+  ' "$phase_output"
+  rm -f "$phase_output"
+  return "$phase_rc"
+}
+"""
+
+
+def server_phase_command(phase: str, command: str) -> str:
+    measured = f"cert_phase {shlex.quote(phase)} /bin/sh -c {shlex.quote(command)}"
+    return f"{measured} || exit $?"
 
 
 class PiCertificateRunner:
@@ -521,10 +613,12 @@ bin/hbs_certgen LMS-HSS-L2-H10-W4 {hbs_warmup_dir}/lms >/dev/null 2>&1 || true
         if proc.returncode:
             raise subprocess.CalledProcessError(proc.returncode, command)
 
-    def remote_attempt_dir(self, signature: Signature, attempt: int) -> str:
+    def remote_attempt_dir(
+        self, signature: Signature, builder: str, attempt: int
+    ) -> str:
         return (
             f"{self.remote_run_dir}/attempts/"
-            f"{slug(signature.name)}/{attempt:03d}"
+            f"{slug(signature.name)}/{slug(builder)}/{attempt:03d}"
         )
 
     def remote_root_dir(self, signature: Signature) -> str:
@@ -790,18 +884,39 @@ def openssl_server_chain_script(
     leaf_hash = hash_arg(signature.leaf_key_type)
     out = shlex.quote(output_dir)
     client = shlex.quote(client_dir)
+    setup_cmd = (
+        f"cp {client}/server_root.crt {client}/server_root.key "
+        f"{client}/server_root.der {out}/ && "
+        "printf 'basicConstraints=critical,CA:FALSE\\n"
+        "keyUsage=critical,digitalSignature,keyEncipherment\\n"
+        "extendedKeyUsage=critical,serverAuth\\n"
+        "subjectAltName=DNS:localhost,IP:127.0.0.1\\n"
+        "subjectKeyIdentifier=hash\\n"
+        "authorityKeyIdentifier=keyid,issuer\\n' "
+        f"> {out}/server.ext"
+    )
+    keygen_cmd = (
+        f"openssl req -new {leaf_args} -keyout {out}/server.key "
+        f"-out {out}/server.csr -nodes -subj /CN=localhost {leaf_hash}"
+    )
+    sign_cmd = (
+        f"openssl x509 -req -in {out}/server.csr -CA {out}/server_root.crt "
+        f"-CAkey {out}/server_root.key -CAcreateserial "
+        f"-out {out}/server.crt -not_before {CERT_NOT_BEFORE} "
+        f"-not_after {CERT_NOT_AFTER} -extfile {out}/server.ext {issuer_hash}"
+    )
+    assemble_cmd = f"cp {out}/server.crt {out}/server_chain.crt"
+    verify_cmd = (
+        f"openssl verify -purpose sslserver -CAfile {out}/server_root.crt "
+        f"{out}/server.crt"
+    )
     return f"""
-cp {client}/server_root.crt {client}/server_root.key {client}/server_root.der {out}/
-printf 'basicConstraints=critical,CA:FALSE\\nkeyUsage=critical,digitalSignature,keyEncipherment\\nextendedKeyUsage=critical,serverAuth\\nsubjectAltName=DNS:localhost,IP:127.0.0.1\\nsubjectKeyIdentifier=hash\\nauthorityKeyIdentifier=keyid,issuer\\n' \\
-  > {out}/server.ext
-openssl req -new {leaf_args} -keyout {out}/server.key -out {out}/server.csr \\
-  -nodes -subj /CN=localhost {leaf_hash}
-openssl x509 -req -in {out}/server.csr -CA {out}/server_root.crt \\
-  -CAkey {out}/server_root.key -CAcreateserial -out {out}/server.crt \\
-  -not_before {CERT_NOT_BEFORE} -not_after {CERT_NOT_AFTER} \\
-  -extfile {out}/server.ext {issuer_hash}
-cp {out}/server.crt {out}/server_chain.crt
-openssl verify -purpose sslserver -CAfile {out}/server_root.crt {out}/server.crt
+{SERVER_PHASE_SHELL.rstrip()}
+{setup_cmd}
+{server_phase_command("keygen", keygen_cmd)}
+{server_phase_command("sign_cert", sign_cmd)}
+{assemble_cmd}
+{server_phase_command("verify_cert", verify_cmd)}
 """
 
 
@@ -813,12 +928,21 @@ def wolfssl_server_chain_script(signature: Signature, *, output_dir: str = "/out
     return f"wolfssl_certgen {shlex.quote(signature.name)} {shlex.quote(output_dir)}"
 
 
-def server_builder_for(signature: Signature, requested: str) -> str:
-    if requested == "auto":
-        return "wolfssl-hbs" if signature.name in HASH_BASED_SIGNATURES else "openssl"
-    if requested == "wolfssl" and signature.name in HASH_BASED_SIGNATURES:
-        return "wolfssl-hbs"
-    return requested
+def wolfssl_server_builder_for(signature: Signature) -> str:
+    return "wolfssl-hbs" if signature.name in HASH_BASED_SIGNATURES else "wolfssl"
+
+
+def server_builders_for(signature: Signature, requested: str) -> list[str]:
+    if requested == "wolfssl":
+        return [wolfssl_server_builder_for(signature)]
+    if requested == "openssl":
+        return [] if signature.name in HASH_BASED_SIGNATURES else ["openssl"]
+
+    builders = []
+    if signature.name not in HASH_BASED_SIGNATURES:
+        builders.append("openssl")
+    builders.append(wolfssl_server_builder_for(signature))
+    return builders
 
 
 def server_generation_scope(builder: str) -> str:
@@ -875,6 +999,7 @@ def attempt_row(
         "sys_cpu_ms": ms(metrics, "sys_cpu_us"),
         "max_rss_kb": metrics.get("max_rss_kb", ""),
         **{metric: metrics.get(metric, "") for metric in SERVER_RESOURCE_METRICS},
+        **server_phase_attempt_values(metrics),
         "server_root_der_bytes": file_size(output / "server_root.der"),
         "server_root_crt_bytes": file_size(output / "server_root.crt"),
         "server_intermediate_crt_bytes": file_size(output / "server_intermediate.crt"),
@@ -893,9 +1018,14 @@ def attempt_row(
 
 
 def summarize(rows: list[dict[str, object]]) -> list[dict[str, object]]:
-    groups: dict[tuple[str, str], list[dict[str, object]]] = {}
+    groups: dict[tuple[str, str, str, str], list[dict[str, object]]] = {}
     for row in rows:
-        groups.setdefault((str(row["component"]), str(row["cert_sig_alg"])), []).append(row)
+        groups.setdefault((
+            str(row["component"]),
+            str(row["cert_sig_alg"]),
+            str(row.get("builder", "")),
+            str(row.get("generation_scope", "")),
+        ), []).append(row)
 
     def numbers(items: list[dict[str, object]], field: str) -> list[float]:
         values = []
@@ -906,7 +1036,9 @@ def summarize(rows: list[dict[str, object]]) -> list[dict[str, object]]:
         return values
 
     summaries = []
-    for (_component, _signature), items in sorted(groups.items()):
+    for (_component, _signature, _builder, _generation_scope), items in sorted(
+        groups.items()
+    ):
         success = [item for item in items if item["status"] == "success"]
         unsupported = [item for item in items if item["status"] == "unsupported"]
         failed = [
@@ -924,6 +1056,20 @@ def summarize(rows: list[dict[str, object]]) -> list[dict[str, object]]:
         rss = numbers(success, "max_rss_kb")
         server_resources = {
             metric: numbers(success, metric)
+            for metric in SERVER_RESOURCE_METRICS
+        }
+        server_phase_values = {
+            (phase, metric): numbers(success, f"server_{phase}_{metric}")
+            for phase, _label in SERVER_PHASES
+            for metric in SERVER_PHASE_TIME_METRICS
+        }
+        server_phase_rss = {
+            phase: numbers(success, f"server_{phase}_rss_kb")
+            for phase, _label in SERVER_PHASES
+        }
+        server_phase_resources = {
+            (phase, metric): numbers(success, f"server_{phase}_{metric}")
+            for phase, _label in SERVER_PHASES
             for metric in SERVER_RESOURCE_METRICS
         }
         output_bytes = numbers(success, "output_total_bytes")
@@ -1033,6 +1179,24 @@ def summarize(rows: list[dict[str, object]]) -> list[dict[str, object]]:
                     f"{sum(values) / len(values):.3f}" if values else ""
                 )
                 for metric, values in server_resources.items()
+            },
+            **{
+                f"mean_server_{phase}_{metric}": (
+                    f"{sum(values) / len(values):.3f}" if values else ""
+                )
+                for (phase, metric), values in server_phase_values.items()
+            },
+            **{
+                f"max_server_{phase}_rss_kb": (
+                    f"{max(values):.0f}" if values else ""
+                )
+                for phase, values in server_phase_rss.items()
+            },
+            **{
+                f"mean_server_{phase}_{metric}": (
+                    f"{sum(values) / len(values):.3f}" if values else ""
+                )
+                for (phase, metric), values in server_phase_resources.items()
             },
             "mean_output_total_bytes": (
                 f"{sum(output_bytes) / len(output_bytes):.0f}"
@@ -1181,11 +1345,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--only-signature", action="append", default=[])
     parser.add_argument(
         "--server-builder",
-        choices=("auto", "openssl", "wolfssl"),
+        choices=("auto", "both", "openssl", "wolfssl"),
         default="auto",
         help=(
-            "server certificate-chain generator. auto keeps the existing "
-            "OpenSSL path except LMS/XMSS, which use wolfSSL."
+            "server certificate-chain generator. auto/both collects OpenSSL "
+            "where available plus wolfSSL for comparison."
         ),
     )
     parser.add_argument(
@@ -1355,8 +1519,11 @@ def main(argv: list[str] | None = None) -> int:
                 write_csv(run_dir / "attempts.csv", ATTEMPT_FIELDS, attempts)
 
     server_builders = {
-        server_builder_for(SIGNATURES_BY_NAME[case["cert_sig_alg"]], args.server_builder)
+        builder
         for case in cases
+        for builder in server_builders_for(
+            SIGNATURES_BY_NAME[case["cert_sig_alg"]], args.server_builder
+        )
     }
     pi_runner = PiCertificateRunner(
         args.pi_host, args.pi_workdir, args.ssh_key, run_id
@@ -1371,48 +1538,55 @@ def main(argv: list[str] | None = None) -> int:
         pi_runner.prepare(log, server_builders)
         for case in cases:
             signature = SIGNATURES_BY_NAME[case["cert_sig_alg"]]
-            builder = server_builder_for(signature, args.server_builder)
-            generation_scope = server_generation_scope(builder)
-            remote_root = ""
-            if builder == "openssl":
-                remote_root = pi_runner.ensure_server_root(
-                    signature,
-                    run_dir / "trust-anchors" / slug(signature.issuer_key_type),
-                    log,
-                )
-            for attempt in range(1, args.iterations + 1):
-                output = (
-                    run_dir / "attempts" / slug(signature.name) / f"{attempt:03d}"
-                )
-                remote_output = pi_runner.remote_attempt_dir(signature, attempt)
-                script = server_script_for(
-                    signature,
-                    builder,
-                    output_dir=remote_output,
-                    client_dir=remote_root,
-                )
-                print(
-                    f"[cert-chain] Raspberry Pi {signature.name} "
-                    f"attempt={attempt}/{args.iterations}",
-                    flush=True,
-                )
-                rc, metrics, stdout = pi_runner.run_measured(
-                    output, remote_output, script, log
-                )
-                attempts.append(attempt_row(
-                    attempt_index=attempt,
-                    component="server_chain",
-                    owner="server",
-                    case=case,
-                    signature=signature,
-                    builder=builder,
-                    generation_scope=generation_scope,
-                    output=output,
-                    status="success" if rc == 0 else "fail",
-                    metrics=metrics,
-                    message="" if rc == 0 else stdout.splitlines()[-1] if stdout else "",
-                ))
-                write_csv(run_dir / "attempts.csv", ATTEMPT_FIELDS, attempts)
+            builders = server_builders_for(signature, args.server_builder)
+            for builder in builders:
+                generation_scope = server_generation_scope(builder)
+                remote_root = ""
+                if builder == "openssl":
+                    remote_root = pi_runner.ensure_server_root(
+                        signature,
+                        run_dir / "trust-anchors" / slug(signature.issuer_key_type),
+                        log,
+                    )
+                for attempt in range(1, args.iterations + 1):
+                    output = (
+                        run_dir / "attempts" / slug(signature.name) /
+                        slug(builder) / f"{attempt:03d}"
+                    )
+                    remote_output = pi_runner.remote_attempt_dir(
+                        signature, builder, attempt
+                    )
+                    script = server_script_for(
+                        signature,
+                        builder,
+                        output_dir=remote_output,
+                        client_dir=remote_root,
+                    )
+                    print(
+                        f"[cert-chain] Raspberry Pi {builder} {signature.name} "
+                        f"attempt={attempt}/{args.iterations}",
+                        flush=True,
+                    )
+                    rc, metrics, stdout = pi_runner.run_measured(
+                        output, remote_output, script, log
+                    )
+                    attempts.append(attempt_row(
+                        attempt_index=attempt,
+                        component="server_chain",
+                        owner="server",
+                        case=case,
+                        signature=signature,
+                        builder=builder,
+                        generation_scope=generation_scope,
+                        output=output,
+                        status="success" if rc == 0 else "fail",
+                        metrics=metrics,
+                        message=(
+                            "" if rc == 0 else
+                            stdout.splitlines()[-1] if stdout else ""
+                        ),
+                    ))
+                    write_csv(run_dir / "attempts.csv", ATTEMPT_FIELDS, attempts)
     finally:
         pi_runner.stop()
 

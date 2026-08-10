@@ -22,6 +22,12 @@ except ModuleNotFoundError as exc:
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_RESULTS_ROOT = PROJECT_ROOT / "benchmarking" / "results"
 DEFAULT_OUT_ROOT = PROJECT_ROOT / "graphic" / "out"
+CLASSIC_COLOR = "#2563eb"
+PQC_COLOR = "#dc2626"
+HYBRID_COLOR = "#6b7280"
+WOLFSSL_PQC_COLOR = "#9333ea"
+WOLFSSL_CLASSIC_COLOR = "#16a34a"
+CPU_OVERLAY_COLOR = "#f97316"
 
 
 def resolve_run_dir(value: str) -> Path:
@@ -49,6 +55,8 @@ def float_or_none(value: str | None) -> float | None:
 
 
 def format_duration_ms(value: float) -> str:
+    if 0.0 < value < 1.0:
+        return "<1 ms"
     if value >= 60000.0:
         return f"{value / 60000.0:.1f} min"
     if value >= 1000.0:
@@ -89,6 +97,28 @@ def load_summary(run_dir: Path, include_failed: bool) -> list[dict[str, str]]:
     return usable
 
 
+def is_server_row(row: dict[str, str]) -> bool:
+    return row.get("component") == "server_chain" or row.get("owner") == "server"
+
+
+def builder_label(row: dict[str, str], *, short: bool = False) -> str:
+    builder = row.get("builder", "")
+    if builder == "openssl":
+        return "OSSL" if short else "OpenSSL"
+    if builder == "wolfssl-hbs":
+        return "wHBS" if short else "wolfSSL HBS"
+    if builder == "wolfssl":
+        return "wSSL" if short else "wolfSSL"
+    return builder
+
+
+def with_server_builder_label(row: dict[str, str], label: str, *, short: bool) -> str:
+    backend = builder_label(row, short=short)
+    if is_server_row(row) and backend:
+        return f"{label} [{backend}]"
+    return label
+
+
 def row_label(row: dict[str, str]) -> str:
     component = row.get("component", "")
     signature = row.get("cert_sig_alg", "")
@@ -98,19 +128,48 @@ def row_label(row: dict[str, str]) -> str:
         return "Board key + CSR"
     if component == "client_certificate":
         return f"Board: {signature}{level_suffix}"
-    return f"{signature}{level_suffix}"
+    return with_server_builder_label(row, f"{signature}{level_suffix}", short=False)
+
+
+def compact_row_label(row: dict[str, str]) -> str:
+    signature = row.get("cert_sig_alg", "")
+    level = row.get("sig_nist_level", "")
+    level_suffix = f" (L{level})" if level else ""
+    if row.get("component") == "client_identity":
+        return "Key + CSR"
+    return with_server_builder_label(row, f"{signature}{level_suffix}", short=True)
+
+
+def scatter_row_label(row: dict[str, str]) -> str:
+    signature = row.get("cert_sig_alg", "")
+    level = row.get("sig_nist_level", "")
+    level_suffix = f" L{level}" if level else ""
+    if signature.startswith("ECDSA-P-"):
+        return with_server_builder_label(
+            row, f"ECDSA-{signature.rsplit('-', 1)[1]}{level_suffix}", short=True
+        )
+    if signature.startswith("RSA-PSS-"):
+        return with_server_builder_label(
+            row, f"RSA-{signature.rsplit('-', 1)[1]}{level_suffix}", short=True
+        )
+    if signature.startswith("ML-DSA-"):
+        return with_server_builder_label(
+            row, f"ML-{signature.rsplit('-', 1)[1]}{level_suffix}", short=True
+        )
+    if signature.startswith("SLH-DSA-SHAKE-"):
+        return with_server_builder_label(
+            row, f"SLH-{signature.rsplit('-', 1)[1]}{level_suffix}", short=True
+        )
+    if signature.startswith("LMS-"):
+        return with_server_builder_label(row, f"LMS-HSS{level_suffix}", short=True)
+    if signature.startswith("XMSS-"):
+        return with_server_builder_label(row, f"XMSS{level_suffix}", short=True)
+    label = f"{signature}{level_suffix}"
+    return with_server_builder_label(row, label, short=True)
 
 
 def row_color(row: dict[str, str]) -> str:
-    component = row.get("component", "")
-    builder = row.get("builder", "")
-    if component in {"client_identity", "client_certificate"}:
-        return "#2563eb"
-    if builder == "wolfssl-hbs":
-        return "#7c3aed"
-    if row.get("sig_family") == "pqc":
-        return "#0f766e"
-    return "#64748b"
+    return family_color(row)
 
 
 def numeric(rows: list[dict[str, str]], field: str) -> list[float]:
@@ -276,6 +335,69 @@ SERVER_RESOURCE_PANELS = [
     ),
 ]
 
+SERVER_PHASE_FIELDS = [
+    ("keygen", "Keygen", "#2563eb"),
+    ("sign_cert", "Sign cert", "#dc2626"),
+    ("verify_cert", "Verify cert", "#0f766e"),
+]
+
+SERVER_PHASE_WALL_FIELDS = [
+    (f"mean_server_{phase}_wall_ms", label, color)
+    for phase, label, color in SERVER_PHASE_FIELDS
+]
+
+SERVER_PHASE_CPU_FIELDS = [
+    (f"mean_server_{phase}_cpu_ms", label, color)
+    for phase, label, color in SERVER_PHASE_FIELDS
+]
+
+SERVER_PHASE_RESOURCE_GROUPS = [
+    (
+        "Peak RSS",
+        "KB",
+        [
+            (f"max_server_{phase}_rss_kb", label)
+            for phase, label, _color in SERVER_PHASE_FIELDS
+        ],
+    ),
+    (
+        "Context switches",
+        "Mean context switches",
+        [
+            (
+                f"mean_server_{phase}_voluntary_context_switches",
+                f"mean_server_{phase}_involuntary_context_switches",
+                label,
+            )
+            for phase, label, _color in SERVER_PHASE_FIELDS
+        ],
+    ),
+    (
+        "Page faults",
+        "Mean page faults",
+        [
+            (
+                f"mean_server_{phase}_minor_page_faults",
+                f"mean_server_{phase}_major_page_faults",
+                label,
+            )
+            for phase, label, _color in SERVER_PHASE_FIELDS
+        ],
+    ),
+    (
+        "Block I/O ops",
+        "Mean block I/O ops",
+        [
+            (
+                f"mean_server_{phase}_block_input_ops",
+                f"mean_server_{phase}_block_output_ops",
+                label,
+            )
+            for phase, label, _color in SERVER_PHASE_FIELDS
+        ],
+    ),
+]
+
 
 def signature_sort_key(name: str) -> tuple[int, int, int, str]:
     upper = name.upper()
@@ -298,13 +420,46 @@ def signature_sort_key(name: str) -> tuple[int, int, int, str]:
 
 
 def family_color(row: dict[str, str]) -> str:
-    return "#0f766e" if row.get("sig_family") == "pqc" else "#64748b"
+    family = row.get("sig_family", "").lower()
+    if family == "pqc":
+        return PQC_COLOR
+    if family == "hybrid":
+        return HYBRID_COLOR
+    return CLASSIC_COLOR
+
+
+def server_backend_family_color(row: dict[str, str]) -> str:
+    family = row.get("sig_family", "").lower()
+    builder = row.get("builder", "").lower()
+    wolfssl = builder.startswith("wolfssl")
+    if family == "hybrid":
+        return HYBRID_COLOR
+    if wolfssl and family == "pqc":
+        return WOLFSSL_PQC_COLOR
+    if wolfssl:
+        return WOLFSSL_CLASSIC_COLOR
+    if family == "pqc":
+        return PQC_COLOR
+    return CLASSIC_COLOR
 
 
 def add_family_legend(ax, *, loc: str = "lower right") -> None:
     legend_handles = [
-        plt.Rectangle((0, 0), 1, 1, color="#64748b", label="Classic"),
-        plt.Rectangle((0, 0), 1, 1, color="#0f766e", label="PQC"),
+        plt.Rectangle((0, 0), 1, 1, color=CLASSIC_COLOR, label="Classic"),
+        plt.Rectangle((0, 0), 1, 1, color=PQC_COLOR, label="PQC"),
+        plt.Rectangle((0, 0), 1, 1, color=HYBRID_COLOR, label="Hybrid"),
+    ]
+    ax.legend(handles=legend_handles, loc=loc, fontsize=8)
+
+
+def add_server_backend_family_legend(ax, *, loc: str = "lower right") -> None:
+    legend_handles = [
+        plt.Rectangle((0, 0), 1, 1, color=PQC_COLOR, label="OpenSSL PQC"),
+        plt.Rectangle((0, 0), 1, 1, color=CLASSIC_COLOR, label="OpenSSL classic"),
+        plt.Rectangle((0, 0), 1, 1, color=WOLFSSL_PQC_COLOR, label="wolfSSL PQC"),
+        plt.Rectangle(
+            (0, 0), 1, 1, color=WOLFSSL_CLASSIC_COLOR, label="wolfSSL classic"
+        ),
     ]
     ax.legend(handles=legend_handles, loc=loc, fontsize=8)
 
@@ -365,18 +520,29 @@ def pad_x_axis(ax, values: list[float], *, log_scale: bool) -> None:
         ax.set_xlim(0, max(positive) * 1.28)
 
 
+def pad_log_scatter_axes(ax, xs: list[float], ys: list[float]) -> None:
+    positive_x = [value for value in xs if value > 0]
+    positive_y = [value for value in ys if value > 0]
+    if positive_x:
+        ax.set_xlim(min(positive_x) / 2.2, max(positive_x) * 2.2)
+    if positive_y:
+        ax.set_ylim(min(positive_y) / 2.2, max(positive_y) * 2.2)
+
+
 def annotate_scatter_nonoverlap(
     ax,
     xs: list[float],
     ys: list[float],
     labels: list[str],
     sizes: list[float] | None = None,
+    *,
+    edge_columns: bool = False,
 ) -> None:
     if not xs:
         return
     ax.figure.canvas.draw()
     renderer = ax.figure.canvas.get_renderer()
-    font_size = 7
+    font_size = 6
     font_properties = FontProperties(size=font_size)
     x_mid = float(np.median(xs))
     entries = []
@@ -400,67 +566,250 @@ def annotate_scatter_nonoverlap(
             "radius": radius,
             "right": x <= x_mid,
         })
-    entries.sort(key=lambda item: item["y_display"])
-
-    lower = ax.bbox.y0 + 10.0
-    upper = ax.bbox.y1 - 10.0
-    adjusted = [
-        min(
-            max(item["y_display"], lower + item["height"] / 2.0),
-            upper - item["height"] / 2.0,
-        )
-        for item in entries
-    ]
-    for index in range(1, len(adjusted)):
-        min_gap = (
-            entries[index - 1]["height"] / 2.0 +
-            entries[index]["height"] / 2.0 +
-            5.0
-        )
-        adjusted[index] = max(adjusted[index], adjusted[index - 1] + min_gap)
-    if adjusted and adjusted[-1] > upper:
-        overflow = adjusted[-1] + entries[-1]["height"] / 2.0 - upper
-        adjusted = [value - overflow for value in adjusted]
-    for index in range(len(adjusted) - 2, -1, -1):
-        min_gap = (
-            entries[index]["height"] / 2.0 +
-            entries[index + 1]["height"] / 2.0 +
-            5.0
-        )
-        adjusted[index] = min(adjusted[index], adjusted[index + 1] - min_gap)
-    if adjusted and adjusted[0] < lower:
-        underflow = lower - (adjusted[0] - entries[0]["height"] / 2.0)
-        adjusted = [value + underflow for value in adjusted]
-
     inverse = ax.transData.inverted()
-    for item, label_y_display in zip(entries, adjusted):
-        x_offset = item["radius"] + 10.0
-        if not item["right"]:
-            x_offset = -x_offset
-        label_x, label_y = inverse.transform(
-            (item["x_display"] + x_offset, label_y_display)
+
+    def adjusted_label_positions(side_entries: list[dict[str, object]]) -> list[float]:
+        side_entries.sort(key=lambda item: float(item["y_display"]))
+        lower = ax.bbox.y0 + 12.0
+        upper = ax.bbox.y1 - 12.0
+        adjusted = [
+            min(
+                max(float(item["y_display"]), lower + float(item["height"]) / 2.0),
+                upper - float(item["height"]) / 2.0,
+            )
+            for item in side_entries
+        ]
+        for index in range(1, len(adjusted)):
+            min_gap = (
+                float(side_entries[index - 1]["height"]) / 2.0 +
+                float(side_entries[index]["height"]) / 2.0 +
+                7.0
+            )
+            adjusted[index] = max(adjusted[index], adjusted[index - 1] + min_gap)
+        if adjusted and adjusted[-1] > upper:
+            overflow = adjusted[-1] + float(side_entries[-1]["height"]) / 2.0 - upper
+            adjusted = [value - overflow for value in adjusted]
+        for index in range(len(adjusted) - 2, -1, -1):
+            min_gap = (
+                float(side_entries[index]["height"]) / 2.0 +
+                float(side_entries[index + 1]["height"]) / 2.0 +
+                7.0
+            )
+            adjusted[index] = min(adjusted[index], adjusted[index + 1] - min_gap)
+        if adjusted and adjusted[0] < lower:
+            underflow = lower - (
+                adjusted[0] - float(side_entries[0]["height"]) / 2.0
+            )
+            adjusted = [value + underflow for value in adjusted]
+        return adjusted
+
+    for side_entries in (
+        [item for item in entries if bool(item["right"])],
+        [item for item in entries if not bool(item["right"])],
+    ):
+        adjusted = adjusted_label_positions(side_entries)
+        for item, label_y_display in zip(side_entries, adjusted):
+            if edge_columns:
+                label_x_display = ax.bbox.x1 - 8.0 if item["right"] else ax.bbox.x0 + 8.0
+            else:
+                x_offset = float(item["radius"]) + 26.0
+                if not item["right"]:
+                    x_offset = -x_offset
+                label_x_display = float(item["x_display"]) + x_offset
+            label_x, label_y = inverse.transform((label_x_display, label_y_display))
+            text_ha = (
+                "right" if item["right"] else "left"
+            ) if edge_columns else (
+                "left" if item["right"] else "right"
+            )
+            ax.annotate(
+                str(item["label"]),
+                (float(item["x"]), float(item["y"])),
+                xytext=(label_x, label_y),
+                textcoords="data",
+                fontsize=font_size,
+                ha=text_ha,
+                va="center",
+                annotation_clip=False,
+                arrowprops={
+                    "arrowstyle": "-",
+                    "color": HYBRID_COLOR,
+                    "linewidth": 0.45,
+                    "shrinkA": 0,
+                    "shrinkB": 3,
+                },
+                bbox={
+                    "boxstyle": "round,pad=0.18",
+                    "facecolor": "#ffffff",
+                    "edgecolor": "none",
+                    "alpha": 0.90,
+                },
+            )
+
+
+def annotate_scatter_candidates(
+    ax,
+    xs: list[float],
+    ys: list[float],
+    labels: list[str],
+    sizes: list[float] | None = None,
+) -> None:
+    if not xs:
+        return
+    ax.figure.canvas.draw()
+    renderer = ax.figure.canvas.get_renderer()
+    font_size = 7
+    font_properties = FontProperties(size=font_size)
+    if sizes is None:
+        sizes = [30.0] * len(xs)
+
+    def rects_overlap(
+        left_a: float, bottom_a: float, right_a: float, top_a: float,
+        left_b: float, bottom_b: float, right_b: float, top_b: float,
+    ) -> bool:
+        return not (
+            right_a <= left_b or right_b <= left_a or
+            top_a <= bottom_b or top_b <= bottom_a
         )
+
+    axis_left = ax.bbox.x0 + 4.0
+    axis_right = ax.bbox.x1 - 4.0
+    axis_bottom = ax.bbox.y0 + 4.0
+    axis_top = ax.bbox.y1 - 4.0
+    points = []
+    for x, y, size in zip(xs, ys, sizes):
+        x_display, y_display = ax.transData.transform((x, y))
+        radius = (float(size) / np.pi) ** 0.5 * ax.figure.dpi / 72.0
+        points.append((x_display, y_display, radius + 4.0))
+
+    label_rects: list[tuple[float, float, float, float]] = []
+    inverse = ax.transData.inverted()
+    entries = []
+    for index, (x, y, label, size) in enumerate(zip(xs, ys, labels, sizes)):
+        x_display, y_display = ax.transData.transform((x, y))
+        width, height, _descent = renderer.get_text_width_height_descent(
+            label,
+            font_properties,
+            ismath=False,
+        )
+        entries.append({
+            "index": index,
+            "x": x,
+            "y": y,
+            "label": label,
+            "x_display": x_display,
+            "y_display": y_display,
+            "width": width + 12.0,
+            "height": height + 9.0,
+            "radius": (float(size) / np.pi) ** 0.5 * ax.figure.dpi / 72.0,
+        })
+    entries.sort(key=lambda item: (-float(item["radius"]), float(item["y_display"])))
+
+    for item in entries:
+        width = float(item["width"])
+        height = float(item["height"])
+        radius = float(item["radius"])
+        x_display = float(item["x_display"])
+        y_display = float(item["y_display"])
+        distances = [
+            radius + 9.0, radius + 20.0, radius + 36.0,
+            radius + 58.0, radius + 86.0, radius + 120.0,
+            radius + 160.0,
+        ]
+        directions = [
+            (1.0, 0.0, "left"),
+            (-1.0, 0.0, "right"),
+            (1.0, 0.75, "left"),
+            (1.0, -0.75, "left"),
+            (-1.0, 0.75, "right"),
+            (-1.0, -0.75, "right"),
+            (1.0, 1.35, "left"),
+            (1.0, -1.35, "left"),
+            (-1.0, 1.35, "right"),
+            (-1.0, -1.35, "right"),
+            (1.0, 2.1, "left"),
+            (1.0, -2.1, "left"),
+            (-1.0, 2.1, "right"),
+            (-1.0, -2.1, "right"),
+            (0.0, 1.0, "center"),
+            (0.0, -1.0, "center"),
+            (0.0, 1.9, "center"),
+            (0.0, -1.9, "center"),
+        ]
+        best: tuple[float, float, float, str] | None = None
+        for distance in distances:
+            for dx, dy, ha in directions:
+                label_x = x_display + dx * distance
+                label_y = y_display + dy * distance
+                if ha == "left":
+                    left = label_x
+                    right = label_x + width
+                elif ha == "right":
+                    left = label_x - width
+                    right = label_x
+                else:
+                    left = label_x - width / 2.0
+                    right = label_x + width / 2.0
+                bottom = label_y - height / 2.0
+                top = label_y + height / 2.0
+                outside = (
+                    max(axis_left - left, 0.0) + max(right - axis_right, 0.0) +
+                    max(axis_bottom - bottom, 0.0) + max(top - axis_top, 0.0)
+                )
+                overlap_penalty = 0.0
+                for other in label_rects:
+                    if rects_overlap(left, bottom, right, top, *other):
+                        overlap_penalty += 10000.0
+                for px, py, pr in points:
+                    if abs(px - x_display) < 0.1 and abs(py - y_display) < 0.1:
+                        continue
+                    if rects_overlap(
+                        left, bottom, right, top,
+                        px - pr, py - pr, px + pr, py + pr,
+                    ):
+                        overlap_penalty += 4000.0
+                score = distance + outside * 100.0 + overlap_penalty
+                if best is None or score < best[0]:
+                    best = (score, label_x, label_y, ha)
+                if overlap_penalty == 0.0 and outside == 0.0:
+                    break
+            if best is not None and best[0] < distance + 1.0:
+                break
+        if best is None:
+            continue
+        _score, label_x, label_y, ha = best
+        if ha == "left":
+            rect = (label_x, label_y - height / 2.0, label_x + width, label_y + height / 2.0)
+        elif ha == "right":
+            rect = (label_x - width, label_y - height / 2.0, label_x, label_y + height / 2.0)
+        else:
+            rect = (
+                label_x - width / 2.0, label_y - height / 2.0,
+                label_x + width / 2.0, label_y + height / 2.0,
+            )
+        label_rects.append(rect)
+        label_data_x, label_data_y = inverse.transform((label_x, label_y))
         ax.annotate(
-            item["label"],
-            (item["x"], item["y"]),
-            xytext=(label_x, label_y),
+            str(item["label"]),
+            (float(item["x"]), float(item["y"])),
+            xytext=(label_data_x, label_data_y),
             textcoords="data",
             fontsize=font_size,
-            ha="left" if item["right"] else "right",
+            ha=ha,
             va="center",
             annotation_clip=False,
             arrowprops={
                 "arrowstyle": "-",
-                "color": "#64748b",
-                "linewidth": 0.45,
+                "color": HYBRID_COLOR,
+                "linewidth": 0.4,
                 "shrinkA": 0,
-                "shrinkB": 2,
+                "shrinkB": 3,
             },
             bbox={
-                "boxstyle": "round,pad=0.16",
+                "boxstyle": "round,pad=0.12",
                 "facecolor": "#ffffff",
                 "edgecolor": "none",
-                "alpha": 0.82,
+                "alpha": 0.88,
             },
         )
 
@@ -495,7 +844,7 @@ def plot_summary(
         positions, wall_ms, color=colors, edgecolor="#111827", linewidth=0.35
     )
     axes[0].barh(
-        positions, cpu_values_ms, color="none", edgecolor="#f97316",
+        positions, cpu_values_ms, color="none", edgecolor=CPU_OVERLAY_COLOR,
         linewidth=1.2, hatch="//"
     )
     axes[0].set_xlabel("Mean time (ms)")
@@ -529,12 +878,11 @@ def plot_summary(
         ax.invert_yaxis()
 
     legend_handles = [
-        plt.Rectangle((0, 0), 1, 1, color="#2563eb", label="Board/wolfSSL"),
-        plt.Rectangle((0, 0), 1, 1, color="#64748b", label="Classic/OpenSSL"),
-        plt.Rectangle((0, 0), 1, 1, color="#0f766e", label="PQC/OpenSSL"),
-        plt.Rectangle((0, 0), 1, 1, color="#7c3aed", label="HBS/wolfSSL"),
+        plt.Rectangle((0, 0), 1, 1, color=CLASSIC_COLOR, label="Classic"),
+        plt.Rectangle((0, 0), 1, 1, color=PQC_COLOR, label="PQC"),
+        plt.Rectangle((0, 0), 1, 1, color=HYBRID_COLOR, label="Hybrid"),
         plt.Rectangle(
-            (0, 0), 1, 1, facecolor="none", edgecolor="#f97316",
+            (0, 0), 1, 1, facecolor="none", edgecolor=CPU_OVERLAY_COLOR,
             hatch="//", label="CPU time overlay"
         ),
     ]
@@ -750,7 +1098,14 @@ def plot_cpu_efficiency(
     run_id: str,
     title_suffix: str = "",
     color_func=row_color,
+    legend_func=None,
     annotate_scatter: bool = True,
+    scatter_x_log: bool = True,
+    candidate_scatter_labels: bool = False,
+    scatter_size_divisor: float = 2.0,
+    scatter_size_max: float = 260.0,
+    min_height: float = 8.0,
+    fig_width: float = 16.0,
 ) -> bool:
     rows = sort_rows([
         row for row in rows
@@ -767,10 +1122,10 @@ def plot_cpu_efficiency(
         cpu_ms(row) / kb if kb > 0 else 0.0
         for row, kb in zip(rows, output_kb)
     ]
-    height = max(8.0, len(rows) * 0.42)
+    height = max(min_height, len(rows) * 0.42)
     fig, axes = plt.subplots(
         1, 2,
-        figsize=(16, height),
+        figsize=(fig_width, height),
         constrained_layout=True,
     )
     title = "Certificate CPU cost normalized by output"
@@ -790,7 +1145,7 @@ def plot_cpu_efficiency(
     annotate_bars(axes[0], bars, cpu_per_kb, decimals=2)
 
     scatter_sizes = [
-        max(30.0, min(260.0, memory_kb(row) / 2.0))
+        max(30.0, min(scatter_size_max, memory_kb(row) / scatter_size_divisor))
         for row in rows
     ]
     axes[1].scatter(
@@ -804,12 +1159,28 @@ def plot_cpu_efficiency(
     )
     axes[1].set_xlabel("Generated output (KB)")
     axes[1].set_ylabel("CPU time (ms)")
-    axes[1].set_xscale("log")
     axes[1].set_yscale("log")
+    if scatter_x_log:
+        axes[1].set_xscale("log")
+        pad_log_scatter_axes(axes[1], output_kb, [cpu_ms(row) for row in rows])
+    else:
+        axes[1].set_xlim(0, max(output_kb) * 1.20)
+        positive_y = [cpu_ms(row) for row in rows if cpu_ms(row) > 0]
+        if positive_y:
+            axes[1].set_ylim(min(positive_y) / 2.2, max(positive_y) * 2.2)
     axes[1].grid(linestyle=":", alpha=0.35)
     if annotate_scatter:
-        annotate_scatter_nonoverlap(
-            axes[1], output_kb, [cpu_ms(row) for row in rows], labels, scatter_sizes
+        annotator = (
+            annotate_scatter_candidates
+            if candidate_scatter_labels else
+            annotate_scatter_nonoverlap
+        )
+        annotator(
+            axes[1],
+            output_kb,
+            [cpu_ms(row) for row in rows],
+            [scatter_row_label(row) for row in rows],
+            scatter_sizes,
         )
 
     axes[0].text(
@@ -820,7 +1191,9 @@ def plot_cpu_efficiency(
         color="#374151",
     )
     axes[0].invert_yaxis()
-    if color_func is family_color:
+    if legend_func is not None:
+        legend_func(axes[0])
+    elif color_func is family_color:
         add_family_legend(axes[0])
 
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -855,7 +1228,16 @@ def plot_server_cpu_efficiency(
         or row.get("owner") == "server"
     ]
     return plot_cpu_efficiency(
-        server_rows, output, run_id, "server", annotate_scatter=True
+        server_rows, output, run_id, "server",
+        color_func=server_backend_family_color,
+        legend_func=add_server_backend_family_legend,
+        annotate_scatter=True,
+        scatter_x_log=False,
+        candidate_scatter_labels=False,
+        scatter_size_divisor=120.0,
+        scatter_size_max=130.0,
+        min_height=9.5,
+        fig_width=18.0,
     )
 
 
@@ -910,7 +1292,7 @@ def plot_wall_cpu_gap(
     annotate_bars(axes[0], share_bars, cpu_share, suffix="%", decimals=3)
 
     gap_bars = axes[1].barh(
-        positions, wall_gap_us, color="#f97316", edgecolor="#111827", linewidth=0.35
+        positions, wall_gap_us, color=CPU_OVERLAY_COLOR, edgecolor="#111827", linewidth=0.35
     )
     axes[1].set_xlabel("Wall time not explained by measured CPU (us)")
     axes[1].grid(axis="x", linestyle=":", alpha=0.35)
@@ -923,11 +1305,10 @@ def plot_wall_cpu_gap(
         axes[1].set_xlim(0, 1)
 
     legend_handles = [
-        plt.Rectangle((0, 0), 1, 1, color="#2563eb", label="Board/wolfSSL"),
-        plt.Rectangle((0, 0), 1, 1, color="#64748b", label="Classic/OpenSSL"),
-        plt.Rectangle((0, 0), 1, 1, color="#0f766e", label="PQC/OpenSSL"),
-        plt.Rectangle((0, 0), 1, 1, color="#7c3aed", label="HBS/wolfSSL"),
-        plt.Rectangle((0, 0), 1, 1, color="#f97316", label="Wall minus CPU"),
+        plt.Rectangle((0, 0), 1, 1, color=CLASSIC_COLOR, label="Classic"),
+        plt.Rectangle((0, 0), 1, 1, color=PQC_COLOR, label="PQC"),
+        plt.Rectangle((0, 0), 1, 1, color=HYBRID_COLOR, label="Hybrid"),
+        plt.Rectangle((0, 0), 1, 1, color=CPU_OVERLAY_COLOR, label="Wall minus CPU"),
     ]
     axes[0].legend(handles=legend_handles, loc="lower right", fontsize=8)
 
@@ -1189,6 +1570,7 @@ def plot_phase_wall_heatmap(
     cpu_fields: list[tuple[str, str, str]] = PHASE_FIELDS,
     title: str = "Board certgen phase wall time heatmap",
     xlabel: str = "Certificate generation phase",
+    colorbar_label: str = "Wall time per phase (ms, log color scale)",
     total_cpu_func=phase_total,
 ) -> bool:
     rows = sort_rows(positive_rows(rows, [field for field, _label, _color in fields]))
@@ -1278,7 +1660,7 @@ def plot_phase_wall_heatmap(
     )
 
     colorbar = fig.colorbar(image, ax=ax, fraction=0.028, pad=0.02)
-    colorbar.set_label("Wall time per phase (ms, log color scale)")
+    colorbar.set_label(colorbar_label)
 
     output.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(output, dpi=180)
@@ -1303,7 +1685,7 @@ def plot_server_phase_wall_ms(
 
     labels = [row_label(row) for row in rows]
     values = numeric(rows, "mean_wall_ms")
-    colors = [row_color(row) for row in rows]
+    colors = [server_backend_family_color(row) for row in rows]
     positions = np.arange(len(rows))
     height = max(7.0, len(rows) * 0.46)
     fig, ax = plt.subplots(figsize=(12, height), constrained_layout=True)
@@ -1321,12 +1703,123 @@ def plot_server_phase_wall_ms(
     annotate_bars(ax, bars, values, suffix=" ms")
     ax.invert_yaxis()
 
-    legend_handles = [
-        plt.Rectangle((0, 0), 1, 1, color="#64748b", label="Classic/OpenSSL"),
-        plt.Rectangle((0, 0), 1, 1, color="#0f766e", label="PQC/OpenSSL"),
-        plt.Rectangle((0, 0), 1, 1, color="#7c3aed", label="HBS/wolfSSL"),
-    ]
-    ax.legend(handles=legend_handles, loc="upper right", fontsize=8)
+    add_server_backend_family_legend(ax, loc="upper right")
+
+    output.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(output, dpi=180)
+    plt.close(fig)
+    return True
+
+
+def server_phase_cpu_total(row: dict[str, str]) -> float:
+    return sum(
+        float_or_none(row.get(field)) or 0.0
+        for field, _label, _color in SERVER_PHASE_CPU_FIELDS
+    )
+
+
+def plot_server_phase_wall_heatmap(
+    rows: list[dict[str, str]],
+    output: Path,
+    run_id: str,
+) -> bool:
+    rows = [row for row in rows if is_server_row(row)]
+    return plot_phase_wall_heatmap(
+        rows,
+        output,
+        run_id,
+        fields=SERVER_PHASE_WALL_FIELDS,
+        cpu_fields=SERVER_PHASE_CPU_FIELDS,
+        title="Server certificate phase wall time heatmap",
+        xlabel="Server certificate generation phase",
+        colorbar_label="Server wall time per phase (ms, log color scale)",
+        total_cpu_func=server_phase_cpu_total,
+    )
+
+
+def plot_server_phase_cpu_heatmap(
+    rows: list[dict[str, str]],
+    output: Path,
+    run_id: str,
+) -> bool:
+    rows = [row for row in rows if is_server_row(row)]
+    return plot_phase_wall_heatmap(
+        rows,
+        output,
+        run_id,
+        fields=SERVER_PHASE_CPU_FIELDS,
+        cpu_fields=SERVER_PHASE_CPU_FIELDS,
+        title="Server certificate phase CPU time heatmap",
+        xlabel="Server certificate generation phase",
+        colorbar_label="Server CPU time per phase (ms, log color scale)",
+        total_cpu_func=server_phase_cpu_total,
+    )
+
+
+def plot_server_phase_resources(
+    rows: list[dict[str, str]],
+    output: Path,
+    run_id: str,
+) -> bool:
+    candidate_fields = []
+    for _title, _label, fields in SERVER_PHASE_RESOURCE_GROUPS:
+        for entry in fields:
+            candidate_fields.extend(entry[:-1])
+    rows = sort_rows([
+        row for row in positive_rows(rows, candidate_fields)
+        if is_server_row(row)
+    ])
+    if not rows:
+        return False
+
+    labels = [row_label(row) for row in rows]
+    phase_labels = [label for _phase, label, _color in SERVER_PHASE_FIELDS]
+    height = max(8.0, len(rows) * 0.62)
+    fig, axes = plt.subplots(
+        1,
+        len(SERVER_PHASE_RESOURCE_GROUPS),
+        figsize=(max(17.0, len(SERVER_PHASE_RESOURCE_GROUPS) * 4.4), height),
+        sharey=True,
+        constrained_layout=True,
+    )
+    if len(SERVER_PHASE_RESOURCE_GROUPS) == 1:
+        axes = [axes]
+    fig.suptitle(f"Server certificate phase resource pressure - {run_id}", fontsize=15)
+
+    for ax, (title, colorbar_label, fields) in zip(axes, SERVER_PHASE_RESOURCE_GROUPS):
+        matrix = []
+        for row in rows:
+            values = []
+            for entry in fields:
+                field_names = entry[:-1]
+                values.append(
+                    sum(float_or_none(row.get(field)) or 0.0 for field in field_names)
+                )
+            matrix.append(values)
+        matrix_array = np.array(matrix, dtype=float)
+        display = np.where(matrix_array > 0, matrix_array, np.nan)
+        positive = display[~np.isnan(display)]
+        if len(positive) == 0:
+            ax.axis("off")
+            continue
+        cmap = plt.get_cmap("YlOrRd").copy()
+        cmap.set_bad("#f8fafc")
+        vmin = max(1.0, float(positive.min()))
+        vmax = float(positive.max())
+        norm = LogNorm(vmin=vmin, vmax=vmax) if vmax > vmin else None
+        image = ax.imshow(display, aspect="auto", cmap=cmap, norm=norm)
+        ax.set_title(title, fontsize=11)
+        ax.set_xticks(np.arange(len(phase_labels)))
+        ax.set_xticklabels(phase_labels, rotation=35, ha="right", fontsize=8)
+        ax.set_yticks(np.arange(len(rows)))
+        ax.set_yticklabels(labels, fontsize=9)
+        ax.grid(which="minor", color="#ffffff", linewidth=1.2)
+        ax.set_xticks(np.arange(-0.5, len(phase_labels), 1), minor=True)
+        ax.set_yticks(np.arange(-0.5, len(rows), 1), minor=True)
+        ax.tick_params(which="minor", bottom=False, left=False)
+        colorbar = fig.colorbar(image, ax=ax, fraction=0.046, pad=0.02)
+        colorbar.set_label(colorbar_label)
+    axes[0].invert_yaxis()
 
     output.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(output, dpi=180)
@@ -1805,58 +2298,70 @@ def main() -> int:
     extension = args.format
     outputs: list[Path] = []
 
-    output = out_dir / f"certificate_summary.{extension}"
+    output = out_dir / f"board_server_certificate_summary.{extension}"
     plot_summary(rows, output, run_dir.name, log_time=not args.linear_time)
     outputs.append(output)
 
     optional_plots = [
         (
             plot_phase_breakdown,
-            out_dir / f"certificate_cpu_phase_breakdown.{extension}",
+            out_dir / f"board_certificate_cpu_phase_breakdown.{extension}",
         ),
         (
             plot_phase_share,
-            out_dir / f"certificate_cpu_phase_share.{extension}",
+            out_dir / f"board_certificate_cpu_phase_share.{extension}",
         ),
         (
             plot_phase_cpu_vs_cpi_share,
-            out_dir / f"certificate_phase_cpu_vs_cpi_share.{extension}",
+            out_dir / f"board_certificate_phase_cpu_vs_cpi_share.{extension}",
         ),
         (
             plot_board_cpu_efficiency,
-            out_dir / f"certificate_board_cpu_efficiency.{extension}",
+            out_dir / f"board_certificate_cpu_efficiency.{extension}",
         ),
         (
             plot_server_cpu_efficiency,
-            out_dir / f"certificate_server_cpu_efficiency.{extension}",
+            out_dir / f"server_certificate_cpu_efficiency.{extension}",
         ),
         (
             plot_wall_cpu_gap,
-            out_dir / f"certificate_wall_cpu_gap.{extension}",
+            out_dir / f"board_server_certificate_wall_cpu_gap.{extension}",
         ),
         (
             plot_server_resource_metrics,
-            out_dir / f"certificate_server_resource_pressure.{extension}",
+            out_dir / f"server_certificate_resource_pressure.{extension}",
         ),
         (
             plot_resource_pressure,
-            out_dir / f"certificate_resource_pressure.{extension}",
+            out_dir / f"board_certificate_resource_pressure.{extension}",
         ),
         (
             plot_thread_cpu_breakdown,
-            out_dir / f"certificate_thread_cpu_breakdown.{extension}",
+            out_dir / f"board_certificate_thread_cpu_breakdown.{extension}",
         ),
         (
             plot_total_cpi,
-            out_dir / f"certificate_total_cpi_log.{extension}",
+            out_dir / f"board_certificate_total_cpi_log.{extension}",
         ),
         (
             plot_phase_wall_heatmap,
-            out_dir / f"certificate_phase_wall_absolute.{extension}",
+            out_dir / f"board_certificate_phase_wall_absolute.{extension}",
         ),
         (
             plot_server_phase_wall_ms,
-            out_dir / f"certificate_server_phase_wall_absolute.{extension}",
+            out_dir / f"server_certificate_phase_wall_absolute.{extension}",
+        ),
+        (
+            plot_server_phase_wall_heatmap,
+            out_dir / f"server_certificate_phase_wall_time.{extension}",
+        ),
+        (
+            plot_server_phase_cpu_heatmap,
+            out_dir / f"server_certificate_phase_cpu_time.{extension}",
+        ),
+        (
+            plot_server_phase_resources,
+            out_dir / f"server_certificate_phase_resources.{extension}",
         ),
         (
             lambda rows, path, run_id: plot_stacked_share(
@@ -1867,7 +2372,7 @@ def main() -> int:
                 "Board certgen LSUCNT phase share",
                 "Share of phase LSUCNT delta (%)",
             ),
-            out_dir / f"certificate_phase_lsu_share.{extension}",
+            out_dir / f"board_certificate_phase_lsu_share.{extension}",
         ),
         (
             lambda rows, path, run_id: plot_stacked_share(
@@ -1878,7 +2383,7 @@ def main() -> int:
                 "Board certgen CPICNT phase share",
                 "Share of phase CPICNT delta (%)",
             ),
-            out_dir / f"certificate_phase_cpi_share.{extension}",
+            out_dir / f"board_certificate_phase_cpi_share.{extension}",
         ),
         (
             lambda rows, path, run_id: plot_stacked_share(
@@ -1889,7 +2394,7 @@ def main() -> int:
                 "Board certgen EXCCNT phase share",
                 "Share of phase exception counter delta (%)",
             ),
-            out_dir / f"certificate_phase_exc_share.{extension}",
+            out_dir / f"board_certificate_phase_exc_share.{extension}",
         ),
         (
             lambda rows, path, run_id: plot_stacked_share(
@@ -1900,7 +2405,7 @@ def main() -> int:
                 "Board certgen SLEEPCNT phase share",
                 "Share of phase sleep counter delta (%)",
             ),
-            out_dir / f"certificate_phase_sleep_share.{extension}",
+            out_dir / f"board_certificate_phase_sleep_share.{extension}",
         ),
         (
             lambda rows, path, run_id: plot_stacked_share(
@@ -1911,51 +2416,51 @@ def main() -> int:
                 "Board certgen FOLDCNT phase share",
                 "Share of phase folded-instruction events (%)",
             ),
-            out_dir / f"certificate_phase_fold_share.{extension}",
+            out_dir / f"board_certificate_phase_fold_share.{extension}",
         ),
         (
             plot_phase_cpi_per_cpu_ms,
-            out_dir / f"certificate_phase_cpi_per_cpu_ms.{extension}",
+            out_dir / f"board_certificate_phase_cpi_per_cpu_ms.{extension}",
         ),
         (
             plot_phase_lsu_per_cpu_ms,
-            out_dir / f"certificate_phase_lsu_per_cpu_ms.{extension}",
+            out_dir / f"board_certificate_phase_lsu_per_cpu_ms.{extension}",
         ),
         (
             plot_phase_lsu_per_cpi,
-            out_dir / f"certificate_phase_lsu_per_cpi.{extension}",
+            out_dir / f"board_certificate_phase_lsu_per_cpi.{extension}",
         ),
         (
             plot_phase_core_cycles_per_cpi,
-            out_dir / f"certificate_phase_core_cycles_per_cpi.{extension}",
+            out_dir / f"board_certificate_phase_core_cycles_per_cpi.{extension}",
         ),
         (
             plot_phase_lsu_per_core_percent,
-            out_dir / f"certificate_phase_lsu_per_core_percent.{extension}",
+            out_dir / f"board_certificate_phase_lsu_per_core_percent.{extension}",
         ),
         (
             plot_phase_cpi_per_core_percent,
-            out_dir / f"certificate_phase_cpi_per_core_percent.{extension}",
+            out_dir / f"board_certificate_phase_cpi_per_core_percent.{extension}",
         ),
         (
             plot_phase_exc_per_core_percent,
-            out_dir / f"certificate_phase_exc_per_core_percent.{extension}",
+            out_dir / f"board_certificate_phase_exc_per_core_percent.{extension}",
         ),
         (
             plot_phase_sleep_per_core_percent,
-            out_dir / f"certificate_phase_sleep_per_core_percent.{extension}",
+            out_dir / f"board_certificate_phase_sleep_per_core_percent.{extension}",
         ),
         (
             plot_phase_fold_per_core_percent,
-            out_dir / f"certificate_phase_fold_per_core_percent.{extension}",
+            out_dir / f"board_certificate_phase_fold_per_core_percent.{extension}",
         ),
         (
             plot_phase_heap_peak,
-            out_dir / f"certificate_phase_heap_peak.{extension}",
+            out_dir / f"board_certificate_phase_heap_peak.{extension}",
         ),
         (
             plot_phase_main_thread_cpu,
-            out_dir / f"certificate_phase_main_thread_cpu.{extension}",
+            out_dir / f"board_certificate_phase_main_thread_cpu.{extension}",
         ),
     ]
     for plotter, path in optional_plots:

@@ -1,6 +1,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/resource.h>
+#include <sys/time.h>
+#include <time.h>
 
 #include <wolfssl/options.h>
 #include <wolfssl/ssl.h>
@@ -9,15 +12,19 @@
 #include <wolfssl/wolfcrypt/error-crypt.h>
 #include <wolfssl/wolfcrypt/random.h>
 #include <wolfssl/wolfcrypt/rsa.h>
+#include <wolfssl/wolfcrypt/wc_mldsa.h>
+#include <wolfssl/wolfcrypt/wc_slhdsa.h>
 
-#define DER_CAP 32768
+#define DER_CAP 65536
 #define KEY_CAP 32768
 #define CERT_NOT_BEFORE "\x18\x0f""20200101000000Z"
 #define CERT_NOT_AFTER  "\x18\x0f""20360101000000Z"
 
 enum KeyKind {
     KEY_ECC,
-    KEY_RSA
+    KEY_RSA,
+    KEY_MLDSA,
+    KEY_SLHDSA
 };
 
 struct Algorithm {
@@ -27,34 +34,127 @@ struct Algorithm {
     int rsa_bits;
     int key_type;
     int sig_type;
+    int mldsa_level;
+    enum SlhDsaParam slhdsa_param;
+};
+
+struct PhaseSample {
+    struct timespec wall;
+    struct rusage usage;
 };
 
 static const struct Algorithm ALGORITHMS[] = {
     {
         "ECDSA-P-256", KEY_ECC, ECC_SECP256R1, 0, ECC_TYPE,
-        CTC_SHA256wECDSA
+        CTC_SHA256wECDSA, 0, SLHDSA_SHAKE128S
     },
     {
         "ECDSA-P-384", KEY_ECC, ECC_SECP384R1, 0, ECC_TYPE,
-        CTC_SHA384wECDSA
+        CTC_SHA384wECDSA, 0, SLHDSA_SHAKE128S
     },
     {
         "ECDSA-P-521", KEY_ECC, ECC_SECP521R1, 0, ECC_TYPE,
-        CTC_SHA512wECDSA
+        CTC_SHA512wECDSA, 0, SLHDSA_SHAKE128S
     },
     {
         "RSA-PSS-3072", KEY_RSA, 0, 3072, RSA_TYPE,
-        CTC_SHA256wRSA
+        CTC_SHA256wRSA, 0, SLHDSA_SHAKE128S
     },
     {
         "RSA-PSS-7680", KEY_RSA, 0, 7680, RSA_TYPE,
-        CTC_SHA384wRSA
+        CTC_SHA384wRSA, 0, SLHDSA_SHAKE128S
     },
     {
         "RSA-PSS-15360", KEY_RSA, 0, 15360, RSA_TYPE,
-        CTC_SHA512wRSA
+        CTC_SHA512wRSA, 0, SLHDSA_SHAKE128S
+    },
+    {
+        "ML-DSA-44", KEY_MLDSA, 0, 0, ML_DSA_44_TYPE,
+        CTC_ML_DSA_44, WC_ML_DSA_44, SLHDSA_SHAKE128S
+    },
+    {
+        "ML-DSA-65", KEY_MLDSA, 0, 0, ML_DSA_65_TYPE,
+        CTC_ML_DSA_65, WC_ML_DSA_65, SLHDSA_SHAKE128S
+    },
+    {
+        "ML-DSA-87", KEY_MLDSA, 0, 0, ML_DSA_87_TYPE,
+        CTC_ML_DSA_87, WC_ML_DSA_87, SLHDSA_SHAKE128S
+    },
+    {
+        "SLH-DSA-SHAKE-128s", KEY_SLHDSA, 0, 0,
+        SLH_DSA_SHAKE_128S_TYPE, CTC_SLH_DSA_SHAKE_128S,
+        0, SLHDSA_SHAKE128S
+    },
+    {
+        "SLH-DSA-SHAKE-128f", KEY_SLHDSA, 0, 0,
+        SLH_DSA_SHAKE_128F_TYPE, CTC_SLH_DSA_SHAKE_128F,
+        0, SLHDSA_SHAKE128F
+    },
+    {
+        "SLH-DSA-SHAKE-192s", KEY_SLHDSA, 0, 0,
+        SLH_DSA_SHAKE_192S_TYPE, CTC_SLH_DSA_SHAKE_192S,
+        0, SLHDSA_SHAKE192S
+    },
+    {
+        "SLH-DSA-SHAKE-192f", KEY_SLHDSA, 0, 0,
+        SLH_DSA_SHAKE_192F_TYPE, CTC_SLH_DSA_SHAKE_192F,
+        0, SLHDSA_SHAKE192F
+    },
+    {
+        "SLH-DSA-SHAKE-256s", KEY_SLHDSA, 0, 0,
+        SLH_DSA_SHAKE_256S_TYPE, CTC_SLH_DSA_SHAKE_256S,
+        0, SLHDSA_SHAKE256S
+    },
+    {
+        "SLH-DSA-SHAKE-256f", KEY_SLHDSA, 0, 0,
+        SLH_DSA_SHAKE_256F_TYPE, CTC_SLH_DSA_SHAKE_256F,
+        0, SLHDSA_SHAKE256F
     },
 };
+
+static long long timeval_us(struct timeval tv)
+{
+    return (long long)tv.tv_sec * 1000000LL + tv.tv_usec;
+}
+
+static long long elapsed_us(struct timespec start, struct timespec end)
+{
+    return (long long)(end.tv_sec - start.tv_sec) * 1000000LL +
+           (end.tv_nsec - start.tv_nsec) / 1000LL;
+}
+
+static void phase_begin(struct PhaseSample* sample)
+{
+    clock_gettime(CLOCK_MONOTONIC, &sample->wall);
+    getrusage(RUSAGE_SELF, &sample->usage);
+}
+
+static void phase_end(const char* name, const struct PhaseSample* start, int status)
+{
+    struct timespec wall;
+    struct rusage usage;
+    long long user_us;
+    long long sys_us;
+
+    clock_gettime(CLOCK_MONOTONIC, &wall);
+    getrusage(RUSAGE_SELF, &usage);
+    user_us = timeval_us(usage.ru_utime) - timeval_us(start->usage.ru_utime);
+    sys_us = timeval_us(usage.ru_stime) - timeval_us(start->usage.ru_stime);
+    printf("[CERT_PHASE] name=%s status=%d wall_us=%lld user_cpu_us=%lld "
+           "sys_cpu_us=%lld cpu_us=%lld max_rss_kb=%ld "
+           "voluntary_context_switches=%ld involuntary_context_switches=%ld "
+           "minor_page_faults=%ld major_page_faults=%ld "
+           "block_input_ops=%ld block_output_ops=%ld\n",
+           name, status, elapsed_us(start->wall, wall), user_us, sys_us,
+           user_us + sys_us, usage.ru_maxrss,
+           usage.ru_nvcsw - start->usage.ru_nvcsw,
+           usage.ru_nivcsw - start->usage.ru_nivcsw,
+           usage.ru_minflt - start->usage.ru_minflt,
+           usage.ru_majflt - start->usage.ru_majflt,
+           usage.ru_inblock - start->usage.ru_inblock,
+           usage.ru_oublock - start->usage.ru_oublock);
+    fflush(stdout);
+}
 
 static int write_file(const char* path, const unsigned char* data, int len)
 {
@@ -169,6 +269,40 @@ static int make_key(const struct Algorithm* alg, WC_RNG* rng, void** key_out)
         return 0;
     }
 
+    if (alg->kind == KEY_MLDSA) {
+        wc_MlDsaKey* key = (wc_MlDsaKey*)malloc(sizeof(*key));
+        if (key == NULL)
+            return MEMORY_E;
+        ret = wc_MlDsaKey_Init(key, NULL, INVALID_DEVID);
+        if (ret == 0)
+            ret = wc_MlDsaKey_SetParams(key, (byte)alg->mldsa_level);
+        if (ret == 0)
+            ret = wc_MlDsaKey_MakeKey(key, rng);
+        if (ret != 0) {
+            wc_MlDsaKey_Free(key);
+            free(key);
+            return ret;
+        }
+        *key_out = key;
+        return 0;
+    }
+
+    if (alg->kind == KEY_SLHDSA) {
+        SlhDsaKey* key = (SlhDsaKey*)malloc(sizeof(*key));
+        if (key == NULL)
+            return MEMORY_E;
+        ret = wc_SlhDsaKey_Init(key, alg->slhdsa_param, NULL, INVALID_DEVID);
+        if (ret == 0)
+            ret = wc_SlhDsaKey_MakeKey(key, rng);
+        if (ret != 0) {
+            wc_SlhDsaKey_Free(key);
+            free(key);
+            return ret;
+        }
+        *key_out = key;
+        return 0;
+    }
+
     return BAD_FUNC_ARG;
 }
 
@@ -180,6 +314,10 @@ static void free_key(const struct Algorithm* alg, void* key)
         wc_ecc_free((ecc_key*)key);
     else if (alg->kind == KEY_RSA)
         wc_FreeRsaKey((RsaKey*)key);
+    else if (alg->kind == KEY_MLDSA)
+        wc_MlDsaKey_Free((wc_MlDsaKey*)key);
+    else if (alg->kind == KEY_SLHDSA)
+        wc_SlhDsaKey_Free((SlhDsaKey*)key);
     free(key);
 }
 
@@ -190,12 +328,30 @@ static int key_to_der(
         return wc_EccKeyToDer((ecc_key*)key, der, derCap);
     if (alg->kind == KEY_RSA)
         return wc_RsaKeyToDer((RsaKey*)key, der, derCap);
+    if (alg->kind == KEY_MLDSA)
+        return wc_MlDsaKey_KeyToDer((wc_MlDsaKey*)key, der, derCap);
+    if (alg->kind == KEY_SLHDSA)
+        return wc_SlhDsaKey_KeyToDer((SlhDsaKey*)key, der, derCap);
     return BAD_FUNC_ARG;
 }
 
 static int key_pem_type(const struct Algorithm* alg)
 {
-    return alg->kind == KEY_ECC ? ECC_PRIVATEKEY_TYPE : PRIVATEKEY_TYPE;
+    if (alg->kind == KEY_ECC)
+        return ECC_PRIVATEKEY_TYPE;
+    if (alg->kind == KEY_RSA)
+        return PRIVATEKEY_TYPE;
+    return PKCS8_PRIVATEKEY_TYPE;
+}
+
+static int write_key_file(
+    const struct Algorithm* alg, const char* path,
+    const unsigned char* der, int derSz)
+{
+    int ret = write_pem_key(path, der, derSz, key_pem_type(alg));
+    if (ret != 0 && (alg->kind == KEY_MLDSA || alg->kind == KEY_SLHDSA))
+        ret = write_file(path, der, derSz);
+    return ret;
 }
 
 static int make_root(
@@ -254,6 +410,24 @@ static int make_leaf(
         alg->key_type, rootKey, rng);
 }
 
+static int verify_leaf(const unsigned char* rootDer, int rootSz,
+    const unsigned char* leafDer, int leafSz)
+{
+    WOLFSSL_CERT_MANAGER* cm;
+    int ret;
+
+    cm = wolfSSL_CertManagerNew();
+    if (cm == NULL)
+        return MEMORY_E;
+    ret = wolfSSL_CertManagerLoadCABuffer(cm, rootDer, rootSz,
+        WOLFSSL_FILETYPE_ASN1);
+    if (ret == WOLFSSL_SUCCESS)
+        ret = wolfSSL_CertManagerVerifyBuffer(cm, leafDer, leafSz,
+            WOLFSSL_FILETYPE_ASN1);
+    wolfSSL_CertManagerFree(cm);
+    return ret == WOLFSSL_SUCCESS ? 0 : ret;
+}
+
 int main(int argc, char** argv)
 {
     const struct Algorithm* alg;
@@ -267,7 +441,9 @@ int main(int argc, char** argv)
     int rootSz;
     int leafSz;
     int leafKeySz;
+    int phaseRet;
     int ret = 1;
+    struct PhaseSample phase;
     WC_RNG rng;
 
     if (argc != 3) {
@@ -291,35 +467,54 @@ int main(int argc, char** argv)
     if (wc_InitRng(&rng) != 0)
         goto cleanup_ssl;
 
-    if (make_key(alg, &rng, &rootKey) != 0)
-        goto cleanup_rng;
-    if (make_key(alg, &rng, &leafKey) != 0)
+    phase_begin(&phase);
+    phaseRet = make_key(alg, &rng, &rootKey);
+    if (phaseRet == 0)
+        phaseRet = make_key(alg, &rng, &leafKey);
+    phase_end("keygen", &phase, phaseRet);
+    if (phaseRet != 0)
         goto cleanup_rng;
 
+    phase_begin(&phase);
     rootSz = make_root(alg, rootKey, &rng, rootDer);
-    if (rootSz <= 0)
-        goto cleanup_rng;
-    leafSz = make_leaf(alg, rootKey, rootDer, rootSz, leafKey, &rng, leafDer);
-    if (leafSz <= 0)
-        goto cleanup_rng;
-    leafKeySz = key_to_der(alg, leafKey, leafKeyDer, KEY_CAP);
-    if (leafKeySz <= 0)
+    phaseRet = rootSz > 0 ? 0 : rootSz;
+    if (phaseRet == 0) {
+        leafSz = make_leaf(alg, rootKey, rootDer, rootSz, leafKey, &rng, leafDer);
+        phaseRet = leafSz > 0 ? 0 : leafSz;
+    }
+    phase_end("sign_cert", &phase, phaseRet);
+    if (phaseRet != 0)
         goto cleanup_rng;
 
-    snprintf(path, sizeof(path), "%s/server_root.der", outdir);
-    if (write_file(path, rootDer, rootSz) != 0)
+    leafKeySz = key_to_der(alg, leafKey, leafKeyDer, KEY_CAP);
+    phaseRet = leafKeySz > 0 ? 0 : leafKeySz;
+    if (phaseRet == 0) {
+        snprintf(path, sizeof(path), "%s/server_root.der", outdir);
+        phaseRet = write_file(path, rootDer, rootSz);
+    }
+    if (phaseRet == 0) {
+        snprintf(path, sizeof(path), "%s/server_root.crt", outdir);
+        phaseRet = write_pem_cert(path, rootDer, rootSz);
+    }
+    if (phaseRet == 0) {
+        snprintf(path, sizeof(path), "%s/server.crt", outdir);
+        phaseRet = write_pem_cert(path, leafDer, leafSz);
+    }
+    if (phaseRet == 0) {
+        snprintf(path, sizeof(path), "%s/server_chain.crt", outdir);
+        phaseRet = write_pem_cert(path, leafDer, leafSz);
+    }
+    if (phaseRet == 0) {
+        snprintf(path, sizeof(path), "%s/server.key", outdir);
+        phaseRet = write_key_file(alg, path, leafKeyDer, leafKeySz);
+    }
+    if (phaseRet != 0)
         goto cleanup_rng;
-    snprintf(path, sizeof(path), "%s/server_root.crt", outdir);
-    if (write_pem_cert(path, rootDer, rootSz) != 0)
-        goto cleanup_rng;
-    snprintf(path, sizeof(path), "%s/server.crt", outdir);
-    if (write_pem_cert(path, leafDer, leafSz) != 0)
-        goto cleanup_rng;
-    snprintf(path, sizeof(path), "%s/server_chain.crt", outdir);
-    if (write_pem_cert(path, leafDer, leafSz) != 0)
-        goto cleanup_rng;
-    snprintf(path, sizeof(path), "%s/server.key", outdir);
-    if (write_pem_key(path, leafKeyDer, leafKeySz, key_pem_type(alg)) != 0)
+
+    phase_begin(&phase);
+    phaseRet = verify_leaf(rootDer, rootSz, leafDer, leafSz);
+    phase_end("verify_cert", &phase, phaseRet);
+    if (phaseRet != 0)
         goto cleanup_rng;
 
     ret = 0;
