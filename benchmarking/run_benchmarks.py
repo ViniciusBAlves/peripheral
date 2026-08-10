@@ -65,6 +65,11 @@ TLS_DWT_METRICS = (
     ("core", "cycles"), ("lsu", "cycles"), ("cpi", "cycles"),
     ("exc", "cycles"), ("sleep", "cycles"), ("fold", "events"),
 )
+LEGACY_TLS_DWT_METRICS = (("lsu", "cycles"), ("cpi", "cycles"))
+ADDED_TLS_DWT_METRICS = tuple(
+    metric for metric in TLS_DWT_METRICS
+    if metric not in LEGACY_TLS_DWT_METRICS
+)
 PI_PROCESS_PREFIXES = ("pi_broker", "pi_bridge")
 PI_PROCESS_METRICS = (
     "utime_ticks", "stime_ticks", "minor_page_faults", "major_page_faults",
@@ -130,11 +135,8 @@ ATTEMPT_FIELDS = [
     "client_cpu_cycles", "client_cycle_hz", "client_cpu_ms",
     "client_cpu_usage_percent", "system_cpu_usage_percent",
     *[f"{phase}_cpu_ms" for phase in TLS_PHASES],
-    *[
-        f"{phase}_{counter}_{suffix}"
-        for counter, suffix in TLS_DWT_METRICS
-        for phase in TLS_PHASES
-    ],
+    *[f"{phase}_lsu_cycles" for phase in TLS_PHASES],
+    *[f"{phase}_cpi_cycles" for phase in TLS_PHASES],
     *[f"{phase}_heap_peak_bytes" for phase in TLS_PHASES],
     *[f"{phase}_thread_main_cpu_percent" for phase in TLS_PHASES],
     *[f"{phase}_thread_idle_cpu_percent" for phase in TLS_PHASES],
@@ -153,12 +155,17 @@ ATTEMPT_FIELDS = [
     "thread_stack_peak_percent",
     "l2cap_rx_ring_peak_bytes", "l2cap_rx_ring_capacity_bytes",
     "l2cap_rx_ring_peak_percent",
-    *PI_PROCESS_ATTEMPT_FIELDS,
     *POWER_ATTEMPT_FIELDS,
     "power_status", "power_profiler_sample_count",
     "power_profiler_window_count", "power_profiler_vdd_mv",
     "power_profiler_output_samples_per_second",
     "error_code", "message",
+    *[
+        f"{phase}_{counter}_{suffix}"
+        for counter, suffix in ADDED_TLS_DWT_METRICS
+        for phase in TLS_PHASES
+    ],
+    *PI_PROCESS_ATTEMPT_FIELDS,
 ]
 
 SUMMARY_FIELDS = [
@@ -174,11 +181,8 @@ SUMMARY_FIELDS = [
     "mean_end_to_end_ms", "connections_per_second", "mean_client_cpu_ms",
     "mean_client_cpu_usage_percent", "mean_system_cpu_usage_percent",
     *[f"mean_{phase}_cpu_ms" for phase in TLS_PHASES],
-    *[
-        f"mean_{phase}_{counter}_{suffix}"
-        for counter, suffix in TLS_DWT_METRICS
-        for phase in TLS_PHASES
-    ],
+    *[f"mean_{phase}_lsu_cycles" for phase in TLS_PHASES],
+    *[f"mean_{phase}_cpi_cycles" for phase in TLS_PHASES],
     *[f"max_{phase}_heap_peak_bytes" for phase in TLS_PHASES],
     *[f"mean_{phase}_thread_main_cpu_percent" for phase in TLS_PHASES],
     *[f"mean_{phase}_thread_idle_cpu_percent" for phase in TLS_PHASES],
@@ -211,13 +215,18 @@ SUMMARY_FIELDS = [
     "max_thread_stack_peak_percent",
     "max_l2cap_rx_ring_peak_bytes", "l2cap_rx_ring_capacity_bytes",
     "max_l2cap_rx_ring_peak_percent",
-    *PI_PROCESS_SUMMARY_FIELDS,
     *[
         f"mean_{window}_{metric}"
         for window in POWER_WINDOWS
         for metric in ("duration_ms", "charge_uc", "energy_uj", "avg_current_ua")
     ],
     *[f"max_{window}_peak_current_ua" for window in POWER_WINDOWS],
+    *[
+        f"mean_{phase}_{counter}_{suffix}"
+        for counter, suffix in ADDED_TLS_DWT_METRICS
+        for phase in TLS_PHASES
+    ],
+    *PI_PROCESS_SUMMARY_FIELDS,
 ]
 
 

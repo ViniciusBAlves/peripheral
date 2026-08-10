@@ -27,17 +27,17 @@ from run_benchmarks import (
 ROOT = Path(__file__).resolve().parent
 RESULTS = ROOT / "results"
 WORK = ROOT / "work"
-SLOW_SIGNATURE_TIMEOUT_SEC = 1.0
+SLOW_SIGNATURE_TIMEOUT_SEC = 2000.0
 SIGNATURE_TIMEOUTS_SEC = {
-    "RSA-PSS-3072": 1.0,
-    "RSA-PSS-7680": 1.0,
-    "RSA-PSS-15360": 1.0,
-    "SLH-DSA-SHAKE-128s": 1.0,
-    "SLH-DSA-SHAKE-128f": 1.0,
-    "SLH-DSA-SHAKE-192s": 1.0,
-    "SLH-DSA-SHAKE-192f": 1.0,
-    "SLH-DSA-SHAKE-256s": 1.0,
-    "SLH-DSA-SHAKE-256f": 1.0,
+    "RSA-PSS-3072": 2400.0,
+    "RSA-PSS-7680": 43200.0,
+    "RSA-PSS-15360": 604800.0,
+    "SLH-DSA-SHAKE-128s": 2400.0,
+    "SLH-DSA-SHAKE-128f": 2400.0,
+    "SLH-DSA-SHAKE-192s": 4200.0,
+    "SLH-DSA-SHAKE-192f": 4200.0,
+    "SLH-DSA-SHAKE-256s": 4200.0,
+    "SLH-DSA-SHAKE-256f": 4200.0,
 }
 PHASES = [
     "keygen", "make_cert", "sign_cert", "parse_cert", "key_export",
@@ -46,6 +46,11 @@ PHASE_THREAD_BUCKETS = ["main", "sysworkq", "bt_rx", "bt_tx", "idle", "other"]
 PHASE_DWT_METRICS = [
     ("core", "cycles"), ("lsu", "cycles"), ("cpi", "cycles"),
     ("exc", "cycles"), ("sleep", "cycles"), ("fold", "events"),
+]
+LEGACY_PHASE_DWT_METRICS = [("lsu", "cycles"), ("cpi", "cycles")]
+ADDED_PHASE_DWT_METRICS = [
+    metric for metric in PHASE_DWT_METRICS
+    if metric not in LEGACY_PHASE_DWT_METRICS
 ]
 
 ATTEMPT_FIELDS = [
@@ -66,26 +71,30 @@ ATTEMPT_FIELDS = [
     ],
     *[f"{phase}_heap_current_bytes" for phase in PHASES],
     *[f"{phase}_heap_peak_bytes" for phase in PHASES],
-    *[
-        f"{phase}_{counter}_{suffix}"
-        for counter, suffix in PHASE_DWT_METRICS
-        for phase in PHASES
-    ],
-    *[
-        f"phase_{counter}_total_{suffix}"
-        for counter, suffix in PHASE_DWT_METRICS
-    ],
+    *[f"{phase}_lsu_cycles" for phase in PHASES],
+    "phase_lsu_total_cycles",
+    *[f"{phase}_cpi_cycles" for phase in PHASES],
+    "phase_cpi_total_cycles",
     "phase_dwt_samples", "dwt_counters_supported", "dwt_wrap_risk",
     "client_heap_current_bytes",
     "client_heap_peak_bytes", "client_heap_free_bytes",
-    "client_heap_capacity_bytes", "firmware_static_ram_used_bytes",
-    "firmware_ram_capacity_bytes", "firmware_static_ram_usage_percent",
-    "thread_stack_used_bytes",
+    "client_heap_capacity_bytes", "thread_stack_used_bytes",
     "thread_stack_capacity_bytes", "thread_stack_peak_percent",
     "client_cert_der_bytes", "client_key_der_bytes",
     "client_cert_der_capacity_bytes", "client_key_der_capacity_bytes",
     "client_hbs_state_capacity_bytes", "error_code",
     "message",
+    *[
+        f"{phase}_{counter}_{suffix}"
+        for counter, suffix in ADDED_PHASE_DWT_METRICS
+        for phase in PHASES
+    ],
+    *[
+        f"phase_{counter}_total_{suffix}"
+        for counter, suffix in ADDED_PHASE_DWT_METRICS
+    ],
+    "firmware_static_ram_used_bytes",
+    "firmware_ram_capacity_bytes", "firmware_static_ram_usage_percent",
 ]
 
 SUMMARY_FIELDS = [
@@ -104,21 +113,24 @@ SUMMARY_FIELDS = [
         for phase in PHASES
     ],
     *[f"max_{phase}_heap_peak_bytes" for phase in PHASES],
+    *[f"mean_{phase}_lsu_cycles" for phase in PHASES],
+    *[f"mean_{phase}_cpi_cycles" for phase in PHASES],
+    "phase_cpu_verify", "mean_phase_lsu_total_cycles",
+    "mean_phase_cpi_total_cycles", "max_phase_dwt_samples",
+    "dwt_counters_supported", "dwt_wrap_risk", "max_client_heap_peak_bytes",
+    "max_thread_stack_peak_percent", "client_cert_der_bytes",
+    "client_key_der_bytes",
     *[
         f"mean_{phase}_{counter}_{suffix}"
-        for counter, suffix in PHASE_DWT_METRICS
+        for counter, suffix in ADDED_PHASE_DWT_METRICS
         for phase in PHASES
     ],
-    "phase_cpu_verify",
     *[
         f"mean_phase_{counter}_total_{suffix}"
-        for counter, suffix in PHASE_DWT_METRICS
+        for counter, suffix in ADDED_PHASE_DWT_METRICS
     ],
-    "max_phase_dwt_samples",
-    "dwt_counters_supported", "dwt_wrap_risk", "max_client_heap_peak_bytes",
     "firmware_static_ram_used_bytes", "firmware_ram_capacity_bytes",
-    "firmware_static_ram_usage_percent", "max_thread_stack_peak_percent",
-    "client_cert_der_bytes", "client_key_der_bytes",
+    "firmware_static_ram_usage_percent",
 ]
 
 

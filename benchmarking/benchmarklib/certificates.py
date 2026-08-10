@@ -13,7 +13,7 @@ from .server_backends import HASH_BASED_SIGNATURES
 
 IMAGE = "peripheral-pqc-openssl:3.10"
 ROOT = Path(__file__).resolve().parents[1]
-CERT_CACHE = ROOT / "work" / "certificate-cache" / "v9"
+CERT_CACHE = ROOT / "work" / "certificate-cache" / "v10"
 LEGACY_CERT_CACHES = (ROOT / "work" / "certificate-cache" / "v1",)
 MIN_CACHE_VALID_SECONDS = 7 * 24 * 60 * 60
 CERT_NOT_BEFORE = "20200101000000Z"
@@ -101,6 +101,26 @@ def _hash_arg(key_type: str) -> str:
     return "-sha256" if bits <= 3072 else "-sha384" if bits <= 7680 else "-sha512"
 
 
+def _hash_name(key_type: str) -> str:
+    bits = _rsa_bits(key_type)
+    if not bits:
+        return ""
+    return "sha256" if bits <= 3072 else "sha384" if bits <= 7680 else "sha512"
+
+
+def _rsa_pss_sigopts(key_type: str) -> str:
+    bits = _rsa_bits(key_type)
+    if not bits:
+        return ""
+    salt_len = 32 if bits <= 3072 else 48 if bits <= 7680 else 64
+    hash_name = _hash_name(key_type)
+    return (
+        "-sigopt rsa_padding_mode:pss "
+        f"-sigopt rsa_mgf1_md:{hash_name} "
+        f"-sigopt rsa_pss_saltlen:{salt_len}"
+    )
+
+
 def _client_signature_algorithms(name: str) -> str:
     ecdsa = {
         "ECDSA-P-256": "ECDSA+SHA256",
@@ -184,6 +204,7 @@ def generate_client_identity(
     cache.mkdir(parents=True, exist_ok=True)
     client_key_args = _key_args(certificate_verify_alg)
     client_hash_arg = _hash_arg(certificate_verify_alg)
+    client_sigopts = _rsa_pss_sigopts(certificate_verify_alg)
     script = f"""
 cat > /out/client.ext <<'EOF'
 basicConstraints=critical,CA:FALSE
@@ -200,7 +221,7 @@ openssl req -x509 -new -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
   -addext keyUsage=critical,keyCertSign,cRLSign
 openssl req -new {client_key_args} \
   -keyout /out/client.key -out /out/client.csr -nodes \
-  -subj /CN=nrf52840-benchmark {client_hash_arg}
+  -subj /CN=nrf52840-benchmark {client_hash_arg} {client_sigopts}
 openssl x509 -req -in /out/client.csr -CA /out/client_ca.crt \
   -CAkey /out/client_ca.key -CAcreateserial -out /out/client.crt \
   -not_before {CERT_NOT_BEFORE} -not_after {CERT_NOT_AFTER} \
@@ -315,11 +336,14 @@ def generate_server_case(case: dict[str, str], output: Path, client_dir: Path, l
     leaf_args = _key_args(signature.leaf_key_type)
     issuer_hash = _hash_arg(signature.issuer_key_type)
     leaf_hash = _hash_arg(signature.leaf_key_type)
+    issuer_sigopts = _rsa_pss_sigopts(signature.issuer_key_type)
+    leaf_sigopts = _rsa_pss_sigopts(signature.leaf_key_type)
     root_setup = f"""
 openssl req -x509 -new {issuer_args} \
   -keyout /out/server_root.key -out /out/server_root.crt -nodes \
   -subj /CN=Peripheral_Benchmark_{signature.name}_Server_Root \
   -not_before {CERT_NOT_BEFORE} -not_after {CERT_NOT_AFTER} \
+  {issuer_hash} {issuer_sigopts} \
   -addext basicConstraints=critical,CA:TRUE \
   -addext keyUsage=critical,keyCertSign,cRLSign
 openssl x509 -in /out/server_root.crt -outform DER -out /out/server_root.der
@@ -329,11 +353,11 @@ openssl x509 -in /out/server_root.crt -outform DER -out /out/server_root.der
 printf 'basicConstraints=critical,CA:FALSE\\nkeyUsage=critical,digitalSignature,keyEncipherment\\nextendedKeyUsage=critical,serverAuth\\nsubjectAltName=DNS:localhost,IP:127.0.0.1\\nsubjectKeyIdentifier=hash\\nauthorityKeyIdentifier=keyid,issuer\\n' \
   > /out/server.ext
 openssl req -new {leaf_args} -keyout /out/server.key -out /out/server.csr \
-  -nodes -subj /CN=localhost {leaf_hash}
+  -nodes -subj /CN=localhost {leaf_hash} {leaf_sigopts}
 openssl x509 -req -in /out/server.csr -CA /out/server_root.crt \
   -CAkey /out/server_root.key -CAcreateserial -out /out/server.crt \
   -not_before {CERT_NOT_BEFORE} -not_after {CERT_NOT_AFTER} \
-  -extfile /out/server.ext {issuer_hash}
+  -extfile /out/server.ext {issuer_hash} {issuer_sigopts}
 cp /out/server.crt /out/server_chain.crt
 openssl verify -purpose sslserver -CAfile /out/server_root.crt /out/server.crt
 """

@@ -28,6 +28,68 @@ HYBRID_COLOR = "#6b7280"
 WOLFSSL_PQC_COLOR = "#9333ea"
 WOLFSSL_CLASSIC_COLOR = "#16a34a"
 CPU_OVERLAY_COLOR = "#f97316"
+LEGACY_PHASE_NAMES = ["keygen", "make_cert", "sign_cert", "parse_cert", "key_export"]
+LEGACY_THREAD_BUCKETS = ["main", "sysworkq", "bt_rx", "bt_tx", "idle", "other"]
+SERVER_RESOURCE_SUMMARY_FIELDS = [
+    "mean_voluntary_context_switches", "mean_involuntary_context_switches",
+    "mean_minor_page_faults", "mean_major_page_faults",
+    "mean_block_input_ops", "mean_block_output_ops",
+]
+LEGACY_3AB6_SUMMARY_FIELDS = [
+    "component", "owner", "cert_sig_alg", "sig_family", "sig_nist_level",
+    "builder", "generation_scope", "status", "success_count", "fail_count",
+    "mean_wall_ms", "min_wall_ms", "max_wall_ms",
+    "mean_cpu_ms", "mean_user_cpu_ms", "mean_sys_cpu_ms",
+    "max_rss_kb", "mean_output_total_bytes",
+    "server_chain_crt_bytes", "server_key_bytes",
+    "client_cert_crt_bytes", "client_key_bytes",
+    "client_csr_der_bytes", "client_csr_pem_bytes",
+    "mean_client_cpu_ms", "mean_thread_main_cpu_percent",
+    "mean_thread_sysworkq_cpu_percent", "mean_thread_bt_rx_cpu_percent",
+    "mean_thread_bt_tx_cpu_percent", "mean_thread_idle_cpu_percent",
+    "mean_thread_other_cpu_percent", "max_client_heap_peak_bytes",
+    "mean_keygen_cpu_ms", "mean_make_cert_cpu_ms",
+    "mean_sign_cert_cpu_ms", "mean_parse_cert_cpu_ms",
+    "mean_key_export_cpu_ms", "mean_phase_cpu_total_ms",
+    *[f"mean_{phase}_wall_ms" for phase in LEGACY_PHASE_NAMES],
+    *[
+        f"mean_{phase}_thread_{bucket}_cpu_percent"
+        for bucket in LEGACY_THREAD_BUCKETS
+        for phase in LEGACY_PHASE_NAMES
+    ],
+    *[f"max_{phase}_heap_peak_bytes" for phase in LEGACY_PHASE_NAMES],
+    *[f"mean_{phase}_lsu_cycles" for phase in LEGACY_PHASE_NAMES],
+    *[f"mean_{phase}_cpi_cycles" for phase in LEGACY_PHASE_NAMES],
+    "phase_cpu_verify", "mean_phase_lsu_total_cycles",
+    "mean_phase_cpi_total_cycles", "max_phase_dwt_samples",
+    "dwt_counters_supported", "dwt_wrap_risk",
+    "max_thread_stack_peak_percent", "client_cert_der_bytes",
+    "client_key_der_bytes",
+]
+RESOURCE_PREFIX_DWT_METRICS = [
+    ("core", "cycles"), ("lsu", "cycles"), ("cpi", "cycles"),
+    ("exc", "cycles"), ("sleep", "cycles"), ("fold", "events"),
+]
+RESOURCE_PREFIX_BOARD_SUMMARY_FIELDS = (
+    LEGACY_3AB6_SUMMARY_FIELDS[:17] +
+    SERVER_RESOURCE_SUMMARY_FIELDS +
+    LEGACY_3AB6_SUMMARY_FIELDS[17:78] +
+    [
+        f"mean_{phase}_{counter}_{suffix}"
+        for counter, suffix in RESOURCE_PREFIX_DWT_METRICS
+        for phase in LEGACY_PHASE_NAMES
+    ] +
+    ["phase_cpu_verify"] +
+    [
+        f"mean_phase_{counter}_total_{suffix}"
+        for counter, suffix in RESOURCE_PREFIX_DWT_METRICS
+    ] +
+    [
+        "max_phase_dwt_samples", "dwt_counters_supported", "dwt_wrap_risk",
+        "max_thread_stack_peak_percent", "client_cert_der_bytes",
+        "client_key_der_bytes",
+    ]
+)
 
 
 def resolve_run_dir(value: str) -> Path:
@@ -83,7 +145,17 @@ def load_summary(run_dir: Path, include_failed: bool) -> list[dict[str, str]]:
         raise FileNotFoundError(f"summary.csv not found in {run_dir}")
 
     with summary_csv.open(newline="") as fp:
-        rows = list(csv.DictReader(fp))
+        reader = csv.reader(fp)
+        try:
+            header = next(reader)
+        except StopIteration:
+            raise ValueError(f"empty summary.csv in {run_dir}") from None
+        rows = [
+            summary_row_from_values(header, values)
+            for values in reader
+        ]
+
+    hydrate_board_output_sizes(run_dir, rows)
 
     usable = []
     for row in rows:
@@ -97,8 +169,90 @@ def load_summary(run_dir: Path, include_failed: bool) -> list[dict[str, str]]:
     return usable
 
 
+def summary_row_from_values(header: list[str], values: list[str]) -> dict[str, str]:
+    row_header = compatible_summary_header(header, values)
+    return {
+        field: values[index] if index < len(values) else ""
+        for index, field in enumerate(row_header)
+    }
+
+
+def compatible_summary_header(header: list[str], values: list[str]) -> list[str]:
+    if len(values) == len(header):
+        return header
+    if (
+        len(values) >= len(RESOURCE_PREFIX_BOARD_SUMMARY_FIELDS)
+        and values[:1] == ["client_certificate"]
+        and len(values) > 5
+        and values[5] == "wolfssl_board"
+    ):
+        return RESOURCE_PREFIX_BOARD_SUMMARY_FIELDS
+    return header
+
+
 def is_server_row(row: dict[str, str]) -> bool:
     return row.get("component") == "server_chain" or row.get("owner") == "server"
+
+
+def is_board_row(row: dict[str, str]) -> bool:
+    return (
+        row.get("component") in {"client_certificate", "client_identity"}
+        or row.get("builder") == "wolfssl_board"
+    )
+
+
+def board_attempt_key(row: dict[str, str]) -> tuple[str, str, str, str, str]:
+    return (
+        row.get("component") or "",
+        row.get("owner") or "",
+        row.get("cert_sig_alg") or "",
+        row.get("sig_nist_level") or "",
+        row.get("builder") or "",
+    )
+
+
+def hydrate_board_output_sizes(run_dir: Path, rows: list[dict[str, str]]) -> None:
+    attempts_csv = run_dir / "attempts.csv"
+    if not attempts_csv.exists():
+        return
+
+    with attempts_csv.open(newline="") as fp:
+        attempts = csv.DictReader(fp)
+        metrics = {}
+        for attempt in attempts:
+            if attempt.get("status") != "success" or not is_board_row(attempt):
+                continue
+            entry = metrics.setdefault(board_attempt_key(attempt), {})
+            cert = float_or_none(attempt.get("client_cert_der_bytes"))
+            key = float_or_none(attempt.get("client_key_der_bytes"))
+            if cert is not None and key is not None and cert + key > 0:
+                entry["client_cert_der_bytes"] = f"{cert:.0f}"
+                entry["client_key_der_bytes"] = f"{key:.0f}"
+                entry["mean_output_total_bytes"] = f"{cert + key:.0f}"
+            heap_peak = float_or_none(attempt.get("client_heap_peak_bytes"))
+            if heap_peak is not None:
+                current = float_or_none(entry.get("max_client_heap_peak_bytes")) or 0.0
+                entry["max_client_heap_peak_bytes"] = f"{max(current, heap_peak):.0f}"
+            for field in (
+                "client_heap_capacity_bytes",
+                "firmware_static_ram_used_bytes",
+                "firmware_ram_capacity_bytes",
+                "firmware_static_ram_usage_percent",
+            ):
+                value = attempt.get(field)
+                if value not in (None, "", "None"):
+                    entry.setdefault(field, value)
+
+    for row in rows:
+        if not is_board_row(row):
+            continue
+        attempt_metrics = metrics.get(board_attempt_key(row))
+        if attempt_metrics is None:
+            continue
+        for field, value in attempt_metrics.items():
+            current = float_or_none(row.get(field))
+            if current is None or current <= 0.0:
+                row[field] = value
 
 
 def builder_label(row: dict[str, str], *, short: bool = False) -> str:
@@ -205,11 +359,13 @@ def memory_kb(row: dict[str, str]) -> float:
 
 def output_size_bytes(row: dict[str, str]) -> float:
     total = float_or_none(row.get("mean_output_total_bytes"))
-    if total is not None:
+    if total is not None and total > 0:
         return total
     cert = float_or_none(row.get("client_cert_der_bytes")) or 0.0
     key = float_or_none(row.get("client_key_der_bytes")) or 0.0
-    return cert + key
+    if cert + key > 0:
+        return cert + key
+    return total or 0.0
 
 
 PHASE_FIELDS = [
@@ -336,7 +492,7 @@ SERVER_RESOURCE_PANELS = [
 ]
 
 SERVER_PHASE_FIELDS = [
-    ("keygen", "Keygen", "#2563eb"),
+    ("keygen_csr", "Keygen", "#2563eb"),
     ("sign_cert", "Sign cert", "#dc2626"),
     ("verify_cert", "Verify cert", "#0f766e"),
 ]
@@ -447,7 +603,6 @@ def add_family_legend(ax, *, loc: str = "lower right") -> None:
     legend_handles = [
         plt.Rectangle((0, 0), 1, 1, color=CLASSIC_COLOR, label="Classic"),
         plt.Rectangle((0, 0), 1, 1, color=PQC_COLOR, label="PQC"),
-        plt.Rectangle((0, 0), 1, 1, color=HYBRID_COLOR, label="Hybrid"),
     ]
     ax.legend(handles=legend_handles, loc=loc, fontsize=8)
 
@@ -473,6 +628,18 @@ def phase_total(row: dict[str, str]) -> float:
     if explicit is not None:
         return explicit
     return sum(phase_values(row))
+
+
+def field_total(row: dict[str, str], fields: list[tuple[str, str, str]]) -> float:
+    return sum(float_or_none(row.get(field)) or 0.0 for field, _label, _color in fields)
+
+
+def phase_wall_total(row: dict[str, str]) -> float:
+    return field_total(row, PHASE_WALL_FIELDS)
+
+
+def server_phase_wall_total(row: dict[str, str]) -> float:
+    return field_total(row, SERVER_PHASE_WALL_FIELDS)
 
 
 def sort_rows(rows: list[dict[str, str]]) -> list[dict[str, str]]:
@@ -880,7 +1047,6 @@ def plot_summary(
     legend_handles = [
         plt.Rectangle((0, 0), 1, 1, color=CLASSIC_COLOR, label="Classic"),
         plt.Rectangle((0, 0), 1, 1, color=PQC_COLOR, label="PQC"),
-        plt.Rectangle((0, 0), 1, 1, color=HYBRID_COLOR, label="Hybrid"),
         plt.Rectangle(
             (0, 0), 1, 1, facecolor="none", edgecolor=CPU_OVERLAY_COLOR,
             hatch="//", label="CPU time overlay"
@@ -1029,6 +1195,7 @@ def plot_phase_cpu_vs_cpi_share(
     cpu_left = np.zeros(len(rows))
     cpi_left = np.zeros(len(rows))
     lsu_left = np.zeros(len(rows))
+    bar_height = 0.30
     for (
         (cpu_field, label, color),
         (cpi_field, _cpi_label, _cpi_color),
@@ -1059,15 +1226,18 @@ def plot_phase_cpu_vs_cpi_share(
         )
         ax.barh(
             cpu_positions, cpu_shares, left=cpu_left, label=label,
-            color=color, edgecolor="#111827", linewidth=0.25
+            color=color, edgecolor="#111827", linewidth=0.25,
+            height=bar_height,
         )
         ax.barh(
             cpi_positions, cpi_shares, left=cpi_left,
-            color=color, edgecolor="#111827", linewidth=0.25, alpha=0.72
+            color=color, edgecolor="#111827", linewidth=0.25,
+            height=bar_height, alpha=0.72
         )
         ax.barh(
             lsu_positions, lsu_shares, left=lsu_left,
-            color=color, edgecolor="#111827", linewidth=0.25, alpha=0.50
+            color=color, edgecolor="#111827", linewidth=0.25,
+            height=bar_height, alpha=0.50
         )
         cpu_left += cpu_shares
         cpi_left += cpi_shares
@@ -1183,13 +1353,6 @@ def plot_cpu_efficiency(
             scatter_sizes,
         )
 
-    axes[0].text(
-        0.02, 0.02,
-        "Right plot bubble size follows peak memory where available.",
-        transform=axes[0].transAxes,
-        fontsize=8,
-        color="#374151",
-    )
     axes[0].invert_yaxis()
     if legend_func is not None:
         legend_func(axes[0])
@@ -1307,7 +1470,6 @@ def plot_wall_cpu_gap(
     legend_handles = [
         plt.Rectangle((0, 0), 1, 1, color=CLASSIC_COLOR, label="Classic"),
         plt.Rectangle((0, 0), 1, 1, color=PQC_COLOR, label="PQC"),
-        plt.Rectangle((0, 0), 1, 1, color=HYBRID_COLOR, label="Hybrid"),
         plt.Rectangle((0, 0), 1, 1, color=CPU_OVERLAY_COLOR, label="Wall minus CPU"),
     ]
     axes[0].legend(handles=legend_handles, loc="lower right", fontsize=8)
@@ -1326,14 +1488,7 @@ def plot_resource_pressure(
     output: Path,
     run_id: str,
 ) -> bool:
-    original_rows = rows
-    ram_fields = ["firmware_static_ram_used_bytes", "firmware_ram_capacity_bytes"]
-    fields = ram_fields
-    rows = sort_rows(positive_rows(rows, fields))
-    use_firmware_ram = bool(rows)
-    if not rows:
-        fields = ["max_client_heap_peak_bytes", "max_thread_stack_peak_percent"]
-        rows = sort_rows(positive_rows(original_rows, fields))
+    rows = sort_rows(positive_rows(rows, ["max_client_heap_peak_bytes"]))
     if not rows:
         return False
 
@@ -1348,60 +1503,50 @@ def plot_resource_pressure(
         sharey=True,
         constrained_layout=True,
     )
-    title = "Board certificate firmware RAM pressure" if use_firmware_ram else (
-        "Board certificate resource pressure"
+    fig.suptitle(f"Board certificate dynamic memory pressure - {run_id}", fontsize=15)
+
+    heap_bytes = [
+        float_or_none(row.get("max_client_heap_peak_bytes")) or 0.0
+        for row in rows
+    ]
+    heap_kb = [value / 1024.0 for value in heap_bytes]
+    raw_heap_capacity = [
+        float_or_none(row.get("client_heap_capacity_bytes")) or 0.0
+        for row in rows
+    ]
+    known_heap_capacity = [value for value in raw_heap_capacity if value > 0.0]
+    default_heap_capacity = (
+        float(np.median(known_heap_capacity)) if known_heap_capacity else 0.0
     )
-    fig.suptitle(f"{title} - {run_id}", fontsize=15)
-
-    if use_firmware_ram:
-        ram_kb = [
-            (float_or_none(row.get("firmware_static_ram_used_bytes")) or 0.0) / 1024.0
-            for row in rows
-        ]
-        ram_pct = [
-            (
-                (float_or_none(row.get("firmware_static_ram_used_bytes")) or 0.0) *
-                100.0 /
-                (float_or_none(row.get("firmware_ram_capacity_bytes")) or 1.0)
+    heap_capacity = []
+    used_capacity_fallback = False
+    for row, capacity in zip(rows, raw_heap_capacity):
+        if capacity <= 0.0:
+            capacity = (
+                default_heap_capacity
+                or float_or_none(row.get("firmware_ram_capacity_bytes"))
+                or 0.0
             )
-            for row in rows
-        ]
-        left_bars = axes[0].barh(
-            positions, ram_kb, color=colors, edgecolor="#111827", linewidth=0.35
-        )
-        axes[0].set_xlabel("Firmware RAM used (KB)")
-        pad_x_axis(axes[0], ram_kb, log_scale=False)
-        annotate_bars(axes[0], left_bars, ram_kb, suffix=" KB")
+            used_capacity_fallback = used_capacity_fallback or capacity > 0.0
+        heap_capacity.append(capacity)
+    heap_pct = [
+        (heap * 100.0 / capacity) if capacity > 0.0 else 0.0
+        for heap, capacity in zip(heap_bytes, heap_capacity)
+    ]
 
-        right_bars = axes[1].barh(
-            positions, ram_pct, color=colors, edgecolor="#111827", linewidth=0.35
-        )
-        axes[1].set_xlabel("Firmware RAM used / nRF SRAM (%)")
-        axes[1].set_xlim(0, max(100.0, max(ram_pct) * 1.12 if ram_pct else 100.0))
-        annotate_bars(axes[1], right_bars, ram_pct, suffix="%")
-    else:
-        heap_kb = [
-            (float_or_none(row.get("max_client_heap_peak_bytes")) or 0.0) / 1024.0
-            for row in rows
-        ]
-        stack_pct = numeric(rows, "max_thread_stack_peak_percent")
-        phase_verify = [row.get("phase_cpu_verify", "") for row in rows]
-        heap_bars = axes[0].barh(
-            positions, heap_kb, color=colors, edgecolor="#111827", linewidth=0.35
-        )
-        axes[0].set_xlabel("Peak wolfSSL heap (KB)")
-        pad_x_axis(axes[0], heap_kb, log_scale=False)
-        annotate_bars(axes[0], heap_bars, heap_kb, suffix=" KB")
+    heap_bars = axes[0].barh(
+        positions, heap_kb, color=colors, edgecolor="#111827", linewidth=0.35
+    )
+    axes[0].set_xlabel("Peak wolfSSL heap (KB)")
+    pad_x_axis(axes[0], heap_kb, log_scale=False)
+    annotate_bars(axes[0], heap_bars, heap_kb, suffix=" KB")
 
-        stack_hatches = ["//" if verify == "fail" else "" for verify in phase_verify]
-        stack_bars = axes[1].barh(
-            positions, stack_pct, color=colors, edgecolor="#111827", linewidth=0.35
-        )
-        for bar, hatch in zip(stack_bars, stack_hatches):
-            bar.set_hatch(hatch)
-        axes[1].set_xlabel("Peak thread stack usage (%)")
-        axes[1].set_xlim(0, max(100.0, max(stack_pct) * 1.12 if stack_pct else 100.0))
-        annotate_bars(axes[1], stack_bars, stack_pct, suffix="%")
+    heap_pct_bars = axes[1].barh(
+        positions, heap_pct, color=colors, edgecolor="#111827", linewidth=0.35
+    )
+    axes[1].set_xlabel("Peak wolfSSL heap usage (%)")
+    axes[1].set_xlim(0, max(100.0, max(heap_pct) * 1.12 if heap_pct else 100.0))
+    annotate_bars(axes[1], heap_pct_bars, heap_pct, suffix="%")
 
     axes[0].set_yticks(positions)
     axes[0].set_yticklabels(labels, fontsize=9)
@@ -1571,7 +1716,8 @@ def plot_phase_wall_heatmap(
     title: str = "Board certgen phase wall time heatmap",
     xlabel: str = "Certificate generation phase",
     colorbar_label: str = "Wall time per phase (ms, log color scale)",
-    total_cpu_func=phase_total,
+    total_func=phase_wall_total,
+    total_label: str = "Phase wall total",
 ) -> bool:
     rows = sort_rows(positive_rows(rows, [field for field, _label, _color in fields]))
     if not rows:
@@ -1643,7 +1789,7 @@ def plot_phase_wall_heatmap(
         ax.text(
             len(fields) + 0.08,
             y,
-            f"CPU {format_duration_ms(total_cpu_func(row))}",
+            f"{total_label} {format_duration_ms(total_func(row))}",
             ha="left",
             va="center",
             fontsize=8,
@@ -1652,7 +1798,7 @@ def plot_phase_wall_heatmap(
     ax.text(
         len(fields) + 0.08,
         -0.72,
-        "Total CPU",
+        total_label,
         ha="left",
         va="center",
         fontsize=9,
@@ -1733,7 +1879,8 @@ def plot_server_phase_wall_heatmap(
         title="Server certificate phase wall time heatmap",
         xlabel="Server certificate generation phase",
         colorbar_label="Server wall time per phase (ms, log color scale)",
-        total_cpu_func=server_phase_cpu_total,
+        total_func=server_phase_wall_total,
+        total_label="Phase wall total",
     )
 
 
@@ -1752,7 +1899,8 @@ def plot_server_phase_cpu_heatmap(
         title="Server certificate phase CPU time heatmap",
         xlabel="Server certificate generation phase",
         colorbar_label="Server CPU time per phase (ms, log color scale)",
-        total_cpu_func=server_phase_cpu_total,
+        total_func=server_phase_cpu_total,
+        total_label="Phase CPU total",
     )
 
 
@@ -2294,6 +2442,8 @@ def main() -> int:
     args = parse_args()
     run_dir = resolve_run_dir(args.run)
     rows = load_summary(run_dir, include_failed=args.include_failed)
+    board_rows = [row for row in rows if is_board_row(row)]
+    server_rows = [row for row in rows if is_server_row(row)]
     out_dir = args.out_dir or DEFAULT_OUT_ROOT / run_dir.name
     extension = args.format
     outputs: list[Path] = []
@@ -2464,7 +2614,12 @@ def main() -> int:
         ),
     ]
     for plotter, path in optional_plots:
-        if plotter(rows, path, run_dir.name):
+        plot_rows = rows
+        if path.name.startswith("board_certificate_"):
+            plot_rows = board_rows
+        elif path.name.startswith("server_certificate_"):
+            plot_rows = server_rows
+        if plotter(plot_rows, path, run_dir.name):
             outputs.append(path)
 
     print(f"rows={len(rows)}")

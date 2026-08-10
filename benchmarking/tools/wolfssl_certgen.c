@@ -10,6 +10,7 @@
 #include <wolfssl/wolfcrypt/asn.h>
 #include <wolfssl/wolfcrypt/ecc.h>
 #include <wolfssl/wolfcrypt/error-crypt.h>
+#include <wolfssl/wolfcrypt/hash.h>
 #include <wolfssl/wolfcrypt/random.h>
 #include <wolfssl/wolfcrypt/rsa.h>
 #include <wolfssl/wolfcrypt/wc_mldsa.h>
@@ -111,6 +112,244 @@ static const struct Algorithm ALGORITHMS[] = {
         0, SLHDSA_SHAKE256F
     },
 };
+
+static int der_len_size(int len)
+{
+    if (len < 0)
+        return 0;
+    if (len < 128)
+        return 1;
+    if (len <= 0xff)
+        return 2;
+    if (len <= 0xffff)
+        return 3;
+    return 4;
+}
+
+static int der_write_len(unsigned char* out, int len)
+{
+    if (len < 128) {
+        out[0] = (unsigned char)len;
+        return 1;
+    }
+    if (len <= 0xff) {
+        out[0] = 0x81;
+        out[1] = (unsigned char)len;
+        return 2;
+    }
+    if (len <= 0xffff) {
+        out[0] = 0x82;
+        out[1] = (unsigned char)(len >> 8);
+        out[2] = (unsigned char)len;
+        return 3;
+    }
+    out[0] = 0x83;
+    out[1] = (unsigned char)(len >> 16);
+    out[2] = (unsigned char)(len >> 8);
+    out[3] = (unsigned char)len;
+    return 4;
+}
+
+static int der_write_header(unsigned char* out, unsigned char tag, int len)
+{
+    out[0] = tag;
+    return 1 + der_write_len(out + 1, len);
+}
+
+static int der_read_header(
+    const unsigned char* der, int derSz, unsigned char tag,
+    int* headerSz, int* contentSz)
+{
+    int count;
+    int value;
+
+    if (derSz < 2 || der[0] != tag)
+        return ASN_PARSE_E;
+    if ((der[1] & 0x80) == 0) {
+        *headerSz = 2;
+        *contentSz = der[1];
+        return *headerSz + *contentSz <= derSz ? 0 : BUFFER_E;
+    }
+    count = der[1] & 0x7f;
+    if (count < 1 || count > 3 || derSz < 2 + count)
+        return ASN_PARSE_E;
+    value = 0;
+    for (int i = 0; i < count; i++)
+        value = (value << 8) | der[2 + i];
+    *headerSz = 2 + count;
+    *contentSz = value;
+    return *headerSz + *contentSz <= derSz ? 0 : BUFFER_E;
+}
+
+static int rsa_pss_params(
+    const struct Algorithm* alg, int* hashOid, enum wc_HashType* hashType,
+    int* mgf, int* saltLen)
+{
+    if (alg->kind != KEY_RSA)
+        return BAD_FUNC_ARG;
+    if (alg->sig_type == CTC_SHA256wRSA) {
+        *hashOid = SHA256h;
+        *hashType = WC_HASH_TYPE_SHA256;
+        *mgf = WC_MGF1SHA256;
+        *saltLen = WC_SHA256_DIGEST_SIZE;
+        return 0;
+    }
+    if (alg->sig_type == CTC_SHA384wRSA) {
+        *hashOid = SHA384h;
+        *hashType = WC_HASH_TYPE_SHA384;
+        *mgf = WC_MGF1SHA384;
+        *saltLen = WC_SHA384_DIGEST_SIZE;
+        return 0;
+    }
+    if (alg->sig_type != CTC_SHA512wRSA)
+        return HASH_TYPE_E;
+    *hashOid = SHA512h;
+    *hashType = WC_HASH_TYPE_SHA512;
+    *mgf = WC_MGF1SHA512;
+    *saltLen = WC_SHA512_DIGEST_SIZE;
+    return 0;
+}
+
+static const unsigned char* rsa_legacy_sig_alg(
+    const struct Algorithm* alg, int* len)
+{
+    static const unsigned char sha256[] = {
+        0x30, 0x0d, 0x06, 0x09, 0x2a, 0x86, 0x48, 0x86,
+        0xf7, 0x0d, 0x01, 0x01, 0x0b, 0x05, 0x00
+    };
+    static const unsigned char sha384[] = {
+        0x30, 0x0d, 0x06, 0x09, 0x2a, 0x86, 0x48, 0x86,
+        0xf7, 0x0d, 0x01, 0x01, 0x0c, 0x05, 0x00
+    };
+    static const unsigned char sha512[] = {
+        0x30, 0x0d, 0x06, 0x09, 0x2a, 0x86, 0x48, 0x86,
+        0xf7, 0x0d, 0x01, 0x01, 0x0d, 0x05, 0x00
+    };
+
+    *len = 15;
+    if (alg->sig_type == CTC_SHA256wRSA)
+        return sha256;
+    if (alg->sig_type == CTC_SHA384wRSA)
+        return sha384;
+    if (alg->sig_type != CTC_SHA512wRSA) {
+        *len = 0;
+        return NULL;
+    }
+    return sha512;
+}
+
+static int replace_tbs_sig_alg(
+    const struct Algorithm* alg, unsigned char* tbs, int* tbsSz, int tbsCap,
+    const unsigned char* pssAlg, int pssAlgSz)
+{
+    const unsigned char* legacy;
+    int legacySz;
+    int oldHdr;
+    int oldContent;
+    int newContent;
+    int newHdr;
+    int pos = -1;
+
+    legacy = rsa_legacy_sig_alg(alg, &legacySz);
+    if (legacy == NULL || legacySz == 0)
+        return HASH_TYPE_E;
+    for (int i = 0; i + legacySz <= *tbsSz; i++) {
+        if (memcmp(tbs + i, legacy, (size_t)legacySz) == 0) {
+            pos = i;
+            break;
+        }
+    }
+    if (pos < 0)
+        return ASN_PARSE_E;
+    if (der_read_header(tbs, *tbsSz, 0x30, &oldHdr, &oldContent) != 0)
+        return ASN_PARSE_E;
+
+    newContent = oldContent + pssAlgSz - legacySz;
+    newHdr = 1 + der_len_size(newContent);
+    if (newHdr + newContent > tbsCap)
+        return BUFFER_E;
+
+    memmove(tbs + pos + pssAlgSz, tbs + pos + legacySz,
+        (size_t)(*tbsSz - pos - legacySz));
+    memcpy(tbs + pos, pssAlg, (size_t)pssAlgSz);
+    if (newHdr != oldHdr)
+        memmove(tbs + newHdr, tbs + oldHdr, (size_t)newContent);
+    der_write_header(tbs, 0x30, newContent);
+    *tbsSz = newHdr + newContent;
+    return 0;
+}
+
+static int wrap_rsa_pss_cert(
+    unsigned char* tbs, int tbsSz, int tbsCap,
+    const unsigned char* pssAlg, int pssAlgSz, const unsigned char* sig,
+    int sigSz)
+{
+    int bitStringHdrSz;
+    int contentSz;
+    int certHdrSz;
+    int offset;
+
+    bitStringHdrSz = 1 + der_len_size(sigSz + 1);
+    contentSz = tbsSz + pssAlgSz + bitStringHdrSz + 1 + sigSz;
+    certHdrSz = 1 + der_len_size(contentSz);
+    if (certHdrSz + contentSz > tbsCap)
+        return BUFFER_E;
+
+    memmove(tbs + certHdrSz, tbs, (size_t)tbsSz);
+    offset = der_write_header(tbs, 0x30, contentSz);
+    offset += tbsSz;
+    memcpy(tbs + offset, pssAlg, (size_t)pssAlgSz);
+    offset += pssAlgSz;
+    offset += der_write_header(tbs + offset, 0x03, sigSz + 1);
+    tbs[offset++] = 0;
+    memcpy(tbs + offset, sig, (size_t)sigSz);
+    return certHdrSz + contentSz;
+}
+
+static int sign_rsa_pss_cert(
+    const struct Algorithm* alg, Cert* cert, unsigned char* der, int derCap,
+    RsaKey* signingKey, WC_RNG* rng)
+{
+    unsigned char pssAlg[128];
+    unsigned char digest[WC_MAX_DIGEST_SIZE];
+    unsigned char* sig = NULL;
+    enum wc_HashType hashType;
+    int hashOid;
+    int mgf;
+    int saltLen;
+    int digestSz;
+    int pssAlgSz;
+    int sigCap;
+    int sigSz;
+    int ret;
+
+    ret = rsa_pss_params(alg, &hashOid, &hashType, &mgf, &saltLen);
+    if (ret != 0)
+        return ret;
+    pssAlgSz = (int)wc_EncodeRsaPssAlgoId(hashOid, saltLen, pssAlg,
+        sizeof(pssAlg));
+    if (pssAlgSz <= 0)
+        return ASN_UNKNOWN_OID_E;
+    ret = replace_tbs_sig_alg(alg, der, &cert->bodySz, derCap, pssAlg,
+        pssAlgSz);
+    if (ret != 0)
+        return ret;
+    ret = wc_Hash(hashType, der, (word32)cert->bodySz, digest, sizeof(digest));
+    if (ret != 0)
+        return ret;
+    digestSz = wc_HashGetDigestSize(hashType);
+    sigCap = wc_RsaEncryptSize(signingKey);
+    sig = (unsigned char*)malloc((size_t)sigCap);
+    if (sig == NULL)
+        return MEMORY_E;
+    sigSz = wc_RsaPSS_Sign_ex(digest, (word32)digestSz, sig, (word32)sigCap,
+        hashType, mgf, saltLen, signingKey, rng);
+    if (sigSz > 0)
+        sigSz = wrap_rsa_pss_cert(der, cert->bodySz, derCap, pssAlg, pssAlgSz,
+            sig, sigSz);
+    free(sig);
+    return sigSz;
+}
 
 static long long timeval_us(struct timeval tv)
 {
@@ -376,6 +615,9 @@ static int make_root(
     ret = wc_MakeCert_ex(&root, rootDer, DER_CAP, alg->key_type, rootKey, rng);
     if (ret <= 0)
         return ret;
+    if (alg->kind == KEY_RSA)
+        return sign_rsa_pss_cert(alg, &root, rootDer, DER_CAP,
+            (RsaKey*)rootKey, rng);
     return wc_SignCert_ex(root.bodySz, alg->sig_type, rootDer, DER_CAP,
         alg->key_type, rootKey, rng);
 }
@@ -406,6 +648,9 @@ static int make_leaf(
     ret = wc_MakeCert_ex(&leaf, leafDer, DER_CAP, alg->key_type, leafKey, rng);
     if (ret <= 0)
         return ret;
+    if (alg->kind == KEY_RSA)
+        return sign_rsa_pss_cert(alg, &leaf, leafDer, DER_CAP,
+            (RsaKey*)rootKey, rng);
     return wc_SignCert_ex(leaf.bodySz, alg->sig_type, leafDer, DER_CAP,
         alg->key_type, rootKey, rng);
 }

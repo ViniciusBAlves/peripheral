@@ -5,7 +5,7 @@ prefix="${1:?usage: setup_pi_wolfssl.sh INSTALL_PREFIX}"
 mkdir -p "${prefix}"
 prefix="$(cd "${prefix}" && pwd)"
 revision="dd6da70d395a0cb26446326f329678fe3bfb212c"
-profile="tls13-all-kem-signatures-rsa16384-fast-math-v7"
+profile="tls13-all-kem-signatures-rsa16384-pi-native-fast-math-v1"
 source_dir="${prefix%/}/src"
 build_dir="${source_dir}/build"
 profile_file="${prefix}/.benchmark-profile"
@@ -56,7 +56,7 @@ touch "${source_dir}/CMakeLists.txt"
 cmake -S "${source_dir}" -B "${build_dir}" -GNinja \
     -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_INSTALL_PREFIX="${prefix}" \
-    -DCMAKE_C_FLAGS="-Wno-error=maybe-uninitialized -DFP_MAX_BITS=32768 -DRSA_MAX_SIZE=16384 -DWC_MAX_RSA_BITS=16384" \
+    -DCMAKE_C_FLAGS="-O3 -mcpu=native -mtune=native -Wno-error=maybe-uninitialized -DFP_MAX_BITS=32768 -DRSA_MAX_SIZE=16384 -DWC_MAX_RSA_BITS=16384" \
     -DWOLFSSL_TLS13=yes \
     -DWOLFSSL_ECC=yes \
     -DWOLFSSL_CURVE25519=yes \

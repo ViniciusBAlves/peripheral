@@ -47,6 +47,11 @@ PHASE_DWT_METRICS = [
     ("core", "cycles"), ("lsu", "cycles"), ("cpi", "cycles"),
     ("exc", "cycles"), ("sleep", "cycles"), ("fold", "events"),
 ]
+LEGACY_PHASE_DWT_METRICS = [("lsu", "cycles"), ("cpi", "cycles")]
+ADDED_PHASE_DWT_METRICS = [
+    metric for metric in PHASE_DWT_METRICS
+    if metric not in LEGACY_PHASE_DWT_METRICS
+]
 SERVER_RESOURCE_METRICS = [
     "voluntary_context_switches", "involuntary_context_switches",
     "minor_page_faults", "major_page_faults",
@@ -95,8 +100,6 @@ ATTEMPT_FIELDS = [
     "attempt_index", "component", "owner", "cert_sig_alg", "sig_family",
     "sig_nist_level", "builder", "generation_scope", "status",
     "wall_ms", "cpu_ms", "user_cpu_ms", "sys_cpu_ms", "max_rss_kb",
-    *SERVER_RESOURCE_METRICS,
-    *SERVER_PHASE_ATTEMPT_FIELDS,
     "server_root_der_bytes", "server_root_crt_bytes",
     "server_intermediate_crt_bytes", "server_leaf_crt_bytes",
     "server_chain_crt_bytes", "server_key_bytes",
@@ -118,25 +121,31 @@ ATTEMPT_FIELDS = [
     ],
     *[f"{phase}_heap_current_bytes" for phase in PHASES],
     *[f"{phase}_heap_peak_bytes" for phase in PHASES],
-    *[
-        f"{phase}_{counter}_{suffix}"
-        for counter, suffix in PHASE_DWT_METRICS
-        for phase in PHASES
-    ],
-    *[
-        f"phase_{counter}_total_{suffix}"
-        for counter, suffix in PHASE_DWT_METRICS
-    ],
+    *[f"{phase}_lsu_cycles" for phase in PHASES],
+    "phase_lsu_total_cycles",
+    *[f"{phase}_cpi_cycles" for phase in PHASES],
+    "phase_cpi_total_cycles",
     "phase_dwt_samples", "dwt_counters_supported", "dwt_wrap_risk",
     "client_heap_current_bytes", "client_heap_peak_bytes",
     "client_heap_free_bytes", "client_heap_capacity_bytes",
-    "firmware_static_ram_used_bytes", "firmware_ram_capacity_bytes",
-    "firmware_static_ram_usage_percent",
     "thread_stack_used_bytes", "thread_stack_capacity_bytes",
     "thread_stack_peak_percent", "client_cert_der_bytes",
     "client_key_der_bytes", "client_cert_der_capacity_bytes",
     "client_key_der_capacity_bytes", "client_hbs_state_capacity_bytes",
     "error_code", "message",
+    *SERVER_RESOURCE_METRICS,
+    *SERVER_PHASE_ATTEMPT_FIELDS,
+    *[
+        f"{phase}_{counter}_{suffix}"
+        for counter, suffix in ADDED_PHASE_DWT_METRICS
+        for phase in PHASES
+    ],
+    *[
+        f"phase_{counter}_total_{suffix}"
+        for counter, suffix in ADDED_PHASE_DWT_METRICS
+    ],
+    "firmware_static_ram_used_bytes", "firmware_ram_capacity_bytes",
+    "firmware_static_ram_usage_percent",
 ]
 
 SUMMARY_FIELDS = [
@@ -144,9 +153,7 @@ SUMMARY_FIELDS = [
     "builder", "generation_scope", "status", "success_count", "fail_count",
     "mean_wall_ms", "min_wall_ms", "max_wall_ms",
     "mean_cpu_ms", "mean_user_cpu_ms", "mean_sys_cpu_ms",
-    "max_rss_kb", *[f"mean_{metric}" for metric in SERVER_RESOURCE_METRICS],
-    *SERVER_PHASE_SUMMARY_FIELDS,
-    "mean_output_total_bytes",
+    "max_rss_kb", "mean_output_total_bytes",
     "server_chain_crt_bytes", "server_key_bytes",
     "client_cert_crt_bytes", "client_key_bytes",
     "client_csr_der_bytes", "client_csr_pem_bytes",
@@ -154,8 +161,6 @@ SUMMARY_FIELDS = [
     "mean_thread_sysworkq_cpu_percent", "mean_thread_bt_rx_cpu_percent",
     "mean_thread_bt_tx_cpu_percent", "mean_thread_idle_cpu_percent",
     "mean_thread_other_cpu_percent", "max_client_heap_peak_bytes",
-    "firmware_static_ram_used_bytes", "firmware_ram_capacity_bytes",
-    "firmware_static_ram_usage_percent",
     "mean_keygen_cpu_ms", "mean_make_cert_cpu_ms",
     "mean_sign_cert_cpu_ms", "mean_parse_cert_cpu_ms",
     "mean_key_export_cpu_ms", "mean_phase_cpu_total_ms",
@@ -166,20 +171,26 @@ SUMMARY_FIELDS = [
         for phase in PHASES
     ],
     *[f"max_{phase}_heap_peak_bytes" for phase in PHASES],
-    *[
-        f"mean_{phase}_{counter}_{suffix}"
-        for counter, suffix in PHASE_DWT_METRICS
-        for phase in PHASES
-    ],
-    "phase_cpu_verify",
-    *[
-        f"mean_phase_{counter}_total_{suffix}"
-        for counter, suffix in PHASE_DWT_METRICS
-    ],
-    "max_phase_dwt_samples",
+    *[f"mean_{phase}_lsu_cycles" for phase in PHASES],
+    *[f"mean_{phase}_cpi_cycles" for phase in PHASES],
+    "phase_cpu_verify", "mean_phase_lsu_total_cycles",
+    "mean_phase_cpi_total_cycles", "max_phase_dwt_samples",
     "dwt_counters_supported", "dwt_wrap_risk",
     "max_thread_stack_peak_percent", "client_cert_der_bytes",
     "client_key_der_bytes",
+    *[f"mean_{metric}" for metric in SERVER_RESOURCE_METRICS],
+    *SERVER_PHASE_SUMMARY_FIELDS,
+    "firmware_static_ram_used_bytes", "firmware_ram_capacity_bytes",
+    "firmware_static_ram_usage_percent",
+    *[
+        f"mean_{phase}_{counter}_{suffix}"
+        for counter, suffix in ADDED_PHASE_DWT_METRICS
+        for phase in PHASES
+    ],
+    *[
+        f"mean_phase_{counter}_total_{suffix}"
+        for counter, suffix in ADDED_PHASE_DWT_METRICS
+    ],
 ]
 
 MEASURE_EXEC_C = r"""
@@ -432,6 +443,20 @@ def hash_arg(key_type: str) -> str:
     return "-sha256" if bits <= 3072 else "-sha384" if bits <= 7680 else "-sha512"
 
 
+def rsa_pss_sigopts(key_type: str) -> str:
+    match = re.fullmatch(r"RSA-PSS-(\d+)", key_type)
+    if not match:
+        return ""
+    bits = int(match.group(1))
+    hash_name = "sha256" if bits <= 3072 else "sha384" if bits <= 7680 else "sha512"
+    salt_len = 32 if bits <= 3072 else 48 if bits <= 7680 else 64
+    return (
+        "-sigopt rsa_padding_mode:pss "
+        f"-sigopt rsa_mgf1_md:{hash_name} "
+        f"-sigopt rsa_pss_saltlen:{salt_len}"
+    )
+
+
 SERVER_PHASE_SHELL = r"""
 cert_phase() {
   phase_name="$1"
@@ -635,6 +660,7 @@ bin/hbs_certgen LMS-HSS-L2-H10-W4 {hbs_warmup_dir}/lms >/dev/null 2>&1 || true
             return remote_dir
         issuer_args = key_args(signature.issuer_key_type)
         issuer_hash = hash_arg(signature.issuer_key_type)
+        issuer_sigopts = rsa_pss_sigopts(signature.issuer_key_type)
         root_name = f"Peripheral_Benchmark_{slug(signature.name)}_Server_Root"
         qremote = shlex.quote(remote_dir)
         qworkdir = shlex.quote(self.gateway.workdir)
@@ -653,7 +679,8 @@ fi
 openssl req -x509 -new {issuer_args} \\
   -keyout {qremote}/server_root.key -out {qremote}/server_root.crt -nodes \\
   -subj /CN={root_name} \\
-  -not_before {CERT_NOT_BEFORE} -not_after {CERT_NOT_AFTER} {issuer_hash} \\
+  -not_before {CERT_NOT_BEFORE} -not_after {CERT_NOT_AFTER} \\
+  {issuer_hash} {issuer_sigopts} \\
   -addext basicConstraints=critical,CA:TRUE \\
   -addext keyUsage=critical,keyCertSign,cRLSign
 openssl x509 -in {qremote}/server_root.crt -outform DER \\
@@ -882,6 +909,8 @@ def openssl_server_chain_script(
     leaf_args = key_args(signature.leaf_key_type)
     issuer_hash = hash_arg(signature.issuer_key_type)
     leaf_hash = hash_arg(signature.leaf_key_type)
+    issuer_sigopts = rsa_pss_sigopts(signature.issuer_key_type)
+    leaf_sigopts = rsa_pss_sigopts(signature.leaf_key_type)
     out = shlex.quote(output_dir)
     client = shlex.quote(client_dir)
     setup_cmd = (
@@ -897,13 +926,15 @@ def openssl_server_chain_script(
     )
     keygen_cmd = (
         f"openssl req -new {leaf_args} -keyout {out}/server.key "
-        f"-out {out}/server.csr -nodes -subj /CN=localhost {leaf_hash}"
+        f"-out {out}/server.csr -nodes -subj /CN=localhost "
+        f"{leaf_hash} {leaf_sigopts}"
     )
     sign_cmd = (
         f"openssl x509 -req -in {out}/server.csr -CA {out}/server_root.crt "
         f"-CAkey {out}/server_root.key -CAcreateserial "
         f"-out {out}/server.crt -not_before {CERT_NOT_BEFORE} "
-        f"-not_after {CERT_NOT_AFTER} -extfile {out}/server.ext {issuer_hash}"
+        f"-not_after {CERT_NOT_AFTER} -extfile {out}/server.ext "
+        f"{issuer_hash} {issuer_sigopts}"
     )
     assemble_cmd = f"cp {out}/server.crt {out}/server_chain.crt"
     verify_cmd = (

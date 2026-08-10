@@ -14,6 +14,7 @@
 #include <wolfssl/wolfcrypt/memory.h>
 #include <wolfssl/wolfcrypt/random.h>
 #ifdef BENCH_CLIENT_CERTGEN
+#include <wolfssl/wolfcrypt/hash.h>
 #include <wolfssl/wolfcrypt/rsa.h>
 #include <wolfssl/wolfcrypt/wc_lms.h>
 #include <wolfssl/wolfcrypt/wc_mldsa.h>
@@ -1004,6 +1005,247 @@ static void client_certgen_set_name(Cert *cert)
     XSTRNCPY(cert->subject.commonName, "nrf52840-benchmark", CTC_NAME_SIZE);
 }
 
+static int client_certgen_der_len_size(int len)
+{
+    if (len < 0)
+        return 0;
+    if (len < 128)
+        return 1;
+    if (len <= 0xff)
+        return 2;
+    if (len <= 0xffff)
+        return 3;
+    return 4;
+}
+
+static int client_certgen_der_write_len(byte *out, int len)
+{
+    if (len < 128) {
+        out[0] = (byte)len;
+        return 1;
+    }
+    if (len <= 0xff) {
+        out[0] = 0x81;
+        out[1] = (byte)len;
+        return 2;
+    }
+    if (len <= 0xffff) {
+        out[0] = 0x82;
+        out[1] = (byte)(len >> 8);
+        out[2] = (byte)len;
+        return 3;
+    }
+    out[0] = 0x83;
+    out[1] = (byte)(len >> 16);
+    out[2] = (byte)(len >> 8);
+    out[3] = (byte)len;
+    return 4;
+}
+
+static int client_certgen_der_write_header(byte *out, byte tag, int len)
+{
+    out[0] = tag;
+    return 1 + client_certgen_der_write_len(out + 1, len);
+}
+
+static int client_certgen_der_read_header(
+    const byte *der, int der_sz, byte tag, int *header_sz, int *content_sz)
+{
+    int count;
+    int value;
+
+    if (der_sz < 2 || der[0] != tag)
+        return ASN_PARSE_E;
+    if ((der[1] & 0x80) == 0) {
+        *header_sz = 2;
+        *content_sz = der[1];
+        return *header_sz + *content_sz <= der_sz ? 0 : BUFFER_E;
+    }
+    count = der[1] & 0x7f;
+    if (count < 1 || count > 3 || der_sz < 2 + count)
+        return ASN_PARSE_E;
+    value = 0;
+    for (int i = 0; i < count; i++)
+        value = (value << 8) | der[2 + i];
+    *header_sz = 2 + count;
+    *content_sz = value;
+    return *header_sz + *content_sz <= der_sz ? 0 : BUFFER_E;
+}
+
+static int client_certgen_rsa_pss_params(
+    const struct client_certgen_algorithm *alg, int *hash_oid,
+    enum wc_HashType *hash_type, int *mgf, int *salt_len)
+{
+    if (alg->kind != CLIENT_CERTGEN_KEY_RSA)
+        return BAD_FUNC_ARG;
+    if (alg->sig_type == CTC_SHA256wRSA) {
+        *hash_oid = SHA256h;
+        *hash_type = WC_HASH_TYPE_SHA256;
+        *mgf = WC_MGF1SHA256;
+        *salt_len = WC_SHA256_DIGEST_SIZE;
+        return 0;
+    }
+    if (alg->sig_type == CTC_SHA384wRSA) {
+        *hash_oid = SHA384h;
+        *hash_type = WC_HASH_TYPE_SHA384;
+        *mgf = WC_MGF1SHA384;
+        *salt_len = WC_SHA384_DIGEST_SIZE;
+        return 0;
+    }
+    if (alg->sig_type != CTC_SHA512wRSA)
+        return HASH_TYPE_E;
+    *hash_oid = SHA512h;
+    *hash_type = WC_HASH_TYPE_SHA512;
+    *mgf = WC_MGF1SHA512;
+    *salt_len = WC_SHA512_DIGEST_SIZE;
+    return 0;
+}
+
+static const byte *client_certgen_rsa_legacy_sig_alg(
+    const struct client_certgen_algorithm *alg, int *len)
+{
+    static const byte sha256[] = {
+        0x30, 0x0d, 0x06, 0x09, 0x2a, 0x86, 0x48, 0x86,
+        0xf7, 0x0d, 0x01, 0x01, 0x0b, 0x05, 0x00
+    };
+    static const byte sha384[] = {
+        0x30, 0x0d, 0x06, 0x09, 0x2a, 0x86, 0x48, 0x86,
+        0xf7, 0x0d, 0x01, 0x01, 0x0c, 0x05, 0x00
+    };
+    static const byte sha512[] = {
+        0x30, 0x0d, 0x06, 0x09, 0x2a, 0x86, 0x48, 0x86,
+        0xf7, 0x0d, 0x01, 0x01, 0x0d, 0x05, 0x00
+    };
+
+    *len = 15;
+    if (alg->sig_type == CTC_SHA256wRSA)
+        return sha256;
+    if (alg->sig_type == CTC_SHA384wRSA)
+        return sha384;
+    if (alg->sig_type != CTC_SHA512wRSA) {
+        *len = 0;
+        return NULL;
+    }
+    return sha512;
+}
+
+static int client_certgen_replace_tbs_sig_alg(
+    const struct client_certgen_algorithm *alg, byte *tbs, int *tbs_sz,
+    int tbs_cap, const byte *pss_alg, int pss_alg_sz)
+{
+    const byte *legacy;
+    int legacy_sz;
+    int old_hdr;
+    int old_content;
+    int new_content;
+    int new_hdr;
+    int pos = -1;
+
+    legacy = client_certgen_rsa_legacy_sig_alg(alg, &legacy_sz);
+    if (legacy == NULL || legacy_sz == 0)
+        return HASH_TYPE_E;
+    for (int i = 0; i + legacy_sz <= *tbs_sz; i++) {
+        if (XMEMCMP(tbs + i, legacy, (size_t)legacy_sz) == 0) {
+            pos = i;
+            break;
+        }
+    }
+    if (pos < 0)
+        return ASN_PARSE_E;
+    if (client_certgen_der_read_header(
+            tbs, *tbs_sz, 0x30, &old_hdr, &old_content) != 0) {
+        return ASN_PARSE_E;
+    }
+
+    new_content = old_content + pss_alg_sz - legacy_sz;
+    new_hdr = 1 + client_certgen_der_len_size(new_content);
+    if (new_hdr + new_content > tbs_cap)
+        return BUFFER_E;
+
+    XMEMMOVE(tbs + pos + pss_alg_sz, tbs + pos + legacy_sz,
+        (size_t)(*tbs_sz - pos - legacy_sz));
+    XMEMCPY(tbs + pos, pss_alg, (size_t)pss_alg_sz);
+    if (new_hdr != old_hdr)
+        XMEMMOVE(tbs + new_hdr, tbs + old_hdr, (size_t)new_content);
+    client_certgen_der_write_header(tbs, 0x30, new_content);
+    *tbs_sz = new_hdr + new_content;
+    return 0;
+}
+
+static int client_certgen_wrap_rsa_pss_cert(
+    byte *tbs, int tbs_sz, int tbs_cap, const byte *pss_alg, int pss_alg_sz,
+    const byte *sig, int sig_sz)
+{
+    int bit_string_hdr_sz;
+    int content_sz;
+    int cert_hdr_sz;
+    int offset;
+
+    bit_string_hdr_sz = 1 + client_certgen_der_len_size(sig_sz + 1);
+    content_sz = tbs_sz + pss_alg_sz + bit_string_hdr_sz + 1 + sig_sz;
+    cert_hdr_sz = 1 + client_certgen_der_len_size(content_sz);
+    if (cert_hdr_sz + content_sz > tbs_cap)
+        return BUFFER_E;
+
+    XMEMMOVE(tbs + cert_hdr_sz, tbs, (size_t)tbs_sz);
+    offset = client_certgen_der_write_header(tbs, 0x30, content_sz);
+    offset += tbs_sz;
+    XMEMCPY(tbs + offset, pss_alg, (size_t)pss_alg_sz);
+    offset += pss_alg_sz;
+    offset += client_certgen_der_write_header(tbs + offset, 0x03, sig_sz + 1);
+    tbs[offset++] = 0;
+    XMEMCPY(tbs + offset, sig, (size_t)sig_sz);
+    return cert_hdr_sz + content_sz;
+}
+
+static int client_certgen_sign_rsa_pss_cert(
+    const struct client_certgen_algorithm *alg, Cert *cert, byte *der,
+    int der_cap, RsaKey *signing_key, WC_RNG *rng)
+{
+    byte pss_alg[128];
+    byte digest[WC_MAX_DIGEST_SIZE];
+    byte *sig = NULL;
+    enum wc_HashType hash_type;
+    int hash_oid;
+    int mgf;
+    int salt_len;
+    int digest_sz;
+    int pss_alg_sz;
+    int sig_cap;
+    int sig_sz;
+    int ret;
+
+    ret = client_certgen_rsa_pss_params(
+        alg, &hash_oid, &hash_type, &mgf, &salt_len);
+    if (ret != 0)
+        return ret;
+    pss_alg_sz = (int)wc_EncodeRsaPssAlgoId(
+        hash_oid, salt_len, pss_alg, sizeof(pss_alg));
+    if (pss_alg_sz <= 0)
+        return ASN_UNKNOWN_OID_E;
+    ret = client_certgen_replace_tbs_sig_alg(
+        alg, der, &cert->bodySz, der_cap, pss_alg, pss_alg_sz);
+    if (ret != 0)
+        return ret;
+    ret = wc_Hash(hash_type, der, (word32)cert->bodySz,
+        digest, sizeof(digest));
+    if (ret != 0)
+        return ret;
+    digest_sz = wc_HashGetDigestSize(hash_type);
+    sig_cap = wc_RsaEncryptSize(signing_key);
+    sig = k_heap_alloc(&wolfssl_heap, (size_t)sig_cap, K_NO_WAIT);
+    if (sig == NULL)
+        return MEMORY_E;
+    sig_sz = wc_RsaPSS_Sign_ex(digest, (word32)digest_sz, sig,
+        (word32)sig_cap, hash_type, mgf, salt_len, signing_key, rng);
+    if (sig_sz > 0) {
+        sig_sz = client_certgen_wrap_rsa_pss_cert(
+            der, cert->bodySz, der_cap, pss_alg, pss_alg_sz, sig, sig_sz);
+    }
+    k_heap_free(&wolfssl_heap, sig);
+    return sig_sz;
+}
+
 static void benchmark_client_certgen(void)
 {
     WC_RNG rng;
@@ -1170,8 +1412,13 @@ static void benchmark_client_certgen(void)
         goto cleanup_key;
     }
     benchmark_cpu_phase_begin(&sign_cert_phase);
-    cert_der_sz = wc_SignCert_ex(cert->bodySz, alg->sig_type,
-        cert_der, cert_der_cap, alg->key_type, key, &rng);
+    if (alg->kind == CLIENT_CERTGEN_KEY_RSA) {
+        cert_der_sz = client_certgen_sign_rsa_pss_cert(
+            alg, cert, cert_der, cert_der_cap, (RsaKey *)key, &rng);
+    } else {
+        cert_der_sz = wc_SignCert_ex(cert->bodySz, alg->sig_type,
+            cert_der, cert_der_cap, alg->key_type, key, &rng);
+    }
     benchmark_cpu_phase_end(&sign_cert_phase);
     if (cert_der_sz <= 0) {
         BENCH_OUT("[BENCH_CERTGEN_RESULT] status=fail stage=sign_cert error=%d\n",

@@ -12,6 +12,7 @@ from pathlib import Path
 try:
     import matplotlib.pyplot as plt
     import numpy as np
+    from matplotlib.ticker import LogLocator, NullFormatter
 except ImportError as exc:  # pragma: no cover - depends on local environment
     raise SystemExit(
         "Missing Python plotting dependency. Install matplotlib and numpy with:\n"
@@ -36,6 +37,18 @@ OPERATION_COLORS = {
     "Keygen": "#2563eb",
     "Encapsulation": "#0f766e",
     "Decapsulation": "#dc2626",
+}
+
+DEVICE_SUMMARY_OPERATION_COLORS = {
+    "KeyGen": "#2563eb",
+    "Encaps": "#dc2626",
+    "Decaps": "#0891b2",
+}
+
+DEVICE_SUMMARY_FAMILY_COLORS = {
+    "classic": "#64748b",
+    "pqc": "#0f766e",
+    "hybrid": "#c05600",
 }
 
 DWT_FIELDS = (
@@ -124,13 +137,26 @@ def family_colors(rows: list[dict[str, str]]) -> list[str]:
     return [FAMILY_COLORS.get(kem_family(row), "#64748b") for row in rows]
 
 
-def add_family_legend(ax) -> None:
+def add_family_legend(ax, rows: list[dict[str, str]]) -> None:
+    present = {kem_family(row) for row in rows}
     handles = [
         plt.Line2D([0], [0], marker="s", color="w", markerfacecolor=color,
                    markersize=9, label=name.title())
         for name, color in FAMILY_COLORS.items()
+        if name in present
     ]
     ax.legend(handles=handles, loc="upper right", frameon=True, fontsize=8)
+
+
+def add_device_family_legend(ax, rows: list[dict[str, str]]) -> None:
+    present = {kem_family(row) for row in rows}
+    handles = [
+        plt.Line2D([0], [0], marker="s", color="w", markerfacecolor=color,
+                   markersize=9, label=name.title())
+        for name, color in DEVICE_SUMMARY_FAMILY_COLORS.items()
+        if name in present
+    ]
+    ax.legend(handles=handles, loc="lower right", frameon=True, fontsize=8)
 
 
 def save(fig, output: Path) -> None:
@@ -151,6 +177,12 @@ def pad_axis(ax, values: list[float], log_scale: bool = False) -> None:
         ax.set_xlim(right=max(positive) * 1.18)
 
 
+def clean_log_axis(ax) -> None:
+    ax.xaxis.set_major_locator(LogLocator(base=10.0))
+    ax.xaxis.set_minor_locator(LogLocator(base=10.0, subs=np.arange(2, 10) * 0.1))
+    ax.xaxis.set_minor_formatter(NullFormatter())
+
+
 def annotate_bars(ax, bars, values: list[float], suffix: str = "") -> None:
     for bar, value in zip(bars, values):
         if value <= 0:
@@ -159,6 +191,95 @@ def annotate_bars(ax, bars, values: list[float], suffix: str = "") -> None:
             bar.get_width(), bar.get_y() + bar.get_height() / 2,
             f" {value:.2f}{suffix}", va="center", ha="left", fontsize=8,
         )
+
+
+def plot_device_summary(rows: list[dict[str, str]], output: Path, run_id: str) -> None:
+    rows = sorted(rows, key=lambda row: number(row, "mean_kem_total_ms") or float("inf"))
+    y = np.arange(len(rows))
+    names = [row.get("kex_group", "") for row in rows]
+    height = 0.22
+    fig, axes = plt.subplots(
+        1, 3, figsize=(16, max(5.0, len(rows) * 0.46)),
+        sharey=True, constrained_layout=True,
+    )
+
+    time_fields = (
+        ("mean_kem_keygen_ms", "KeyGen", -height),
+        ("mean_kem_encapsulation_ms", "Encaps", 0.0),
+        ("mean_kem_decapsulation_ms", "Decaps", height),
+    )
+    time_values: list[float] = []
+    for field, label_name, offset in time_fields:
+        values = [(number(row, field) or 0.0) / 1000.0 for row in rows]
+        time_values.extend(values)
+        axes[0].barh(
+            y + offset, values, height=height,
+            color=DEVICE_SUMMARY_OPERATION_COLORS[label_name],
+            edgecolor="#111827", linewidth=0.25, label=label_name,
+        )
+    totals_s = [(number(row, "mean_kem_total_ms") or 0.0) / 1000.0 for row in rows]
+    time_values.extend(totals_s)
+    axes[0].scatter(
+        totals_s, y, marker="|", s=170, linewidths=1.6,
+        color="#111827", label="Total", zorder=3,
+    )
+    for ypos, total_s in zip(y, totals_s):
+        if total_s > 0:
+            axes[0].text(total_s * 1.07, ypos, f"{total_s:.3f} s",
+                         va="center", ha="left", fontsize=7)
+    axes[0].set_xlabel("Mean time (seconds)")
+    axes[0].set_xscale("log")
+    axes[0].set_yticks(y)
+    axes[0].set_yticklabels(names, fontsize=8)
+    axes[0].grid(axis="x", color="#d1d5db", linestyle=":", linewidth=0.65)
+    axes[0].legend(title="Operations", loc="upper right", frameon=True, fontsize=7)
+    pad_axis(axes[0], time_values, log_scale=True)
+    clean_log_axis(axes[0])
+
+    families = [kem_family(row) for row in rows]
+    colors = [DEVICE_SUMMARY_FAMILY_COLORS.get(family, "#64748b") for family in families]
+    memory_kb = [(number(row, "max_client_heap_peak_bytes") or 0.0) / 1024.0 for row in rows]
+    bars = axes[1].barh(
+        y, memory_kb, color=colors, edgecolor="#111827", linewidth=0.25
+    )
+    axes[1].set_xlabel("Peak memory (KB)")
+    axes[1].grid(axis="x", color="#d1d5db", linestyle=":", linewidth=0.65)
+    annotate_bars(axes[1], bars, memory_kb, " KB")
+    pad_axis(axes[1], memory_kb)
+    if memory_kb:
+        axes[1].set_xlim(right=max(memory_kb) * 1.45)
+    add_device_family_legend(axes[1], rows)
+
+    output_bytes = [
+        sum(
+            number(row, field) or 0.0
+            for field in (
+                "kex_public_key_bytes",
+                "kex_ciphertext_bytes",
+                "kex_shared_secret_bytes",
+            )
+        )
+        for row in rows
+    ]
+    bars = axes[2].barh(
+        y, output_bytes, color=colors, edgecolor="#111827", linewidth=0.25
+    )
+    axes[2].set_xlabel("Generated output (bytes)")
+    axes[2].set_xscale("log")
+    axes[2].grid(axis="x", color="#d1d5db", linestyle=":", linewidth=0.65)
+    for bar, value in zip(bars, output_bytes):
+        if value > 0:
+            axes[2].text(
+                bar.get_width() * 1.05, bar.get_y() + bar.get_height() / 2,
+                f"{value:,.0f} B", va="center", ha="left", fontsize=7,
+    )
+    pad_axis(axes[2], output_bytes, log_scale=True)
+    clean_log_axis(axes[2])
+
+    for ax in axes:
+        ax.invert_yaxis()
+    fig.suptitle(f"On-device KEM benchmark - {run_id}", fontsize=13)
+    save(fig, output)
 
 
 def plot_operation_time(rows: list[dict[str, str]], output: Path, run_id: str) -> None:
@@ -176,10 +297,11 @@ def plot_operation_time(rows: list[dict[str, str]], output: Path, run_id: str) -
     for offset, (field, name) in zip((-height, 0.0, height), fields):
         values = [number(row, field) or 0.0 for row in rows]
         all_values.extend(values)
-        ax.barh(
+        bars = ax.barh(
             y + offset, values, height=height, label=name,
             color=OPERATION_COLORS[name], edgecolor="#111827", linewidth=0.3,
         )
+        annotate_bars(ax, bars, values, " ms")
     ax.set_title(f"KEM operation wall time - {run_id}")
     ax.set_xlabel("Mean operation time (ms, log scale)")
     ax.set_yticks(y)
@@ -238,7 +360,7 @@ def plot_total_time(rows: list[dict[str, str]], output: Path, run_id: str) -> No
     ax.grid(axis="x", color="#e5e7eb", linewidth=0.8)
     pad_axis(ax, values, log_scale=True)
     annotate_bars(ax, bars, values, " ms")
-    add_family_legend(ax)
+    add_family_legend(ax, rows)
     save(fig, output)
 
 
@@ -343,7 +465,7 @@ def plot_size_vs_time(rows: list[dict[str, str]], output: Path, run_id: str) -> 
     ax.set_ylabel("Mean total time (ms, log scale)")
     ax.set_yscale("log")
     ax.grid(True, color="#e5e7eb", linewidth=0.8)
-    add_family_legend(ax)
+    add_family_legend(ax, rows)
     save(fig, output)
 
 
@@ -399,6 +521,7 @@ def main(argv: list[str] | None = None) -> int:
     out_dir = args.out_dir or ROOT / "graphic" / "out" / run_id
     rows = load_rows(run_dir)
     extension = args.format
+    plot_device_summary(rows, out_dir / f"kem_device_summary.{extension}", run_id)
     plot_total_time(rows, out_dir / f"kem_total_time.{extension}", run_id)
     plot_operation_time(rows, out_dir / f"kem_operation_time.{extension}", run_id)
     plot_time_share(rows, out_dir / f"kem_operation_share.{extension}", run_id)
