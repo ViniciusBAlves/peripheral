@@ -13,6 +13,7 @@ from pathlib import Path
 
 from benchmarklib.algorithms import SIGNATURES_BY_NAME, slug
 from benchmarklib.firmware import build as build_firmware
+from benchmarklib.firmware import ensure_pqm4
 from benchmarklib.firmware import flash as flash_firmware
 from run_benchmarks import (
     DEFAULT_CONFIG,
@@ -27,18 +28,30 @@ from run_benchmarks import (
 ROOT = Path(__file__).resolve().parent
 RESULTS = ROOT / "results"
 WORK = ROOT / "work"
-SLOW_SIGNATURE_TIMEOUT_SEC = 2000.0
+SLOW_SIGNATURE_TIMEOUT_SEC = 1.0
 SIGNATURE_TIMEOUTS_SEC = {
-    "RSA-PSS-3072": 2400.0,
-    "RSA-PSS-7680": 43200.0,
-    "RSA-PSS-15360": 604800.0,
-    "SLH-DSA-SHAKE-128s": 2400.0,
-    "SLH-DSA-SHAKE-128f": 2400.0,
-    "SLH-DSA-SHAKE-192s": 4200.0,
-    "SLH-DSA-SHAKE-192f": 4200.0,
-    "SLH-DSA-SHAKE-256s": 4200.0,
-    "SLH-DSA-SHAKE-256f": 4200.0,
+    "RSA-PSS-3072": 1.0,
+    "RSA-PSS-7680": 1.0,
+    "RSA-PSS-15360": 1.0,
+    "SLH-DSA-SHAKE-128s": 1.0,
+    "SLH-DSA-SHAKE-128f": 1.0,
+    "SLH-DSA-SHAKE-192s": 1.0,
+    "SLH-DSA-SHAKE-192f": 1.0,
+    "SLH-DSA-SHAKE-256s": 1.0,
+    "SLH-DSA-SHAKE-256f": 1.0,
 }
+RSA_CERTGEN_LIMITS = {
+    "RSA-PSS-3072": (3072, 8192),
+    "RSA-PSS-7680": (7680, 16384),
+    "RSA-PSS-15360": (15360, 32768),
+}
+MEMORY_PROFILE_SMALL = "small_mem"
+MEMORY_PROFILE_NO_SMALL = "no_small_mem"
+MEMORY_PROFILES = (MEMORY_PROFILE_SMALL, MEMORY_PROFILE_NO_SMALL)
+MEMORY_PROFILE_FIELDS = [
+    "memory_profile", "small_mem_enabled", "small_mem_variant_of",
+]
+SUMMARY_COMPAT_TAIL_FIELDS = ["client_heap_capacity_bytes", *MEMORY_PROFILE_FIELDS]
 PHASES = [
     "keygen", "make_cert", "sign_cert", "parse_cert", "key_export",
 ]
@@ -95,6 +108,7 @@ ATTEMPT_FIELDS = [
     ],
     "firmware_static_ram_used_bytes",
     "firmware_ram_capacity_bytes", "firmware_static_ram_usage_percent",
+    *MEMORY_PROFILE_FIELDS,
 ]
 
 SUMMARY_FIELDS = [
@@ -131,6 +145,7 @@ SUMMARY_FIELDS = [
     ],
     "firmware_static_ram_used_bytes", "firmware_ram_capacity_bytes",
     "firmware_static_ram_usage_percent",
+    *SUMMARY_COMPAT_TAIL_FIELDS,
 ]
 
 
@@ -181,6 +196,42 @@ def usage_percent(values: dict[str, str], used_key: str, capacity_key: str) -> s
     return f"{100.0 * used / capacity:.2f}"
 
 
+def signature_has_small_mem(signature: str) -> bool:
+    return signature.startswith(("ML-DSA-", "SLH-DSA-SHAKE-"))
+
+
+def normalize_memory_profile(profile: str | None) -> str:
+    if not profile:
+        return MEMORY_PROFILE_SMALL
+    if profile not in MEMORY_PROFILES:
+        raise ValueError(
+            f"unknown memory profile {profile!r}; expected "
+            f"{', '.join(MEMORY_PROFILES)}"
+        )
+    return profile
+
+
+def memory_profile_values(signature: str, profile: str | None) -> dict[str, str]:
+    if not signature_has_small_mem(signature):
+        return {
+            "memory_profile": "",
+            "small_mem_enabled": "",
+            "small_mem_variant_of": "",
+        }
+    profile = normalize_memory_profile(profile)
+    return {
+        "memory_profile": profile,
+        "small_mem_enabled": "0" if profile == MEMORY_PROFILE_NO_SMALL else "1",
+        "small_mem_variant_of": signature,
+    }
+
+
+def memory_profile_suffix(signature: str, profile: str) -> str:
+    if signature_has_small_mem(signature) and profile != MEMORY_PROFILE_SMALL:
+        return f"-{profile}"
+    return ""
+
+
 def wait_for_certgen_result(
     serial_port,
     log: Path,
@@ -203,13 +254,18 @@ def wait_for_certgen_result(
     raise TimeoutError(f"timed out waiting for BENCH_CERTGEN_RESULT after {timeout_sec}s")
 
 
-def attempt_row(values: dict[str, str]) -> dict[str, object]:
+def attempt_row(
+    values: dict[str, str],
+    *,
+    memory_profile: str = MEMORY_PROFILE_SMALL,
+) -> dict[str, object]:
     status = values.get("status", "fail")
+    signature = values.get("algorithm", "ECDSA-P-256")
     row = {
         "attempt_index": 1,
         "component": "client_certificate",
         "owner": "client",
-        "cert_sig_alg": values.get("algorithm", "ECDSA-P-256"),
+        "cert_sig_alg": signature,
         "builder": values.get("builder", "wolfssl_board"),
         "generation_scope": values.get("generation_scope", "client_self_signed_cert"),
         "status": status,
@@ -266,6 +322,7 @@ def attempt_row(values: dict[str, str]) -> dict[str, object]:
         ),
         "error_code": values.get("error", ""),
         "message": "" if status == "success" else values.get("stage", ""),
+        **memory_profile_values(signature, memory_profile),
     }
     for counter, suffix in PHASE_DWT_METRICS:
         row[f"phase_{counter}_total_{suffix}"] = values.get(
@@ -288,7 +345,12 @@ def attempt_row(values: dict[str, str]) -> dict[str, object]:
     return row
 
 
-def unsupported_row(signature: str, message: str) -> dict[str, object]:
+def unsupported_row(
+    signature: str,
+    message: str,
+    *,
+    memory_profile: str = MEMORY_PROFILE_SMALL,
+) -> dict[str, object]:
     return {
         "attempt_index": 1,
         "component": "client_certificate",
@@ -298,6 +360,7 @@ def unsupported_row(signature: str, message: str) -> dict[str, object]:
         "generation_scope": "client_self_signed_cert",
         "status": "unsupported",
         "message": message,
+        **memory_profile_values(signature, memory_profile),
     }
 
 
@@ -310,6 +373,34 @@ def serial_timeout_for(signature: str, requested: float) -> float:
     }:
         return max(requested, SLOW_SIGNATURE_TIMEOUT_SEC)
     return requested
+
+
+def certgen_cmake_args(
+    signature: str,
+    memory_profile: str = MEMORY_PROFILE_SMALL,
+) -> list[str]:
+    memory_profile = normalize_memory_profile(memory_profile)
+    args = [
+        "-DBENCH_CLIENT_CERTGEN=ON",
+        f"-DBENCH_CLIENT_CERTGEN_SIG={signature}",
+    ]
+    if signature.startswith("SLH-DSA-SHAKE-"):
+        args.append("-DBENCH_WOLFSSL_PQM4_KECCAK=ON")
+    if memory_profile == MEMORY_PROFILE_NO_SMALL and signature.startswith("ML-DSA-"):
+        args.append("-DBENCH_MLDSA_NO_SMALL_MEM=ON")
+    if (
+        memory_profile == MEMORY_PROFILE_NO_SMALL
+        and signature.startswith("SLH-DSA-SHAKE-")
+    ):
+        args.append("-DBENCH_SLHDSA_NO_SMALL_MEM=ON")
+    rsa_limits = RSA_CERTGEN_LIMITS.get(signature)
+    if rsa_limits is not None:
+        rsa_max_bits, fp_max_bits = rsa_limits
+        args.extend([
+            f"-DBENCH_RSA_MAX_BITS={rsa_max_bits}",
+            f"-DBENCH_RSA_FP_MAX_BITS={fp_max_bits}",
+        ])
+    return args
 
 
 def summarize(row: dict[str, object]) -> list[dict[str, object]]:
@@ -368,6 +459,13 @@ def summarize(row: dict[str, object]) -> list[dict[str, object]]:
         ),
         "client_cert_der_bytes": row["client_cert_der_bytes"] if success else "",
         "client_key_der_bytes": row["client_key_der_bytes"] if success else "",
+        "client_heap_capacity_bytes": (
+            row["client_heap_capacity_bytes"] if success else ""
+        ),
+        **{
+            field: row.get(field, "")
+            for field in MEMORY_PROFILE_FIELDS
+        },
     }
     for counter, suffix in PHASE_DWT_METRICS:
         summary[f"mean_phase_{counter}_total_{suffix}"] = (
@@ -404,6 +502,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--serial-device", default=config["serial-device"])
     parser.add_argument("--serial-baud", type=int, default=115200)
     parser.add_argument("--serial-timeout-sec", type=float, default=30.0)
+    parser.add_argument(
+        "--memory-profile",
+        choices=MEMORY_PROFILES,
+        default=MEMORY_PROFILE_SMALL,
+        help="board certgen memory profile for algorithms with SMALL_MEM",
+    )
     parser.add_argument("--nrfutil", default=default_nrfutil())
     parser.add_argument("--ncs-version", default=DEFAULT_NCS_VERSION)
     parser.add_argument("--ncs-chdir", default=default_ncs_chdir())
@@ -438,18 +542,35 @@ def run_board_client_certificate_benchmark(
     run_id: str,
     run_dir: Path,
     signature: str | None = None,
+    memory_profile: str | None = None,
 ) -> dict[str, object]:
     signature = signature or getattr(args, "signature", "ECDSA-P-256")
+    memory_profile = normalize_memory_profile(
+        memory_profile or getattr(args, "memory_profile", MEMORY_PROFILE_SMALL)
+    )
     if signature not in SIGNATURES_BY_NAME:
-        return unsupported_row(signature, "unknown signature")
+        return unsupported_row(
+            signature, "unknown signature", memory_profile=memory_profile
+        )
 
     signature_slug = slug(signature)
-    generated_dir = WORK / "generated" / "board-certgen" / signature_slug
+    profile_suffix = memory_profile_suffix(signature, memory_profile)
+    generated_dir = (
+        WORK / "generated" / "board-certgen" / f"{signature_slug}{profile_suffix}"
+    )
     write_certgen_placeholder_credentials(generated_dir / "benchmark_credentials.h")
+    pqm4_dir = WORK / "pqm4" if signature.startswith("SLH-DSA-SHAKE-") else None
 
-    build_dir = WORK / "firmware-build" / f"client-certgen-{signature_slug}"
+    build_dir = WORK / "firmware-build" / f"client-certgen-{signature_slug}{profile_suffix}"
     if not args.skip_build:
-        print(f"[firmware] Building/updating board certgen profile={signature}...", flush=True)
+        if pqm4_dir is not None:
+            print(f"[pqm4] preparing pinned sources -> {pqm4_dir}", flush=True)
+            ensure_pqm4(pqm4_dir, run_dir / "build.log")
+        print(
+            f"[firmware] Building/updating board certgen profile={signature} "
+            f"memory={memory_profile}...",
+            flush=True,
+        )
         build_firmware(
             firmware_dir=ROOT / "firmware",
             build_dir=build_dir,
@@ -460,15 +581,16 @@ def run_board_client_certificate_benchmark(
             ncs_chdir=args.ncs_chdir,
             board=args.board,
             mlkem_backend="wolfssl",
-            pqm4_dir=None,
-            extra_cmake_args=[
-                "-DBENCH_CLIENT_CERTGEN=ON",
-                f"-DBENCH_CLIENT_CERTGEN_SIG={signature}",
-            ],
+            pqm4_dir=pqm4_dir,
+            extra_cmake_args=certgen_cmake_args(signature, memory_profile),
         )
         print("[firmware] Build completed.", flush=True)
     if not args.skip_flash:
-        print(f"[firmware] Flashing board certgen profile={signature}...", flush=True)
+        print(
+            f"[firmware] Flashing board certgen profile={signature} "
+            f"memory={memory_profile}...",
+            flush=True,
+        )
         flash_firmware(
             build_dir=build_dir,
             log=run_dir / "flash.log",
@@ -491,10 +613,15 @@ def run_board_client_certificate_benchmark(
             serial_timeout_for(signature, args.serial_timeout_sec),
         )
 
-    row = attempt_row(values)
+    row = attempt_row(values, memory_profile=memory_profile)
+    credentials_name = f"benchmark_credentials_client_{signature}.h"
+    if profile_suffix:
+        credentials_name = (
+            f"benchmark_credentials_client_{signature}_{memory_profile}.h"
+        )
     shutil.copy2(
         generated_dir / "benchmark_credentials.h",
-        run_dir / f"benchmark_credentials_client_{signature}.h",
+        run_dir / credentials_name,
     )
     return row
 
@@ -512,6 +639,7 @@ def main(argv: list[str] | None = None) -> int:
         run_id=run_id,
         run_dir=run_dir,
         signature=args.signature,
+        memory_profile=args.memory_profile,
     )
     write_csv(run_dir / "attempts.csv", ATTEMPT_FIELDS, [row])
     write_csv(run_dir / "summary.csv", SUMMARY_FIELDS, summarize(row))

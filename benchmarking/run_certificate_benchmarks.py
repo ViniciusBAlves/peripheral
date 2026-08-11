@@ -32,7 +32,14 @@ from run_benchmarks import (
     resolve_pi_workdir,
     resolve_serial_device,
 )
-from run_board_certificate_benchmark import run_board_client_certificate_benchmark
+from run_board_certificate_benchmark import (
+    MEMORY_PROFILE_FIELDS,
+    MEMORY_PROFILE_NO_SMALL,
+    MEMORY_PROFILE_SMALL,
+    memory_profile_values,
+    run_board_client_certificate_benchmark,
+    signature_has_small_mem,
+)
 
 
 ROOT = Path(__file__).resolve().parent
@@ -40,6 +47,10 @@ RESULTS = ROOT / "results"
 WORK = ROOT / "work"
 WOLFSSL_COMPAT_CFLAGS = (
     "-DFP_MAX_BITS=32768 -DRSA_MAX_SIZE=16384 -DWC_MAX_RSA_BITS=16384"
+)
+PI_WOLFSSL_NATIVE_CFLAGS = (
+    "-O3 -mcpu=native -mtune=native -flto=auto "
+    "-fno-semantic-interposition -fomit-frame-pointer"
 )
 PHASES = ["keygen", "make_cert", "sign_cert", "parse_cert", "key_export"]
 PHASE_THREAD_BUCKETS = ["main", "sysworkq", "bt_rx", "bt_tx", "idle", "other"]
@@ -95,6 +106,7 @@ SERVER_PHASE_SUMMARY_FIELDS = [
         ],
     )
 ]
+SUMMARY_COMPAT_TAIL_FIELDS = ["client_heap_capacity_bytes", *MEMORY_PROFILE_FIELDS]
 
 ATTEMPT_FIELDS = [
     "attempt_index", "component", "owner", "cert_sig_alg", "sig_family",
@@ -146,6 +158,7 @@ ATTEMPT_FIELDS = [
     ],
     "firmware_static_ram_used_bytes", "firmware_ram_capacity_bytes",
     "firmware_static_ram_usage_percent",
+    *MEMORY_PROFILE_FIELDS,
 ]
 
 SUMMARY_FIELDS = [
@@ -191,6 +204,7 @@ SUMMARY_FIELDS = [
         f"mean_phase_{counter}_total_{suffix}"
         for counter, suffix in ADDED_PHASE_DWT_METRICS
     ],
+    *SUMMARY_COMPAT_TAIL_FIELDS,
 ]
 
 MEASURE_EXEC_C = r"""
@@ -498,6 +512,7 @@ class PiCertificateRunner:
         workdir = shlex.quote(self.gateway.workdir)
         warmup_dir = shlex.quote(f"{self.remote_run_dir}/warmup/openssl")
         hbs_warmup_dir = shlex.quote(f"{self.remote_run_dir}/warmup/hbs")
+        wolfssl_cflags = f"{PI_WOLFSSL_NATIVE_CFLAGS} {WOLFSSL_COMPAT_CFLAGS}"
         self.gateway.command(
             f"""
 set -eu
@@ -580,12 +595,12 @@ chmod +x bin/setup_pi_wolfssl.sh
 ./bin/setup_pi_wolfssl.sh deps/wolfssl
 export PKG_CONFIG_PATH="$PWD/deps/wolfssl/lib/pkgconfig"
 pkg-config --exists wolfssl
-gcc -O2 -Wall -Wextra \\
-  -DWOLFSSL_HAVE_LMS -DWOLFSSL_HAVE_XMSS {WOLFSSL_COMPAT_CFLAGS} \\
+gcc {wolfssl_cflags} -Wall -Wextra \\
+  -DWOLFSSL_HAVE_LMS -DWOLFSSL_HAVE_XMSS \\
   -o bin/hbs_certgen bin/hbs_certgen.c \\
   $(pkg-config --cflags --libs wolfssl) \\
   -Wl,-rpath,"$PWD/deps/wolfssl/lib"
-gcc -O2 -Wall -Wextra {WOLFSSL_COMPAT_CFLAGS} \\
+gcc {wolfssl_cflags} -Wall -Wextra -pthread \\
   -o bin/wolfssl_certgen bin/wolfssl_certgen.c \\
   $(pkg-config --cflags --libs wolfssl) \\
   -Wl,-rpath,"$PWD/deps/wolfssl/lib"
@@ -1049,13 +1064,14 @@ def attempt_row(
 
 
 def summarize(rows: list[dict[str, object]]) -> list[dict[str, object]]:
-    groups: dict[tuple[str, str, str, str], list[dict[str, object]]] = {}
+    groups: dict[tuple[str, str, str, str, str], list[dict[str, object]]] = {}
     for row in rows:
         groups.setdefault((
             str(row["component"]),
             str(row["cert_sig_alg"]),
             str(row.get("builder", "")),
             str(row.get("generation_scope", "")),
+            str(row.get("memory_profile", "")),
         ), []).append(row)
 
     def numbers(items: list[dict[str, object]], field: str) -> list[float]:
@@ -1067,7 +1083,13 @@ def summarize(rows: list[dict[str, object]]) -> list[dict[str, object]]:
         return values
 
     summaries = []
-    for (_component, _signature, _builder, _generation_scope), items in sorted(
+    for (
+        _component,
+        _signature,
+        _builder,
+        _generation_scope,
+        _memory_profile,
+    ), items in sorted(
         groups.items()
     ):
         success = [item for item in items if item["status"] == "success"]
@@ -1336,6 +1358,13 @@ def summarize(rows: list[dict[str, object]]) -> list[dict[str, object]]:
             "client_key_der_bytes": (
                 success[0].get("client_key_der_bytes", "") if success else ""
             ),
+            "client_heap_capacity_bytes": (
+                success[0].get("client_heap_capacity_bytes", "") if success else ""
+            ),
+            **{
+                field: base.get(field, "")
+                for field in MEMORY_PROFILE_FIELDS
+            },
         }
         for phase in PHASES:
             wall_values = phase_wall[phase]
@@ -1441,6 +1470,7 @@ def board_client_error_row(
     *,
     status: str,
     message: str,
+    memory_profile: str = MEMORY_PROFILE_SMALL,
 ) -> dict[str, object]:
     return {
         "attempt_index": 1,
@@ -1453,6 +1483,7 @@ def board_client_error_row(
         "generation_scope": "client_self_signed_cert",
         "status": status,
         "message": message,
+        **memory_profile_values(signature.name, memory_profile),
     }
 
 
@@ -1514,40 +1545,48 @@ def main(argv: list[str] | None = None) -> int:
     if not args.no_board_client:
         for case in cases:
             signature = SIGNATURES_BY_NAME[case["cert_sig_alg"]]
-            for attempt in range(1, args.iterations + 1):
-                print(
-                    f"[client-cert] board wolfSSL {signature.name} "
-                    f"attempt={attempt}/{args.iterations}",
-                    flush=True,
-                )
-                board_args = board_args_from(args)
-                if attempt > 1:
-                    board_args.skip_build = True
-                try:
-                    board_row = run_board_client_certificate_benchmark(
-                        board_args,
-                        run_id=run_id,
-                        run_dir=run_dir,
-                        signature=signature.name,
+            memory_profiles = [MEMORY_PROFILE_SMALL]
+            if signature_has_small_mem(signature.name):
+                memory_profiles.append(MEMORY_PROFILE_NO_SMALL)
+            for memory_profile in memory_profiles:
+                for attempt in range(1, args.iterations + 1):
+                    print(
+                        f"[client-cert] board wolfSSL {signature.name} "
+                        f"memory={memory_profile} "
+                        f"attempt={attempt}/{args.iterations}",
+                        flush=True,
                     )
-                except subprocess.CalledProcessError as error:
-                    board_row = board_client_error_row(
-                        signature,
-                        status="unsupported",
-                        message=f"board build command failed: {error.returncode}",
-                    )
-                except Exception as error:
-                    board_row = board_client_error_row(
-                        signature,
-                        status="fail",
-                        message=str(error),
-                    )
-                board_row["attempt_index"] = attempt
-                board_row["sig_family"] = signature.family
-                board_row["sig_nist_level"] = signature.nist_level
-                board_row["cpu_ms"] = board_row.get("client_cpu_ms", "")
-                attempts.append(board_row)
-                write_csv(run_dir / "attempts.csv", ATTEMPT_FIELDS, attempts)
+                    board_args = board_args_from(args)
+                    if attempt > 1:
+                        board_args.skip_build = True
+                    try:
+                        board_row = run_board_client_certificate_benchmark(
+                            board_args,
+                            run_id=run_id,
+                            run_dir=run_dir,
+                            signature=signature.name,
+                            memory_profile=memory_profile,
+                        )
+                    except subprocess.CalledProcessError as error:
+                        board_row = board_client_error_row(
+                            signature,
+                            status="unsupported",
+                            message=f"board build command failed: {error.returncode}",
+                            memory_profile=memory_profile,
+                        )
+                    except Exception as error:
+                        board_row = board_client_error_row(
+                            signature,
+                            status="fail",
+                            message=str(error),
+                            memory_profile=memory_profile,
+                        )
+                    board_row["attempt_index"] = attempt
+                    board_row["sig_family"] = signature.family
+                    board_row["sig_nist_level"] = signature.nist_level
+                    board_row["cpu_ms"] = board_row.get("client_cpu_ms", "")
+                    attempts.append(board_row)
+                    write_csv(run_dir / "attempts.csv", ATTEMPT_FIELDS, attempts)
 
     server_builders = {
         builder

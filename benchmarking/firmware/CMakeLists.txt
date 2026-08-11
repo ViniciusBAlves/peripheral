@@ -8,8 +8,18 @@ option(BENCH_POWER_MARKERS "Enable PPK2 GPIO timing markers" OFF)
 set_property(CACHE BENCH_MLKEM_BACKEND PROPERTY STRINGS wolfssl pqm4-m4fstack)
 option(BENCH_CLIENT_CERTGEN "Run board-side client certificate generation benchmark" OFF)
 option(BENCH_KEM_OPERATIONS "Run board-side key-exchange operation benchmark" OFF)
+option(BENCH_WOLFSSL_PQM4_KECCAK
+    "Use pqm4 Cortex-M Keccak permutation for wolfSSL SHA3/SHAKE" OFF)
+option(BENCH_MLDSA_NO_SMALL_MEM
+    "Disable wolfSSL ML-DSA small-memory mode for selected certgen profiles" OFF)
+option(BENCH_SLHDSA_NO_SMALL_MEM
+    "Disable wolfSSL SLH-DSA small-memory mode for selected certgen profiles" OFF)
 set(BENCH_CLIENT_CERTGEN_SIG "ECDSA-P-256" CACHE STRING
     "Signature algorithm for board-side client certificate generation")
+set(BENCH_RSA_MAX_BITS "16384" CACHE STRING
+    "Maximum RSA key size supported by this firmware image")
+set(BENCH_RSA_FP_MAX_BITS "32768" CACHE STRING
+    "fast-math FP_MAX_BITS value for this firmware image")
 
 if(BENCH_CLIENT_CERTGEN AND BENCH_KEM_OPERATIONS)
     message(FATAL_ERROR "BENCH_CLIENT_CERTGEN and BENCH_KEM_OPERATIONS are mutually exclusive")
@@ -275,6 +285,42 @@ string(REPLACE
 )
 file(WRITE "${WOLFSSL_TLS13_C}" "${WOLFSSL_TLS13_TEXT}")
 
+if(BENCH_WOLFSSL_PQM4_KECCAK)
+    set(WOLFSSL_SHA3_C "${WOLFSSL_ROOT_DIR}/wolfcrypt/src/sha3.c")
+    file(READ "${WOLFSSL_SHA3_C}" WOLFSSL_SHA3_TEXT)
+    string(REPLACE
+        "#include <stdint.h>\nextern void KeccakF1600_StatePermute(uint64_t *state);\n"
+        ""
+        WOLFSSL_SHA3_TEXT "${WOLFSSL_SHA3_TEXT}"
+    )
+    string(REPLACE
+        "#ifdef BENCH_WOLFSSL_PQM4_KECCAK\n    KeccakF1600_StatePermute((uint64_t*)s);\n#else\n"
+        ""
+        WOLFSSL_SHA3_TEXT "${WOLFSSL_SHA3_TEXT}"
+    )
+    string(REPLACE
+        "\n#endif /* BENCH_WOLFSSL_PQM4_KECCAK */\n}\n#endif /* WC_SHA3_SW_KECCAK */"
+        "\n}\n#endif /* WC_SHA3_SW_KECCAK */"
+        WOLFSSL_SHA3_TEXT "${WOLFSSL_SHA3_TEXT}"
+    )
+    string(REPLACE
+        "#include <wolfssl/wolfcrypt/hash.h>"
+        "#include <wolfssl/wolfcrypt/hash.h>\n#include <stdint.h>\nextern void KeccakF1600_StatePermute(uint64_t *state);"
+        WOLFSSL_SHA3_TEXT "${WOLFSSL_SHA3_TEXT}"
+    )
+    string(REPLACE
+        "void BlockSha3(word64* s)\n{\n    word64 n[25];"
+        "void BlockSha3(word64* s)\n{\n#ifdef BENCH_WOLFSSL_PQM4_KECCAK\n    KeccakF1600_StatePermute((uint64_t*)s);\n#else\n    word64 n[25];"
+        WOLFSSL_SHA3_TEXT "${WOLFSSL_SHA3_TEXT}"
+    )
+    string(REPLACE
+        "        s[0] ^= hash_keccak_r[i+1];\n    }\n}\n#endif /* WC_SHA3_SW_KECCAK */"
+        "        s[0] ^= hash_keccak_r[i+1];\n    }\n#endif /* BENCH_WOLFSSL_PQM4_KECCAK */\n}\n#endif /* WC_SHA3_SW_KECCAK */"
+        WOLFSSL_SHA3_TEXT "${WOLFSSL_SHA3_TEXT}"
+    )
+    file(WRITE "${WOLFSSL_SHA3_C}" "${WOLFSSL_SHA3_TEXT}")
+endif()
+
 # This pinned wolfSSL revision sizes two classic RSA ASN/TLS buffers for
 # RSA-4096 by default. Patch only the disposable FetchContent copy so the
 # fast-math image can parse and encode RSA-PSS-15360 material.
@@ -384,13 +430,15 @@ endif()
 # CRITICAL FIX: Target-specific definitions and includes (NOT Global)
 target_compile_definitions(app PRIVATE
     WOLFSSL_USER_SETTINGS
-    FP_MAX_BITS=32768
+    FP_MAX_BITS=${BENCH_RSA_FP_MAX_BITS}
+    RSA_MAX_SIZE=${BENCH_RSA_MAX_BITS}
+    WC_MAX_RSA_BITS=${BENCH_RSA_MAX_BITS}
     BENCHMARK_CLOSE_AFTER_TLS=0
 )
 target_compile_options(app PRIVATE -include ${CMAKE_CURRENT_SOURCE_DIR}/user_settings.h)
 
 target_compile_definitions(app PRIVATE
-    BENCH_RSA_PROFILE_NAME="fast-math"
+    BENCH_RSA_PROFILE_NAME="fast-math-rsa${BENCH_RSA_MAX_BITS}"
 )
 
 if(BENCH_CLIENT_CERTGEN)
@@ -399,8 +447,23 @@ if(BENCH_CLIENT_CERTGEN)
         BENCH_CLIENT_CERTGEN_SIG="${BENCH_CLIENT_CERTGEN_SIG}"
     )
 endif()
+if(BENCH_MLDSA_NO_SMALL_MEM)
+    target_compile_definitions(app PRIVATE BENCH_MLDSA_NO_SMALL_MEM)
+endif()
+if(BENCH_SLHDSA_NO_SMALL_MEM)
+    target_compile_definitions(app PRIVATE BENCH_SLHDSA_NO_SMALL_MEM)
+endif()
 if(BENCH_KEM_OPERATIONS)
     target_compile_definitions(app PRIVATE BENCH_KEM_OPERATIONS)
+endif()
+
+if(BENCH_WOLFSSL_PQM4_KECCAK)
+    if(NOT DEFINED PQM4_ROOT OR
+       NOT EXISTS "${PQM4_ROOT}/common/keccakf1600.S")
+        message(FATAL_ERROR "PQM4_ROOT must point to a complete pqm4 checkout")
+    endif()
+    target_sources(app PRIVATE "${PQM4_ROOT}/common/keccakf1600.S")
+    target_compile_definitions(app PRIVATE BENCH_WOLFSSL_PQM4_KECCAK)
 endif()
 
 if(BENCH_MLKEM_BACKEND STREQUAL "pqm4-m4fstack")

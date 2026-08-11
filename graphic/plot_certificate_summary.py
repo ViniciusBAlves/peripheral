@@ -28,12 +28,32 @@ HYBRID_COLOR = "#6b7280"
 WOLFSSL_PQC_COLOR = "#9333ea"
 WOLFSSL_CLASSIC_COLOR = "#16a34a"
 CPU_OVERLAY_COLOR = "#f97316"
+MEMORY_PROFILE_SMALL = "small_mem"
+MEMORY_PROFILE_NO_SMALL = "no_small_mem"
+MEMORY_PROFILE_COLORS = {
+    MEMORY_PROFILE_SMALL: "#2563eb",
+    MEMORY_PROFILE_NO_SMALL: "#dc2626",
+}
 LEGACY_PHASE_NAMES = ["keygen", "make_cert", "sign_cert", "parse_cert", "key_export"]
 LEGACY_THREAD_BUCKETS = ["main", "sysworkq", "bt_rx", "bt_tx", "idle", "other"]
 SERVER_RESOURCE_SUMMARY_FIELDS = [
     "mean_voluntary_context_switches", "mean_involuntary_context_switches",
     "mean_minor_page_faults", "mean_major_page_faults",
     "mean_block_input_ops", "mean_block_output_ops",
+]
+SERVER_PHASE_ALIASES = {
+    "keygen": ("keygen_csr",),
+}
+SERVER_PHASE_COMPAT_METRIC_TEMPLATES = [
+    "mean_server_{phase}_wall_ms",
+    "mean_server_{phase}_cpu_ms",
+    "max_server_{phase}_rss_kb",
+    "mean_server_{phase}_voluntary_context_switches",
+    "mean_server_{phase}_involuntary_context_switches",
+    "mean_server_{phase}_minor_page_faults",
+    "mean_server_{phase}_major_page_faults",
+    "mean_server_{phase}_block_input_ops",
+    "mean_server_{phase}_block_output_ops",
 ]
 LEGACY_3AB6_SUMMARY_FIELDS = [
     "component", "owner", "cert_sig_alg", "sig_family", "sig_nist_level",
@@ -156,6 +176,7 @@ def load_summary(run_dir: Path, include_failed: bool) -> list[dict[str, str]]:
         ]
 
     hydrate_board_output_sizes(run_dir, rows)
+    hydrate_server_phase_aliases(rows)
 
     usable = []
     for row in rows:
@@ -167,6 +188,22 @@ def load_summary(run_dir: Path, include_failed: bool) -> list[dict[str, str]]:
     if not usable:
         raise ValueError(f"no plottable rows found in {summary_csv}")
     return usable
+
+
+def hydrate_server_phase_aliases(rows: list[dict[str, str]]) -> None:
+    for row in rows:
+        if not is_server_row(row):
+            continue
+        for canonical, aliases in SERVER_PHASE_ALIASES.items():
+            for template in SERVER_PHASE_COMPAT_METRIC_TEMPLATES:
+                target = template.format(phase=canonical)
+                if row.get(target) not in (None, ""):
+                    continue
+                for alias in aliases:
+                    value = row.get(template.format(phase=alias))
+                    if value not in (None, ""):
+                        row[target] = value
+                        break
 
 
 def summary_row_from_values(header: list[str], values: list[str]) -> dict[str, str]:
@@ -201,13 +238,15 @@ def is_board_row(row: dict[str, str]) -> bool:
     )
 
 
-def board_attempt_key(row: dict[str, str]) -> tuple[str, str, str, str, str]:
+def board_attempt_key(row: dict[str, str]) -> tuple[str, str, str, str, str, str, str]:
     return (
         row.get("component") or "",
         row.get("owner") or "",
         row.get("cert_sig_alg") or "",
         row.get("sig_nist_level") or "",
         row.get("builder") or "",
+        row.get("generation_scope") or "",
+        row.get("memory_profile") or "",
     )
 
 
@@ -273,6 +312,32 @@ def with_server_builder_label(row: dict[str, str], label: str, *, short: bool) -
     return label
 
 
+def memory_profile(row: dict[str, str]) -> str:
+    value = (row.get("memory_profile") or "").strip()
+    if value:
+        return value
+    enabled = (row.get("small_mem_enabled") or "").strip()
+    if enabled == "1":
+        return MEMORY_PROFILE_SMALL
+    if enabled == "0":
+        return MEMORY_PROFILE_NO_SMALL
+    return ""
+
+
+def memory_profile_label(row: dict[str, str], *, short: bool = False) -> str:
+    profile = memory_profile(row)
+    if profile == MEMORY_PROFILE_SMALL:
+        return "SMALL" if short else "SMALL_MEM"
+    if profile == MEMORY_PROFILE_NO_SMALL:
+        return "noSMALL" if short else "no SMALL_MEM"
+    return ""
+
+
+def memory_profile_suffix(row: dict[str, str], *, short: bool = False) -> str:
+    label = memory_profile_label(row, short=short)
+    return f" [{label}]" if label else ""
+
+
 def row_label(row: dict[str, str]) -> str:
     component = row.get("component", "")
     signature = row.get("cert_sig_alg", "")
@@ -281,7 +346,7 @@ def row_label(row: dict[str, str]) -> str:
     if component == "client_identity":
         return "Board key + CSR"
     if component == "client_certificate":
-        return f"Board: {signature}{level_suffix}"
+        return f"Board: {signature}{level_suffix}{memory_profile_suffix(row)}"
     return with_server_builder_label(row, f"{signature}{level_suffix}", short=False)
 
 
@@ -291,34 +356,48 @@ def compact_row_label(row: dict[str, str]) -> str:
     level_suffix = f" (L{level})" if level else ""
     if row.get("component") == "client_identity":
         return "Key + CSR"
-    return with_server_builder_label(row, f"{signature}{level_suffix}", short=True)
+    label = f"{signature}{level_suffix}{memory_profile_suffix(row, short=True)}"
+    return with_server_builder_label(row, label, short=True)
 
 
 def scatter_row_label(row: dict[str, str]) -> str:
     signature = row.get("cert_sig_alg", "")
     level = row.get("sig_nist_level", "")
     level_suffix = f" L{level}" if level else ""
+    profile_suffix = memory_profile_suffix(row, short=True)
     if signature.startswith("ECDSA-P-"):
         return with_server_builder_label(
-            row, f"ECDSA-{signature.rsplit('-', 1)[1]}{level_suffix}", short=True
+            row,
+            f"ECDSA-{signature.rsplit('-', 1)[1]}{level_suffix}{profile_suffix}",
+            short=True,
         )
     if signature.startswith("RSA-PSS-"):
         return with_server_builder_label(
-            row, f"RSA-{signature.rsplit('-', 1)[1]}{level_suffix}", short=True
+            row,
+            f"RSA-{signature.rsplit('-', 1)[1]}{level_suffix}{profile_suffix}",
+            short=True,
         )
     if signature.startswith("ML-DSA-"):
         return with_server_builder_label(
-            row, f"ML-{signature.rsplit('-', 1)[1]}{level_suffix}", short=True
+            row,
+            f"ML-{signature.rsplit('-', 1)[1]}{level_suffix}{profile_suffix}",
+            short=True,
         )
     if signature.startswith("SLH-DSA-SHAKE-"):
         return with_server_builder_label(
-            row, f"SLH-{signature.rsplit('-', 1)[1]}{level_suffix}", short=True
+            row,
+            f"SLH-{signature.rsplit('-', 1)[1]}{level_suffix}{profile_suffix}",
+            short=True,
         )
     if signature.startswith("LMS-"):
-        return with_server_builder_label(row, f"LMS-HSS{level_suffix}", short=True)
+        return with_server_builder_label(
+            row, f"LMS-HSS{level_suffix}{profile_suffix}", short=True
+        )
     if signature.startswith("XMSS-"):
-        return with_server_builder_label(row, f"XMSS{level_suffix}", short=True)
-    label = f"{signature}{level_suffix}"
+        return with_server_builder_label(
+            row, f"XMSS{level_suffix}{profile_suffix}", short=True
+        )
+    label = f"{signature}{level_suffix}{profile_suffix}"
     return with_server_builder_label(row, label, short=True)
 
 
@@ -492,7 +571,7 @@ SERVER_RESOURCE_PANELS = [
 ]
 
 SERVER_PHASE_FIELDS = [
-    ("keygen_csr", "Keygen", "#2563eb"),
+    ("keygen", "Keygen", "#2563eb"),
     ("sign_cert", "Sign cert", "#dc2626"),
     ("verify_cert", "Verify cert", "#0f766e"),
 ]
@@ -643,12 +722,18 @@ def server_phase_wall_total(row: dict[str, str]) -> float:
 
 
 def sort_rows(rows: list[dict[str, str]]) -> list[dict[str, str]]:
+    profile_order = {
+        "": 0,
+        MEMORY_PROFILE_SMALL: 1,
+        MEMORY_PROFILE_NO_SMALL: 2,
+    }
     return sorted(
         rows,
         key=lambda row: (
             row.get("component") != "client_identity",
             row.get("component") not in {"client_identity", "client_certificate"},
             signature_sort_key(row.get("cert_sig_alg", "")),
+            profile_order.get(memory_profile(row), 9),
             row.get("builder", ""),
             row_label(row).lower(),
         ),
@@ -1814,6 +1899,189 @@ def plot_phase_wall_heatmap(
     return True
 
 
+def small_mem_comparison_pairs(
+    rows: list[dict[str, str]],
+) -> list[tuple[tuple[str, str], dict[str, str], dict[str, str]]]:
+    groups: dict[tuple[str, str], dict[str, dict[str, str]]] = {}
+    for row in rows:
+        if row.get("component") != "client_certificate":
+            continue
+        profile = memory_profile(row)
+        if profile not in {MEMORY_PROFILE_SMALL, MEMORY_PROFILE_NO_SMALL}:
+            continue
+        key = (row.get("cert_sig_alg", ""), row.get("sig_nist_level", ""))
+        groups.setdefault(key, {})[profile] = row
+
+    pairs = []
+    for key, profiles in groups.items():
+        small = profiles.get(MEMORY_PROFILE_SMALL)
+        no_small = profiles.get(MEMORY_PROFILE_NO_SMALL)
+        if small is not None and no_small is not None:
+            pairs.append((key, small, no_small))
+    return sorted(pairs, key=lambda item: signature_sort_key(item[0][0]))
+
+
+def small_mem_comparison_rows(rows: list[dict[str, str]]) -> list[dict[str, str]]:
+    comparison_rows = []
+    for _key, small, no_small in small_mem_comparison_pairs(rows):
+        comparison_rows.extend([small, no_small])
+    return comparison_rows
+
+
+def small_mem_pair_label(key: tuple[str, str]) -> str:
+    signature, level = key
+    return f"{signature} (L{level})" if level else signature
+
+
+def plot_small_mem_total_time(
+    rows: list[dict[str, str]],
+    output: Path,
+    run_id: str,
+) -> bool:
+    pairs = small_mem_comparison_pairs(rows)
+    if not pairs:
+        return False
+
+    labels = [small_mem_pair_label(key) for key, _small, _no_small in pairs]
+    small_values = [
+        float_or_none(small.get("mean_wall_ms")) or 0.0
+        for _key, small, _no_small in pairs
+    ]
+    no_small_values = [
+        float_or_none(no_small.get("mean_wall_ms")) or 0.0
+        for _key, _small, no_small in pairs
+    ]
+    values = small_values + no_small_values
+    positive = [value for value in values if value > 0]
+    if not positive:
+        return False
+    log_scale = max(positive) / min(positive) >= 25.0 if len(positive) > 1 else False
+
+    positions = np.arange(len(pairs), dtype=float)
+    bar_height = 0.36
+    height = max(6.5, len(pairs) * 0.55)
+    fig, ax = plt.subplots(figsize=(12, height), constrained_layout=True)
+    fig.suptitle(f"Board certgen SMALL_MEM total time - {run_id}", fontsize=15)
+
+    small_bars = ax.barh(
+        positions - bar_height / 2,
+        small_values,
+        height=bar_height,
+        label="SMALL_MEM",
+        color=MEMORY_PROFILE_COLORS[MEMORY_PROFILE_SMALL],
+        edgecolor="#111827",
+        linewidth=0.35,
+    )
+    no_small_bars = ax.barh(
+        positions + bar_height / 2,
+        no_small_values,
+        height=bar_height,
+        label="no SMALL_MEM",
+        color=MEMORY_PROFILE_COLORS[MEMORY_PROFILE_NO_SMALL],
+        edgecolor="#111827",
+        linewidth=0.35,
+    )
+
+    ax.set_xlabel(f"Mean wall time (ms{', log scale' if log_scale else ''})")
+    if log_scale:
+        ax.set_xscale("log")
+    ax.set_yticks(positions)
+    ax.set_yticklabels(labels, fontsize=9)
+    ax.grid(axis="x", linestyle=":", alpha=0.35)
+    pad_x_axis(ax, positive, log_scale=log_scale)
+    annotate_bars(ax, small_bars, small_values, suffix=" ms")
+    annotate_bars(ax, no_small_bars, no_small_values, suffix=" ms")
+    ax.legend(loc="upper right", fontsize=8)
+    ax.invert_yaxis()
+
+    output.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(output, dpi=180)
+    plt.close(fig)
+    return True
+
+
+def plot_small_mem_phase_time(
+    rows: list[dict[str, str]],
+    output: Path,
+    run_id: str,
+) -> bool:
+    comparison_rows = small_mem_comparison_rows(rows)
+    if not comparison_rows:
+        return False
+    return plot_phase_wall_heatmap(
+        comparison_rows,
+        output,
+        run_id,
+        title="Board certgen SMALL_MEM phase wall time",
+        colorbar_label="Wall time per phase (ms, log color scale)",
+        total_label="Phase wall total",
+    )
+
+
+def plot_small_mem_heap_peak(
+    rows: list[dict[str, str]],
+    output: Path,
+    run_id: str,
+) -> bool:
+    pairs = small_mem_comparison_pairs(rows)
+    if not pairs:
+        return False
+
+    labels = [small_mem_pair_label(key) for key, _small, _no_small in pairs]
+    small_values = [
+        (float_or_none(small.get("max_client_heap_peak_bytes")) or 0.0) / 1024.0
+        for _key, small, _no_small in pairs
+    ]
+    no_small_values = [
+        (float_or_none(no_small.get("max_client_heap_peak_bytes")) or 0.0) / 1024.0
+        for _key, _small, no_small in pairs
+    ]
+    values = small_values + no_small_values
+    positive = [value for value in values if value > 0]
+    if not positive:
+        return False
+
+    positions = np.arange(len(pairs), dtype=float)
+    bar_height = 0.36
+    height = max(6.5, len(pairs) * 0.55)
+    fig, ax = plt.subplots(figsize=(12, height), constrained_layout=True)
+    fig.suptitle(f"Board certgen SMALL_MEM heap peak - {run_id}", fontsize=15)
+
+    small_bars = ax.barh(
+        positions - bar_height / 2,
+        small_values,
+        height=bar_height,
+        label="SMALL_MEM",
+        color=MEMORY_PROFILE_COLORS[MEMORY_PROFILE_SMALL],
+        edgecolor="#111827",
+        linewidth=0.35,
+    )
+    no_small_bars = ax.barh(
+        positions + bar_height / 2,
+        no_small_values,
+        height=bar_height,
+        label="no SMALL_MEM",
+        color=MEMORY_PROFILE_COLORS[MEMORY_PROFILE_NO_SMALL],
+        edgecolor="#111827",
+        linewidth=0.35,
+    )
+
+    ax.set_xlabel("Peak wolfSSL heap usage (KB)")
+    ax.set_yticks(positions)
+    ax.set_yticklabels(labels, fontsize=9)
+    ax.grid(axis="x", linestyle=":", alpha=0.35)
+    pad_x_axis(ax, positive, log_scale=False)
+    annotate_bars(ax, small_bars, small_values, suffix=" KB", decimals=1)
+    annotate_bars(ax, no_small_bars, no_small_values, suffix=" KB", decimals=1)
+    ax.legend(loc="upper right", fontsize=8)
+    ax.invert_yaxis()
+
+    output.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(output, dpi=180)
+    plt.close(fig)
+    return True
+
+
 def plot_server_phase_wall_ms(
     rows: list[dict[str, str]],
     output: Path,
@@ -2484,6 +2752,18 @@ def main() -> int:
         (
             plot_resource_pressure,
             out_dir / f"board_certificate_resource_pressure.{extension}",
+        ),
+        (
+            plot_small_mem_total_time,
+            out_dir / f"board_certificate_small_mem_total_time.{extension}",
+        ),
+        (
+            plot_small_mem_phase_time,
+            out_dir / f"board_certificate_small_mem_phase_time.{extension}",
+        ),
+        (
+            plot_small_mem_heap_peak,
+            out_dir / f"board_certificate_small_mem_heap_peak.{extension}",
         ),
         (
             plot_thread_cpu_breakdown,

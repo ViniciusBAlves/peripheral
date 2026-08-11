@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <pthread.h>
 #include <sys/resource.h>
 #include <sys/time.h>
 #include <time.h>
@@ -545,6 +546,75 @@ static int make_key(const struct Algorithm* alg, WC_RNG* rng, void** key_out)
     return BAD_FUNC_ARG;
 }
 
+static void free_key(const struct Algorithm* alg, void* key);
+
+struct KeygenThreadArgs {
+    const struct Algorithm* alg;
+    void* key;
+    int ret;
+};
+
+static void* make_key_thread(void* arg)
+{
+    struct KeygenThreadArgs* keygen = (struct KeygenThreadArgs*)arg;
+    WC_RNG rng;
+
+    keygen->key = NULL;
+    keygen->ret = wc_InitRng(&rng);
+    if (keygen->ret == 0) {
+        keygen->ret = make_key(keygen->alg, &rng, &keygen->key);
+        wc_FreeRng(&rng);
+    }
+    return NULL;
+}
+
+static int make_key_pair(
+    const struct Algorithm* alg, WC_RNG* rng, void** rootKey, void** leafKey)
+{
+    struct KeygenThreadArgs rootArgs;
+    struct KeygenThreadArgs leafArgs;
+    pthread_t rootThread;
+    pthread_t leafThread;
+    int rootStarted;
+    int leafStarted;
+    int ret;
+
+    if (alg->kind != KEY_RSA) {
+        ret = make_key(alg, rng, rootKey);
+        if (ret == 0)
+            ret = make_key(alg, rng, leafKey);
+        return ret;
+    }
+
+    rootArgs.alg = alg;
+    rootArgs.key = NULL;
+    rootArgs.ret = 0;
+    leafArgs = rootArgs;
+
+    rootStarted = pthread_create(&rootThread, NULL, make_key_thread, &rootArgs) == 0;
+    leafStarted = pthread_create(&leafThread, NULL, make_key_thread, &leafArgs) == 0;
+    if (!rootStarted || !leafStarted) {
+        if (rootStarted)
+            pthread_join(rootThread, NULL);
+        if (leafStarted)
+            pthread_join(leafThread, NULL);
+        free_key(alg, rootArgs.key);
+        free_key(alg, leafArgs.key);
+        ret = make_key(alg, rng, rootKey);
+        if (ret == 0)
+            ret = make_key(alg, rng, leafKey);
+        return ret;
+    }
+
+    pthread_join(rootThread, NULL);
+    pthread_join(leafThread, NULL);
+    *rootKey = rootArgs.key;
+    *leafKey = leafArgs.key;
+    if (rootArgs.ret != 0)
+        return rootArgs.ret;
+    return leafArgs.ret;
+}
+
 static void free_key(const struct Algorithm* alg, void* key)
 {
     if (key == NULL)
@@ -713,9 +783,7 @@ int main(int argc, char** argv)
         goto cleanup_ssl;
 
     phase_begin(&phase);
-    phaseRet = make_key(alg, &rng, &rootKey);
-    if (phaseRet == 0)
-        phaseRet = make_key(alg, &rng, &leafKey);
+    phaseRet = make_key_pair(alg, &rng, &rootKey, &leafKey);
     phase_end("keygen", &phase, phaseRet);
     if (phaseRet != 0)
         goto cleanup_rng;

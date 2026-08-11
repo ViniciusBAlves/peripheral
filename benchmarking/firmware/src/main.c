@@ -455,12 +455,15 @@ static void benchmark_cpu_phase_begin(struct benchmark_cpu_phase *phase)
 
     (void)sys_heap_runtime_stats_reset_max(&wolfssl_heap.heap);
     (void)sys_heap_runtime_stats_get(&wolfssl_heap.heap, &stats);
+#ifndef BENCH_CLIENT_CERTGEN
     phase->thread_start = benchmark_thread_cpu_snapshot_get();
+#endif
     phase->start = benchmark_cpu_snapshot_get();
     phase->wall_start_ms = k_uptime_get();
     phase->wall_ms = 0;
     phase->cycles = 0;
     phase->us = 0;
+    phase->thread_delta = (struct benchmark_thread_cpu_delta){0};
     phase->dwt_core_cycles = 0;
     phase->dwt_lsu_cycles = 0;
     phase->dwt_cpi_cycles = 0;
@@ -520,9 +523,26 @@ static void benchmark_cpu_phase_end(struct benchmark_cpu_phase *phase)
         phase->us = k_cyc_to_us_floor64(phase->cycles);
     }
 
+#ifdef BENCH_CLIENT_CERTGEN
+    if (phase->start.valid && end.valid &&
+        end.system_cycles > phase->start.system_cycles) {
+        uint64_t system_delta = end.system_cycles - phase->start.system_cycles;
+
+        phase->thread_delta.main_cycles = phase->cycles;
+        phase->thread_delta.main_bp =
+            benchmark_percent_bp(phase->cycles, system_delta);
+        if (system_delta > phase->cycles) {
+            phase->thread_delta.other_cycles = system_delta - phase->cycles;
+            phase->thread_delta.other_bp =
+                benchmark_percent_bp(phase->thread_delta.other_cycles,
+                                     system_delta);
+        }
+    }
+#else
     thread_end = benchmark_thread_cpu_snapshot_get();
     phase->thread_delta = benchmark_thread_cpu_delta_get(
         &phase->thread_start, &thread_end);
+#endif
     (void)sys_heap_runtime_stats_get(&wolfssl_heap.heap, &stats);
     phase->heap_current_bytes = (uint32_t)stats.allocated_bytes;
     phase->heap_peak_bytes = (uint32_t)stats.max_allocated_bytes;
