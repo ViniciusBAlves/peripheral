@@ -12,6 +12,11 @@
 #define WOLFSSL_USER_IO
 #define SINGLE_THREADED
 #define WOLFSSL_SMALL_STACK
+/* Release DecodedCert while checking large SLH-DSA certificate signatures. */
+#define WOLFSSL_SMALL_CERT_VERIFY
+/* SLH-DSA-SHAKE-256f leaf + intermediate is about 100 KiB on the wire. */
+#define MAX_CERTIFICATE_SZ (128U * 1024U)
+#define MAX_HANDSHAKE_SZ (128U * 1024U)
 #define NO_FILESYSTEM
 #define WOLFSSL_NO_SOCK
 #define NO_WRITEV            /* KILLS sys/uio.h completely */
@@ -45,13 +50,9 @@
 #define WOLFSSL_SHA512
 #define HAVE_HKDF
 #define WC_RSA_PSS
-#ifdef BENCH_LARGE_RSA
-#define USE_INTEGER_HEAP_MATH
+#define USE_FAST_MATH
 #define RSA_MAX_SIZE 16384
 #define WC_MAX_RSA_BITS 16384
-#else
-#define USE_FAST_MATH
-#endif
 #ifndef WOLFSSL_DISABLE_TFM_TIMING_RESISTANT
 #define TFM_TIMING_RESISTANT
 #endif
@@ -116,6 +117,14 @@
 #define WOLFSSL_XMSS_MIN_HEIGHT 20
 #define WOLFSSL_XMSS_MAX_HEIGHT 20
 #define HAVE_SNI
+
+#ifdef BENCH_CERTIFICATE_GEN
+#define WOLFSSL_CERT_GEN
+#define WOLFSSL_CERT_EXT
+#define WOLFSSL_KEY_GEN
+#undef WOLFSSL_LMS_VERIFY_ONLY
+#undef WOLFSSL_XMSS_VERIFY_ONLY
+#endif
 
 #undef min
 #undef max

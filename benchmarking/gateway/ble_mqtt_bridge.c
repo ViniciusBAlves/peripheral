@@ -1,3 +1,4 @@
+#define _GNU_SOURCE
 #include <arpa/inet.h>
 #include <bluetooth/bluetooth.h>
 #include <bluetooth/l2cap.h>
@@ -53,6 +54,14 @@
 #define DEFAULT_DISCOVERY_ATTEMPTS 3
 #define COMMAND_OUTPUT_MAX 8192
 #define BRIDGE_RECV_BUFFER_SIZE 65535
+#define L2CAP_SOCKET_RCVBUF_SIZE (2 * 1024 * 1024)
+#define L2CAP_SEND_RETRY_TIMEOUT_MS 10000
+/* At the requested 20 ms BLE connection interval, one SDU per interval keeps
+ * the link fed without adding four idle intervals between every TLS chunk. */
+#define L2CAP_SDU_PACING_US 20000
+#define CONTROL_HEADER_SIZE 8
+#define CONTROL_FLAG_START 0x01
+#define CONTROL_FLAG_END 0x02
 
 static volatile sig_atomic_t keep_running = 1;
 
@@ -78,6 +87,8 @@ struct config {
     bool reset_adapter;
     bool disable_wifi;
     bool wifi_disabled;
+    const char *root_signature;
+    const char *leaf_signature;
 };
 
 struct command_result {
@@ -95,7 +106,84 @@ struct sdu_prefix_state {
     size_t expected_sdu_len;
 };
 
+struct control_state {
+    uint16_t message_id;
+    bool active;
+    uint8_t *pending;
+    size_t pending_len;
+    size_t pending_cap;
+    bool identity_ready;
+    bool identity_error;
+};
+
 static int send_stream(int fd, const uint8_t *data, size_t length);
+
+static int handle_control_frame(struct control_state *state,
+                                const uint8_t *data, size_t length)
+{
+    size_t base = 0;
+
+    if (length >= CONTROL_HEADER_SIZE && memcmp(data, "BCTL1", 5) == 0) {
+        base = 0;
+    } else if (length >= CONTROL_HEADER_SIZE + 2 &&
+               memcmp(data + 2, "BCTL1", 5) == 0) {
+        base = 2;
+    } else {
+        return 0;
+    }
+
+    uint8_t flags = data[base + 5];
+    uint16_t message_id = (uint16_t)data[base + 6] |
+                          ((uint16_t)data[base + 7] << 8);
+    const uint8_t *payload = data + base + CONTROL_HEADER_SIZE;
+    size_t payload_len = length - base - CONTROL_HEADER_SIZE;
+
+    if (flags & CONTROL_FLAG_START) {
+        state->message_id = message_id;
+        state->active = true;
+        state->pending_len = 0;
+    }
+    if (!state->active || state->message_id != message_id) {
+        fprintf(stderr, "[-] Invalid BCTL1 fragment sequence\n");
+        return -1;
+    }
+    if (state->pending_len + payload_len > state->pending_cap) {
+        size_t capacity = state->pending_cap ? state->pending_cap : 1024;
+        while (capacity < state->pending_len + payload_len) {
+            capacity *= 2;
+        }
+        uint8_t *pending = realloc(state->pending, capacity);
+        if (!pending) {
+            return -1;
+        }
+        state->pending = pending;
+        state->pending_cap = capacity;
+    }
+    memcpy(state->pending + state->pending_len, payload, payload_len);
+    state->pending_len += payload_len;
+
+    if (flags & CONTROL_FLAG_END) {
+        if (memmem(state->pending, state->pending_len,
+                   "[BENCH_PKI] status=ready",
+                   sizeof("[BENCH_PKI] status=ready") - 1) != NULL) {
+            state->identity_ready = true;
+        }
+        if (memmem(state->pending, state->pending_len,
+                   "[BENCH_PKI] status=error",
+                   sizeof("[BENCH_PKI] status=error") - 1) != NULL) {
+            state->identity_error = true;
+        }
+        fwrite(state->pending, 1, state->pending_len, stdout);
+        if (state->pending_len == 0 ||
+            state->pending[state->pending_len - 1] != '\n') {
+            fputc('\n', stdout);
+        }
+        fflush(stdout);
+        state->active = false;
+        state->pending_len = 0;
+    }
+    return 1;
+}
 
 static void handle_signal(int sig)
 {
@@ -119,7 +207,9 @@ static void usage(const char *program)
             "  --forget-cache               Remove cached BlueZ device first\n"
             "  --no-acl-prime               Skip bluetoothctl connect before L2CAP\n"
             "  --reset-adapter              Power-cycle the adapter before scanning\n"
-            "  --disable-wifi               Disable Pi Wi-Fi while BLE bridge runs\n",
+            "  --disable-wifi               Disable Pi Wi-Fi while BLE bridge runs\n"
+            "  --root-signature NAME        Trusted root selected for this case\n"
+            "  --leaf-signature NAME        Expected TLS CertificateVerify leaf\n",
             program);
 }
 
@@ -151,6 +241,8 @@ static int parse_args(int argc, char **argv, struct config *cfg)
         .reset_adapter = false,
         .disable_wifi = false,
         .wifi_disabled = false,
+        .root_signature = NULL,
+        .leaf_signature = NULL,
     };
 
     for (int i = 1; i < argc; i++) {
@@ -197,6 +289,10 @@ static int parse_args(int argc, char **argv, struct config *cfg)
             cfg->reset_adapter = true;
         } else if (!strcmp(argv[i], "--disable-wifi")) {
             cfg->disable_wifi = true;
+        } else if (!strcmp(argv[i], "--root-signature") && i + 1 < argc) {
+            cfg->root_signature = argv[++i];
+        } else if (!strcmp(argv[i], "--leaf-signature") && i + 1 < argc) {
+            cfg->leaf_signature = argv[++i];
         } else if (!strcmp(argv[i], "--help")) {
             usage(argv[0]);
             exit(0);
@@ -459,6 +555,13 @@ static int connect_l2cap(const char *address, int address_type, uint16_t psm)
         return -1;
     }
 
+    int receive_buffer = L2CAP_SOCKET_RCVBUF_SIZE;
+    if (setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &receive_buffer,
+                   sizeof(receive_buffer)) < 0) {
+        fprintf(stderr, "[!] Unable to enlarge L2CAP receive buffer: %s\n",
+                strerror(errno));
+    }
+
     struct sockaddr_l2 local = {0};
     local.l2_family = AF_BLUETOOTH;
     bacpy(&local.l2_bdaddr, BDADDR_ANY);
@@ -467,6 +570,14 @@ static int connect_l2cap(const char *address, int address_type, uint16_t psm)
         fprintf(stderr, "[-] L2CAP local bind failed: %s\n", strerror(errno));
         close(fd);
         return -1;
+    }
+
+    /* Keep a 1 MiB upload below the affected Pi kernel's LE credit limit. */
+    uint16_t requested_receive_mtu = 5120;
+    if (setsockopt(fd, SOL_BLUETOOTH, BT_RCVMTU, &requested_receive_mtu,
+                   sizeof(requested_receive_mtu)) < 0) {
+        fprintf(stderr, "[!] Unable to request L2CAP RX MTU %u: %s\n",
+                requested_receive_mtu, strerror(errno));
     }
 
     uint8_t mode = BT_MODE_LE_FLOWCTL;
@@ -515,12 +626,15 @@ static int connect_l2cap(const char *address, int address_type, uint16_t psm)
 
     uint16_t receive_mtu = 0;
     uint16_t send_mtu = 0;
+    int actual_receive_buffer = 0;
     socklen_t length = sizeof(uint16_t);
     (void)getsockopt(fd, SOL_BLUETOOTH, BT_RCVMTU, &receive_mtu, &length);
     length = sizeof(uint16_t);
     (void)getsockopt(fd, SOL_BLUETOOTH, BT_SNDMTU, &send_mtu, &length);
-    printf("[+] L2CAP Channel Established! RX MTU=%u TX MTU=%u\n",
-           receive_mtu, send_mtu);
+    length = sizeof(actual_receive_buffer);
+    (void)getsockopt(fd, SOL_SOCKET, SO_RCVBUF, &actual_receive_buffer, &length);
+    printf("[+] L2CAP Channel Established! RX MTU=%u TX MTU=%u RCVBUF=%d\n",
+           receive_mtu, send_mtu, actual_receive_buffer);
     return fd;
 }
 
@@ -560,6 +674,117 @@ static int send_stream(int fd, const uint8_t *data, size_t length)
         offset += (size_t)written;
     }
     return offset == length ? 0 : -1;
+}
+
+static int send_l2cap_sdu(int fd, const uint8_t *data, size_t length)
+{
+    double deadline = monotonic_ms() + L2CAP_SEND_RETRY_TIMEOUT_MS;
+
+    while (keep_running) {
+        ssize_t written = send(fd, data, length, MSG_NOSIGNAL);
+        if (written == (ssize_t)length) {
+            return 0;
+        }
+        if (written >= 0) {
+            fprintf(stderr,
+                    "[-] Partial L2CAP SDU write: %zd/%zu bytes\n",
+                    written, length);
+            return -1;
+        }
+        if (errno == EINTR) {
+            continue;
+        }
+        if (errno != EAGAIN && errno != EWOULDBLOCK &&
+            errno != ENOBUFS && errno != ENOMEM) {
+            fprintf(stderr, "[-] L2CAP send failed: %s\n", strerror(errno));
+            return -1;
+        }
+        if (monotonic_ms() >= deadline) {
+            fprintf(stderr,
+                    "[-] L2CAP send remained blocked for %d ms: %s\n",
+                    L2CAP_SEND_RETRY_TIMEOUT_MS, strerror(errno));
+            return -1;
+        }
+
+        struct pollfd writable = {.fd = fd, .events = POLLOUT};
+        int poll_result;
+        do {
+            poll_result = poll(&writable, 1, 100);
+        } while (poll_result < 0 && errno == EINTR);
+        if (poll_result < 0) {
+            fprintf(stderr,
+                    "[-] L2CAP POLLOUT wait failed: %s\n", strerror(errno));
+            return -1;
+        }
+        if (poll_result > 0 &&
+            (writable.revents & (POLLERR | POLLHUP | POLLNVAL))) {
+            int socket_error = 0;
+            socklen_t error_length = sizeof(socket_error);
+            (void)getsockopt(fd, SOL_SOCKET, SO_ERROR,
+                             &socket_error, &error_length);
+            fprintf(stderr, "[-] L2CAP socket closed while sending: %s\n",
+                    strerror(socket_error ? socket_error : ECONNRESET));
+            return -1;
+        }
+    }
+    return -1;
+}
+
+static int select_pki_profile(int ble_fd, const struct config *cfg)
+{
+    uint8_t frame[256] = {'B', 'C', 'T', 'L', '1',
+                          CONTROL_FLAG_START | CONTROL_FLAG_END, 1, 0};
+    uint8_t received[BRIDGE_RECV_BUFFER_SIZE];
+    struct control_state control = {0};
+    const char *root = cfg->root_signature;
+    const char *leaf = cfg->leaf_signature;
+    int payload_len;
+    double deadline;
+
+    if (root == NULL || root[0] == '\0' || leaf == NULL || leaf[0] == '\0') {
+        fprintf(stderr, "[-] --root-signature and --leaf-signature are required\n");
+        return -1;
+    }
+    payload_len = snprintf(
+        (char *)frame + CONTROL_HEADER_SIZE,
+        sizeof(frame) - CONTROL_HEADER_SIZE,
+        "[BENCH_SELECT] root=%s leaf=%s", root, leaf);
+    if (payload_len <= 0 ||
+        (size_t)payload_len >= sizeof(frame) - CONTROL_HEADER_SIZE ||
+        send_l2cap_sdu(
+            ble_fd, frame, CONTROL_HEADER_SIZE + (size_t)payload_len) != 0) {
+        return -1;
+    }
+
+    deadline = monotonic_ms() + 10000.0;
+    while (monotonic_ms() < deadline) {
+        struct pollfd descriptor = {.fd = ble_fd, .events = POLLIN};
+        int poll_result = poll(&descriptor, 1, 250);
+        if (poll_result < 0 && errno == EINTR) {
+            continue;
+        }
+        if (poll_result < 0) {
+            break;
+        }
+        if (poll_result == 0) {
+            continue;
+        }
+        ssize_t length = recv(ble_fd, received, sizeof(received), 0);
+        if (length <= 0 ||
+            handle_control_frame(&control, received, (size_t)length) < 0) {
+            break;
+        }
+        if (control.identity_ready) {
+            free(control.pending);
+            return 0;
+        }
+        if (control.identity_error) {
+            break;
+        }
+    }
+    free(control.pending);
+    fprintf(stderr, "[-] PKI profile selection was not acknowledged\n");
+    return -1;
 }
 
 static int append_pending(struct sdu_prefix_state *state,
@@ -620,9 +845,14 @@ static int drain_prefixed_sdu(struct sdu_prefix_state *state, int tcp_fd)
     return 0;
 }
 
-static int forward_ble_payload(struct sdu_prefix_state *state, int tcp_fd,
+static int forward_ble_payload(struct sdu_prefix_state *state,
+                               struct control_state *control, int tcp_fd,
                                const uint8_t *data, size_t length)
 {
+    int control_result = handle_control_frame(control, data, length);
+    if (control_result != 0) {
+        return control_result < 0 ? -1 : 0;
+    }
     if (state->first_packet) {
         printf("[Bridge] First BLE receive: %zu bytes, prefix=", length);
         size_t preview = length < 12 ? length : 12;
@@ -655,6 +885,51 @@ static int forward_ble_payload(struct sdu_prefix_state *state, int tcp_fd,
     return drain_prefixed_sdu(state, tcp_fd);
 }
 
+static int control_protocol_self_test(void)
+{
+    struct sdu_prefix_state stream = {.first_packet = true};
+    struct control_state control = {0};
+    uint8_t first[64] = {'B', 'C', 'T', 'L', '1', CONTROL_FLAG_START, 1, 0};
+    uint8_t second[64] = {'B', 'C', 'T', 'L', '1', CONTROL_FLAG_END, 1, 0};
+    const char first_payload[] = "[BENCH_RESULT] status=";
+    const char second_payload[] = "success\n";
+    const uint8_t tls_record[] = {0x16, 0x03, 0x03, 0x00, 0x01, 0xaa};
+    uint8_t received[sizeof(tls_record)] = {0};
+    int sockets[2];
+
+    memcpy(first + CONTROL_HEADER_SIZE, first_payload,
+           sizeof(first_payload) - 1);
+    memcpy(second + CONTROL_HEADER_SIZE, second_payload,
+           sizeof(second_payload) - 1);
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) != 0) {
+        return 1;
+    }
+    if (forward_ble_payload(
+            &stream, &control, sockets[0], first,
+            CONTROL_HEADER_SIZE + sizeof(first_payload) - 1) != 0 ||
+        forward_ble_payload(
+            &stream, &control, sockets[0], second,
+            CONTROL_HEADER_SIZE + sizeof(second_payload) - 1) != 0) {
+        close(sockets[0]);
+        close(sockets[1]);
+        return 1;
+    }
+    if (forward_ble_payload(&stream, &control, sockets[0], tls_record,
+                            sizeof(tls_record)) != 0 ||
+        recv(sockets[1], received, sizeof(received), 0) != sizeof(received) ||
+        memcmp(received, tls_record, sizeof(tls_record)) != 0) {
+        close(sockets[0]);
+        close(sockets[1]);
+        free(control.pending);
+        return 1;
+    }
+    close(sockets[0]);
+    close(sockets[1]);
+    free(control.pending);
+    printf("[BCTL_SELFTEST] PASS\n");
+    return 0;
+}
+
 static int relay_loop(int ble_fd, int tcp_fd, size_t mtu)
 {
     uint8_t *buffer = malloc(BRIDGE_RECV_BUFFER_SIZE);
@@ -670,6 +945,7 @@ static int relay_loop(int ble_fd, int tcp_fd, size_t mtu)
         .pending_cap = 0,
         .expected_sdu_len = 0,
     };
+    struct control_state control_state = {0};
     printf("[Bridge] BLE L2CAP <-> TCP active. BLE write chunk=%zu read buffer=%u\n",
            mtu, BRIDGE_RECV_BUFFER_SIZE);
 
@@ -692,7 +968,7 @@ static int relay_loop(int ble_fd, int tcp_fd, size_t mtu)
         if (descriptors[0].revents & (POLLIN | POLLHUP | POLLERR)) {
             ssize_t length = recv(ble_fd, buffer, BRIDGE_RECV_BUFFER_SIZE, 0);
             if (length <= 0 ||
-                forward_ble_payload(&ble_rx_state, tcp_fd, buffer,
+                forward_ble_payload(&ble_rx_state, &control_state, tcp_fd, buffer,
                                     (size_t)length) != 0) {
                 break;
             }
@@ -709,14 +985,13 @@ static int relay_loop(int ble_fd, int tcp_fd, size_t mtu)
                 if (chunk > mtu) {
                     chunk = mtu;
                 }
-                ssize_t written = send(ble_fd, buffer + offset, chunk, 0);
-                if (written <= 0) {
+                if (send_l2cap_sdu(ble_fd, buffer + offset, chunk) != 0) {
                     result = -1;
                     break;
                 }
-                offset += (size_t)written;
+                offset += chunk;
                 if (offset < (size_t)length) {
-                    usleep(20000);
+                    usleep(L2CAP_SDU_PACING_US);
                 }
             }
             if (result < 0) {
@@ -726,6 +1001,7 @@ static int relay_loop(int ble_fd, int tcp_fd, size_t mtu)
     }
 
     free(ble_rx_state.pending);
+    free(control_state.pending);
     free(buffer);
     return keep_running ? -1 : 0;
 }
@@ -736,6 +1012,10 @@ int main(int argc, char **argv)
     setvbuf(stderr, NULL, _IOLBF, 0);
     signal(SIGINT, handle_signal);
     signal(SIGTERM, handle_signal);
+
+    if (argc == 2 && strcmp(argv[1], "--self-test-control") == 0) {
+        return control_protocol_self_test();
+    }
 
     struct config cfg;
     if (parse_args(argc, argv, &cfg) != 0) {
@@ -761,7 +1041,7 @@ int main(int argc, char **argv)
         address = discovered_address;
     }
 
-    int prepare_scan_seconds = cfg.device_addr ? cfg.scan_timeout_sec : 0;
+    int prepare_scan_seconds = cfg.device_addr ? 0 : cfg.scan_timeout_sec;
     prepare_bluetooth_adapter(address, prepare_scan_seconds,
                               cfg.forget_cache, cfg.reset_adapter);
 
@@ -820,6 +1100,14 @@ int main(int argc, char **argv)
     }
     printf("[BENCH_GATEWAY] ble_l2cap_connect_ms=%.3f\n",
            monotonic_ms() - l2cap_start_ms);
+
+    if (select_pki_profile(ble_fd, &cfg) != 0) {
+        close(ble_fd);
+        if (cfg.wifi_disabled) {
+            set_wifi_enabled(true);
+        }
+        return 1;
+    }
 
     double tcp_start_ms = monotonic_ms();
     int tcp_fd = connect_tcp(cfg.tcp_host, cfg.tcp_port);

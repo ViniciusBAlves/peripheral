@@ -1,0 +1,64 @@
+case_id,enabled,kex_group,kex_family,kex_nist_level,kex_public_key_bytes,kex_ciphertext_bytes,kex_shared_secret_bytes,cert_sig_alg,sig_family,sig_nist_level,sig_public_key_bytes,sig_private_key_bytes,sig_signature_bytes,certificate_verify_alg,iterations,warmup_iterations,expected_support,notes
+ecdhe_p_521__rsa_pss_15360,1,ECDHE-P-521,classic,5,133,133,66,RSA-PSS-15360,classic,5,1920,1920,1920,RSA-PSS-15360,4,1,known_unsupported,wolfSSL USE_FAST_MATH in this pinned revision caps TLS RSA at 8192 bits
+ecdhe_p_521__rsa_pss_7680,1,ECDHE-P-521,classic,5,133,133,66,RSA-PSS-7680,classic,3,960,960,960,RSA-PSS-7680,4,1,required,
+ecdhe_p_384__slh_dsa_shake_128s,1,ECDHE-P-384,classic,3,97,97,48,SLH-DSA-SHAKE-128s,pqc,1,32,64,7856,ECDSA-P-256,4,1,required,SLH-DSA signs the chain; TLS CertificateVerify uses ECDSA
+mlkem768__slh_dsa_shake_256s,1,MLKEM768,pqc,3,1184,1088,32,SLH-DSA-SHAKE-256s,pqc,5,64,128,29792,ECDSA-P-521,4,1,required,SLH-DSA signs the chain; TLS CertificateVerify uses ECDSA
+ecdhe_p_256__slh_dsa_shake_192s,1,ECDHE-P-256,classic,1,65,65,32,SLH-DSA-SHAKE-192s,pqc,3,48,96,16224,ECDSA-P-384,4,1,required,SLH-DSA signs the chain; TLS CertificateVerify uses ECDSA
+mlkem1024__slh_dsa_shake_192s,1,MLKEM1024,pqc,5,1568,1568,32,SLH-DSA-SHAKE-192s,pqc,3,48,96,16224,ECDSA-P-384,4,1,required,SLH-DSA signs the chain; TLS CertificateVerify uses ECDSA
+ecdhe_p_384__xmss_sha2_20_256,1,ECDHE-P-384,classic,3,97,97,48,XMSS-SHA2_20_256,pqc,5,68,2573,2820,XMSS-SHA2_20_256,4,1,required,XMSS signs the chain; TLS CertificateVerify uses ECDSA
+x25519mlkem768__slh_dsa_shake_128s,1,X25519MLKEM768,pqc,3,1216,1120,64,SLH-DSA-SHAKE-128s,pqc,1,32,64,7856,ECDSA-P-256,4,1,required,SLH-DSA signs the chain; TLS CertificateVerify uses ECDSA
+secp256r1mlkem768__slh_dsa_shake_192s,1,SecP256r1MLKEM768,pqc,3,1249,1153,64,SLH-DSA-SHAKE-192s,pqc,3,48,96,16224,ECDSA-P-384,4,1,required,SLH-DSA signs the chain; TLS CertificateVerify uses ECDSA
+ecdhe_p_256__rsa_pss_7680,1,ECDHE-P-256,classic,1,65,65,32,RSA-PSS-7680,classic,3,960,960,960,RSA-PSS-7680,4,1,required,
+secp384r1mlkem1024__rsa_pss_15360,1,SecP384r1MLKEM1024,pqc,5,1665,1665,80,RSA-PSS-15360,classic,5,1920,1920,1920,RSA-PSS-15360,4,1,known_unsupported,wolfSSL USE_FAST_MATH in this pinned revision caps TLS RSA at 8192 bits
+ecdhe_p_384__slh_dsa_shake_256s,1,ECDHE-P-384,classic,3,97,97,48,SLH-DSA-SHAKE-256s,pqc,5,64,128,29792,ECDSA-P-521,4,1,required,SLH-DSA signs the chain; TLS CertificateVerify uses ECDSA
+mlkem512__rsa_pss_15360,1,MLKEM512,pqc,1,800,768,32,RSA-PSS-15360,classic,5,1920,1920,1920,RSA-PSS-15360,4,1,known_unsupported,wolfSSL USE_FAST_MATH in this pinned revision caps TLS RSA at 8192 bits
+mlkem1024__slh_dsa_shake_256s,1,MLKEM1024,pqc,5,1568,1568,32,SLH-DSA-SHAKE-256s,pqc,5,64,128,29792,ECDSA-P-521,4,1,required,SLH-DSA signs the chain; TLS CertificateVerify uses ECDSA
+mlkem512__rsa_pss_7680,1,MLKEM512,pqc,1,800,768,32,RSA-PSS-7680,classic,3,960,960,960,RSA-PSS-7680,4,1,required,
+mlkem768__slh_dsa_shake_128s,1,MLKEM768,pqc,3,1184,1088,32,SLH-DSA-SHAKE-128s,pqc,1,32,64,7856,ECDSA-P-256,4,1,required,SLH-DSA signs the chain; TLS CertificateVerify uses ECDSA
+x25519mlkem768__slh_dsa_shake_256s,1,X25519MLKEM768,pqc,3,1216,1120,64,SLH-DSA-SHAKE-256s,pqc,5,64,128,29792,ECDSA-P-521,4,1,required,SLH-DSA signs the chain; TLS CertificateVerify uses ECDSA
+mlkem512__slh_dsa_shake_192s,1,MLKEM512,pqc,1,800,768,32,SLH-DSA-SHAKE-192s,pqc,3,48,96,16224,ECDSA-P-384,4,1,required,SLH-DSA signs the chain; TLS CertificateVerify uses ECDSA
+x25519mlkem768__rsa_pss_3072,1,X25519MLKEM768,pqc,3,1216,1120,64,RSA-PSS-3072,classic,1,384,384,384,RSA-PSS-3072,4,1,required,
+ecdhe_p_256__xmss_sha2_20_256,1,ECDHE-P-256,classic,1,65,65,32,XMSS-SHA2_20_256,pqc,5,68,2573,2820,XMSS-SHA2_20_256,4,1,required,XMSS signs the chain; TLS CertificateVerify uses ECDSA
+secp256r1mlkem768__rsa_pss_3072,1,SecP256r1MLKEM768,pqc,3,1249,1153,64,RSA-PSS-3072,classic,1,384,384,384,RSA-PSS-3072,4,1,required,
+ecdhe_p_384__rsa_pss_3072,1,ECDHE-P-384,classic,3,97,97,48,RSA-PSS-3072,classic,1,384,384,384,RSA-PSS-3072,4,1,required,
+secp384r1mlkem1024__rsa_pss_7680,1,SecP384r1MLKEM1024,pqc,5,1665,1665,80,RSA-PSS-7680,classic,3,960,960,960,RSA-PSS-7680,4,1,required,
+ecdhe_p_256__slh_dsa_shake_128s,1,ECDHE-P-256,classic,1,65,65,32,SLH-DSA-SHAKE-128s,pqc,1,32,64,7856,ECDSA-P-256,4,1,required,SLH-DSA signs the chain; TLS CertificateVerify uses ECDSA
+mlkem1024__rsa_pss_15360,1,MLKEM1024,pqc,5,1568,1568,32,RSA-PSS-15360,classic,5,1920,1920,1920,RSA-PSS-15360,4,1,known_unsupported,wolfSSL USE_FAST_MATH in this pinned revision caps TLS RSA at 8192 bits
+secp256r1mlkem768__rsa_pss_15360,1,SecP256r1MLKEM768,pqc,3,1249,1153,64,RSA-PSS-15360,classic,5,1920,1920,1920,RSA-PSS-15360,4,1,known_unsupported,wolfSSL USE_FAST_MATH in this pinned revision caps TLS RSA at 8192 bits
+mlkem768__rsa_pss_3072,1,MLKEM768,pqc,3,1184,1088,32,RSA-PSS-3072,classic,1,384,384,384,RSA-PSS-3072,4,1,required,
+ecdhe_p_384__slh_dsa_shake_192s,1,ECDHE-P-384,classic,3,97,97,48,SLH-DSA-SHAKE-192s,pqc,3,48,96,16224,ECDSA-P-384,4,1,required,SLH-DSA signs the chain; TLS CertificateVerify uses ECDSA
+mlkem512__xmss_sha2_20_256,1,MLKEM512,pqc,1,800,768,32,XMSS-SHA2_20_256,pqc,5,68,2573,2820,XMSS-SHA2_20_256,4,1,required,XMSS signs the chain; TLS CertificateVerify uses ECDSA
+mlkem512__slh_dsa_shake_256s,1,MLKEM512,pqc,1,800,768,32,SLH-DSA-SHAKE-256s,pqc,5,64,128,29792,ECDSA-P-521,4,1,required,SLH-DSA signs the chain; TLS CertificateVerify uses ECDSA
+ecdhe_p_256__rsa_pss_15360,1,ECDHE-P-256,classic,1,65,65,32,RSA-PSS-15360,classic,5,1920,1920,1920,RSA-PSS-15360,4,1,known_unsupported,wolfSSL USE_FAST_MATH in this pinned revision caps TLS RSA at 8192 bits
+secp256r1mlkem768__slh_dsa_shake_256s,1,SecP256r1MLKEM768,pqc,3,1249,1153,64,SLH-DSA-SHAKE-256s,pqc,5,64,128,29792,ECDSA-P-521,4,1,required,SLH-DSA signs the chain; TLS CertificateVerify uses ECDSA
+ecdhe_p_384__rsa_pss_7680,1,ECDHE-P-384,classic,3,97,97,48,RSA-PSS-7680,classic,3,960,960,960,RSA-PSS-7680,4,1,required,
+ecdhe_p_384__rsa_pss_15360,1,ECDHE-P-384,classic,3,97,97,48,RSA-PSS-15360,classic,5,1920,1920,1920,RSA-PSS-15360,4,1,known_unsupported,wolfSSL USE_FAST_MATH in this pinned revision caps TLS RSA at 8192 bits
+mlkem512__slh_dsa_shake_128s,1,MLKEM512,pqc,1,800,768,32,SLH-DSA-SHAKE-128s,pqc,1,32,64,7856,ECDSA-P-256,4,1,required,SLH-DSA signs the chain; TLS CertificateVerify uses ECDSA
+secp384r1mlkem1024__slh_dsa_shake_256s,1,SecP384r1MLKEM1024,pqc,5,1665,1665,80,SLH-DSA-SHAKE-256s,pqc,5,64,128,29792,ECDSA-P-521,4,1,required,SLH-DSA signs the chain; TLS CertificateVerify uses ECDSA
+mlkem768__slh_dsa_shake_192s,1,MLKEM768,pqc,3,1184,1088,32,SLH-DSA-SHAKE-192s,pqc,3,48,96,16224,ECDSA-P-384,4,1,required,SLH-DSA signs the chain; TLS CertificateVerify uses ECDSA
+secp384r1mlkem1024__slh_dsa_shake_128s,1,SecP384r1MLKEM1024,pqc,5,1665,1665,80,SLH-DSA-SHAKE-128s,pqc,1,32,64,7856,ECDSA-P-256,4,1,required,SLH-DSA signs the chain; TLS CertificateVerify uses ECDSA
+secp256r1mlkem768__rsa_pss_7680,1,SecP256r1MLKEM768,pqc,3,1249,1153,64,RSA-PSS-7680,classic,3,960,960,960,RSA-PSS-7680,4,1,required,
+secp256r1mlkem768__slh_dsa_shake_128s,1,SecP256r1MLKEM768,pqc,3,1249,1153,64,SLH-DSA-SHAKE-128s,pqc,1,32,64,7856,ECDSA-P-256,4,1,required,SLH-DSA signs the chain; TLS CertificateVerify uses ECDSA
+mlkem768__xmss_sha2_20_256,1,MLKEM768,pqc,3,1184,1088,32,XMSS-SHA2_20_256,pqc,5,68,2573,2820,XMSS-SHA2_20_256,4,1,required,XMSS signs the chain; TLS CertificateVerify uses ECDSA
+ecdhe_p_256__slh_dsa_shake_256s,1,ECDHE-P-256,classic,1,65,65,32,SLH-DSA-SHAKE-256s,pqc,5,64,128,29792,ECDSA-P-521,4,1,required,SLH-DSA signs the chain; TLS CertificateVerify uses ECDSA
+ecdhe_p_256__rsa_pss_3072,1,ECDHE-P-256,classic,1,65,65,32,RSA-PSS-3072,classic,1,384,384,384,RSA-PSS-3072,4,1,required,
+mlkem768__rsa_pss_7680,1,MLKEM768,pqc,3,1184,1088,32,RSA-PSS-7680,classic,3,960,960,960,RSA-PSS-7680,4,1,required,
+mlkem1024__xmss_sha2_20_256,1,MLKEM1024,pqc,5,1568,1568,32,XMSS-SHA2_20_256,pqc,5,68,2573,2820,XMSS-SHA2_20_256,4,1,required,XMSS signs the chain; TLS CertificateVerify uses ECDSA
+secp384r1mlkem1024__slh_dsa_shake_192s,1,SecP384r1MLKEM1024,pqc,5,1665,1665,80,SLH-DSA-SHAKE-192s,pqc,3,48,96,16224,ECDSA-P-384,4,1,required,SLH-DSA signs the chain; TLS CertificateVerify uses ECDSA
+mlkem1024__rsa_pss_3072,1,MLKEM1024,pqc,5,1568,1568,32,RSA-PSS-3072,classic,1,384,384,384,RSA-PSS-3072,4,1,required,
+ecdhe_p_521__slh_dsa_shake_192s,1,ECDHE-P-521,classic,5,133,133,66,SLH-DSA-SHAKE-192s,pqc,3,48,96,16224,ECDSA-P-384,4,1,required,SLH-DSA signs the chain; TLS CertificateVerify uses ECDSA
+mlkem1024__slh_dsa_shake_128s,1,MLKEM1024,pqc,5,1568,1568,32,SLH-DSA-SHAKE-128s,pqc,1,32,64,7856,ECDSA-P-256,4,1,required,SLH-DSA signs the chain; TLS CertificateVerify uses ECDSA
+secp384r1mlkem1024__rsa_pss_3072,1,SecP384r1MLKEM1024,pqc,5,1665,1665,80,RSA-PSS-3072,classic,1,384,384,384,RSA-PSS-3072,4,1,required,
+ecdhe_p_521__rsa_pss_3072,1,ECDHE-P-521,classic,5,133,133,66,RSA-PSS-3072,classic,1,384,384,384,RSA-PSS-3072,4,1,required,
+mlkem768__rsa_pss_15360,1,MLKEM768,pqc,3,1184,1088,32,RSA-PSS-15360,classic,5,1920,1920,1920,RSA-PSS-15360,4,1,known_unsupported,wolfSSL USE_FAST_MATH in this pinned revision caps TLS RSA at 8192 bits
+mlkem1024__rsa_pss_7680,1,MLKEM1024,pqc,5,1568,1568,32,RSA-PSS-7680,classic,3,960,960,960,RSA-PSS-7680,4,1,required,
+secp384r1mlkem1024__xmss_sha2_20_256,1,SecP384r1MLKEM1024,pqc,5,1665,1665,80,XMSS-SHA2_20_256,pqc,5,68,2573,2820,XMSS-SHA2_20_256,4,1,required,XMSS signs the chain; TLS CertificateVerify uses ECDSA
+secp256r1mlkem768__xmss_sha2_20_256,1,SecP256r1MLKEM768,pqc,3,1249,1153,64,XMSS-SHA2_20_256,pqc,5,68,2573,2820,XMSS-SHA2_20_256,4,1,required,XMSS signs the chain; TLS CertificateVerify uses ECDSA
+x25519mlkem768__slh_dsa_shake_192s,1,X25519MLKEM768,pqc,3,1216,1120,64,SLH-DSA-SHAKE-192s,pqc,3,48,96,16224,ECDSA-P-384,4,1,required,SLH-DSA signs the chain; TLS CertificateVerify uses ECDSA
+x25519mlkem768__rsa_pss_7680,1,X25519MLKEM768,pqc,3,1216,1120,64,RSA-PSS-7680,classic,3,960,960,960,RSA-PSS-7680,4,1,required,
+ecdhe_p_521__slh_dsa_shake_256s,1,ECDHE-P-521,classic,5,133,133,66,SLH-DSA-SHAKE-256s,pqc,5,64,128,29792,ECDSA-P-521,4,1,required,SLH-DSA signs the chain; TLS CertificateVerify uses ECDSA
+ecdhe_p_521__slh_dsa_shake_128s,1,ECDHE-P-521,classic,5,133,133,66,SLH-DSA-SHAKE-128s,pqc,1,32,64,7856,ECDSA-P-256,4,1,required,SLH-DSA signs the chain; TLS CertificateVerify uses ECDSA
+x25519mlkem768__rsa_pss_15360,1,X25519MLKEM768,pqc,3,1216,1120,64,RSA-PSS-15360,classic,5,1920,1920,1920,RSA-PSS-15360,4,1,known_unsupported,wolfSSL USE_FAST_MATH in this pinned revision caps TLS RSA at 8192 bits
+x25519mlkem768__xmss_sha2_20_256,1,X25519MLKEM768,pqc,3,1216,1120,64,XMSS-SHA2_20_256,pqc,5,68,2573,2820,XMSS-SHA2_20_256,4,1,required,XMSS signs the chain; TLS CertificateVerify uses ECDSA
+mlkem512__rsa_pss_3072,1,MLKEM512,pqc,1,800,768,32,RSA-PSS-3072,classic,1,384,384,384,RSA-PSS-3072,4,1,required,
+ecdhe_p_521__xmss_sha2_20_256,1,ECDHE-P-521,classic,5,133,133,66,XMSS-SHA2_20_256,pqc,5,68,2573,2820,XMSS-SHA2_20_256,4,1,required,XMSS signs the chain; TLS CertificateVerify uses ECDSA

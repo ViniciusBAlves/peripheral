@@ -13,41 +13,157 @@ listener backed by OpenSSL 3.5+ and its available post-quantum providers, while
 LMS/HSS and XMSS cases use a small wolfSSL TLS server with a minimal MQTT
 CONNACK responder.
 
-The firmware contains every supported TLS key-exchange group and a trust bundle
-for the server CAs in the selected run. The server offers one group and one
-certificate per case. The nRF52840 uses one fixed ECDSA client identity for
-mutual TLS, so the benchmark signature algorithm describes the server side.
+The Bluetooth controller and benchmark application share the nRF52840's single
+Cortex-M4F core. The runner therefore builds one `nrf52840dk/nrf52840` image
+without sysbuild or an `hci_ipc` child image.
 
-SLH-DSA signs the server certificate chain. Its TLS `CertificateVerify` leaf
-remains ECDSA because the current TLS stacks do not negotiate SLH-DSA as a TLS
-signature scheme. Both values are recorded explicitly in the CSV.
+The firmware contains every supported TLS key-exchange group and all 17 public
+roots used by the suite. Each PKI is `root -> intermediate -> leaf`.
+The root remains on the nRF52840 and Raspberry Pi; the TLS server transmits only
+`leaf + intermediate`. Authentication is server-only by default. The optional
+`--mtls-mode` build additionally embeds one fixed ECDSA P-256 client identity
+and makes the selected server backend require its certificate.
 
-LMS/HSS and XMSS also sign the server certificate chain while keeping an ECDSA
-TLS leaf key. OpenSSL/Mosquitto cannot load those chains for TLS, so the runner
-uses wolfSSL for those cases when `--server-backend auto` is selected.
+The generator creates six homogeneous chains (ECDSA P-256/384/521 and ML-DSA
+44/65/87) and 22 heterogeneous chains. In heterogeneous chains a heavier
+SLH-DSA, RSA-PSS, LMS, or XMSS root signs a lighter intermediate, and that
+intermediate signs a leaf using the same light algorithm. `cert_sig_alg`
+therefore always describes the leaf and the real TLS 1.3 `CertificateVerify`.
 
-RSA-PSS-15360 cases are emitted as `known_unsupported` by default because the
-normal wolfSSL `USE_FAST_MATH` profile caps TLS RSA keys at 8192 bits. They are
-not silently substituted with RSA-PSS-7680. The runner handles them by default
-with a separate RSA-16384 firmware profile that disables `USE_FAST_MATH`, as
-described below.
+By default, LMS/HSS and XMSS act only as roots; their intermediate and leaf use
+either ECDSA P-521 or ML-DSA-87. OpenSSL/Mosquitto cannot load chains rooted in
+these stateful algorithms, so the runner uses wolfSSL for those cases when
+`--server-backend auto` is selected.
+
+Pass `--include-heavy-homogeneous` to add 11 opt-in homogeneous X.509 chains:
+all six SLH-DSA-SHAKE variants, all three RSA-PSS sizes, LMS, and XMSS. In
+these profiles one algorithm signs the root, intermediate, and leaf
+certificates. RSA-PSS also supplies the TLS leaf key and `CertificateVerify`.
+SLH-DSA, LMS, and XMSS keep an ECDSA TLS leaf key because the installed TLS
+stacks do not expose those algorithms as TLS 1.3 `SignatureScheme` values.
+
+RSA-PSS-3072, RSA-PSS-7680, and RSA-PSS-15360 all run in the normal wolfSSL
+`USE_FAST_MATH` firmware profile. RSA-PSS-15360 is not silently substituted
+with RSA-PSS-7680.
+
+The runner first tries one universal root bundle and requires 32 KiB of free
+flash. If needed, it packs roots largest-first into the minimum practical set
+of firmware profiles and executes each profile contiguously to minimize
+reflashing.
+
+## Connection Configuration
+
+Before running a hardware benchmark, configure the four connection values in
+`benchmarking/config.json`. The repository currently uses:
+
+```json
+{
+  "serial-device": "/dev/serial/by-id/usb-SEGGER_J-Link_001050210143-if00",
+  "pi-host": "user@ip",
+  "ssh-key": "~/.ssh/[INSERT_SSH_KEY]",
+  "ble-addr": "00:00:00:00:00:00"
+}
+```
+
+- `serial-device`: nRF52840DK VCOM used for `BENCH_*` telemetry.
+- `pi-host`: Raspberry Pi SSH destination in `user@host` form.
+- `ssh-key`: private SSH key; `~` and environment variables are expanded.
+- `ble-addr`: BLE address advertised by the nRF52840DK. Use all zeroes to scan
+  for the `PQC52840` device name.
+
+`run_benchmarks.py` loads this file automatically. A different file can be
+selected with `--config`:
+
+```bash
+python benchmarking/run_benchmarks.py \
+  --config benchmarking/config-lab.json \
+  --cases benchmarking/cases/<cases>.csv \
+  --seed 123
+```
+
+The corresponding CLI options remain available as one-run overrides and take
+precedence over JSON values. The four connection fields are required.
+
+## Certificate Generation Benchmark
+
+`run_certificate_benchmarks.py` builds and flashes a dedicated nRF5340
+firmware that generates a self-signed X.509 certificate on the application
+core for every signature algorithm enabled by the input CSV:
+
+```bash
+python benchmarking/run_certificate_benchmarks.py \
+  --cases benchmarking/cases/20260703_220208_benchmark_cases.csv \
+  --iterations 5 \
+  --seed 123
+```
+
+Each attempt reports separate `certificate_keygen_ms`,
+`certificate_make_body_ms`, `certificate_sign_ms`, and
+`certificate_verify_ms` values, plus total time, DER size, CPU cycles, and
+wolfSSL heap usage. The firmware supports ECDSA, RSA-PSS, ML-DSA,
+SLH-DSA-SHAKE `128s/128f`, `192s/192f`, and `256s/256f`, LMS/HSS, and XMSS
+cases from `benchmarklib/algorithms.py`. Large RSA key
+generation and the small-memory SLH/LMS/XMSS implementations can take many
+minutes. Every attempt has a hard 15-minute ceiling; after a timeout, the
+remaining iterations of that signature are recorded as `cancelled` and the
+runner advances to the next algorithm.
+
+This mode measures a fresh key pair and a self-signed CA certificate whose
+X.509 signature uses the selected algorithm. It does not reproduce the normal
+benchmark's three-level server chain.
+ML-DSA signing uses randomized FIPS 204 signing and rejection sampling, so its
+signing distribution is expected to be wider than ECDSA. The summary includes
+median, p95, and standard deviation for `certificate_sign_ms`.
+
+Use `--skip-build --skip-flash` to reuse the certificate firmware already on
+the board. The runner resets the DK after opening its VCOM so `BENCH_READY`
+is not lost. The previous Docker/OpenSSL server-chain benchmark remains
+available with `--host-only`.
+
+## KEM Operations Benchmark
+
+`run_kem_benchmarks.py` builds a separate nRF5340 image and measures recipient
+key generation, encapsulation and decapsulation directly on the application
+core. It validates that both sides derive the same secret and reports operation
+times, public/private key sizes, ciphertext and shared-secret sizes, CPU
+cycles, CPU time, and wolfSSL heap usage.
+
+```bash
+python benchmarking/run_kem_benchmarks.py \
+  --cases benchmarking/cases/all_kem_cases.csv \
+  --iterations 5 \
+  --seed 123
+```
+
+The default ML-KEM backend is the pinned `pqm4-m4fstack` implementation. Use
+`--mlkem-backend wolfssl` for a direct wolfSSL comparison. For ECDHE groups,
+the CSV labels the operation model as `dh_key_agreement`: encapsulation means
+ephemeral-key generation plus the initiator's shared-secret derivation, while
+decapsulation means the recipient's shared-secret derivation. Hybrid cases
+measure both their ML-KEM and classical components in each stage.
+
+As in the certificate benchmark, each attempt is capped at 15 minutes. A
+timeout cancels the remaining iterations of that KEM and advances to the next
+group.
 
 ## Raspberry Pi
 
-Configure SSH key authentication first. Then install the gateway dependencies:
+Configure SSH key authentication first. Install the system build and Bluetooth
+dependencies on the Pi:
 
 ```bash
-ssh thiago@10.12.194.1 'bash -s' < benchmarking/gateway/setup_pi_gateway.sh
-PI_HOST=thiago@10.12.194.1 \
-SSH_KEY="$HOME/.ssh/id_ed25519_pi" \
-benchmarking/gateway/deploy_pi_gateway.sh
+ssh thiago@10.12.194.1 \
+  'sudo apt update && sudo apt install -y build-essential bluez cmake git \
+   libbluetooth-dev libcap2-bin libssl-dev mosquitto ninja-build perl pkg-config'
 ```
 
+The Python runner deploys and compiles the bridge automatically using the SSH
+values from `config.json`. It also builds the pinned wolfSSL revision once
+under `/home/<user>/peripheral-benchmark/deps/wolfssl`; subsequent runs reuse
+that user-local installation and do not require a system wolfSSL package.
+
 The benchmark user must be able to start `ble_mqtt_bridge` with non-interactive
-sudo. Add a narrow sudoers rule for the deployed binary if needed. Runs that
-use `--server-backend auto` with LMS/XMSS cases, or `--server-backend wolfssl`,
-also require wolfSSL development files on the Pi so the runner can compile
-`wolfssl_tls_server` with `pkg-config wolfssl`.
+sudo. Add a narrow sudoers rule for the deployed binary if needed.
 
 ## Generate Cases
 
@@ -56,11 +172,16 @@ python benchmarking/generate_cases.py \
   --seed 123 \
   --iterations 5 \
   --warmup-iterations 1 \
+  --include-heavy-homogeneous \
   --separate-pqc-classic
 ```
 
 The generator refuses to overwrite an existing CSV. The printed path is used
-as `--cases` below.
+as `--cases` below. A full generation contains 28 PKI chains crossed with nine
+KEM groups, for 252 unique cases. The CSV records `pki_chain_id`, root,
+intermediate, leaf, PKI kind, and the expected leaf `CertificateVerify` scheme.
+With `--include-heavy-homogeneous`, the output contains 39 PKI chains and 351
+cases before `--separate-pqc-classic` filtering.
 
 ## Schedule-Only Dry Run
 
@@ -79,7 +200,7 @@ Two complete sessions are created per case by default. Every warmup or measured
 attempt for normally supported cases is a separate block shuffled by the run
 seed. Cases marked `known_unsupported` are moved to the end of the schedule.
 Their case order is seeded, but every attempt belonging to one such case stays
-contiguous so the large-RSA firmware profile is flashed only once.
+contiguous.
 
 Use `--limit N` to execute only the first `N` cases after seeded shuffling:
 
@@ -89,6 +210,19 @@ python benchmarking/run_benchmarks.py \
   --seed 123 \
   --limit 2
 ```
+
+Add mutual client authentication without changing the case CSV:
+
+```bash
+python benchmarking/run_benchmarks.py \
+  --cases benchmarking/cases/<cases>.csv \
+  --seed 123 \
+  --mtls-mode
+```
+
+The flag produces a distinct firmware build containing the fixed client
+identity. Do not reuse a server-only image with `--skip-build` or
+`--skip-flash` for the first mTLS run.
 
 ## Server Backend
 
@@ -101,11 +235,11 @@ The runner supports three server backend modes:
 - `--server-backend wolfssl`: use the wolfSSL TLS server for every selected
   case.
 
-The wolfSSL server is not a full MQTT broker. It accepts one mutual-TLS
-connection through the existing BLE bridge, reads the benchmark firmware's MQTT
-CONNECT packet, sends CONNACK, and closes cleanly. The resolved backend is saved
-in `run_manifest.csv`, `session_manifest.csv`, `attempts.csv`, and
-`summary.csv`.
+The wolfSSL server is not a full MQTT broker. It accepts one TLS connection
+through the existing BLE bridge, reads the benchmark firmware's MQTT CONNECT
+packet, sends CONNACK, and closes cleanly. The attempts output records the raw
+two-byte scheme ID, observed server scheme, expected leaf scheme, and whether
+they matched. A mismatch is a benchmark failure rather than a silent fallback.
 
 ## Hardware Run
 
@@ -131,7 +265,10 @@ Hardware connection defaults are read from `benchmarking/config.json`:
   "serial-device": "/dev/ttyACM0",
   "pi-host": "user@ip",
   "ssh-key": "~/.ssh/[INSERT_SSH_KEY]",
-  "ble-addr": "00:00:00:00:00:00"
+  "ble-addr": "00:00:00:00:00:00",
+  "power-profiler-serial-device": "/dev/serial/by-id/usb-Nordic_Semiconductor_PPK2_SERIAL-if01",
+  "power-profiler-vdd-mv": 3000,
+  "power-profiler-output-samples-per-second": 100
 }
 ```
 
@@ -144,6 +281,65 @@ The runner generates every certificate first, builds and flashes one universal
 firmware image, then executes the saved schedule. Use `--skip-build
 --skip-flash` only when the already flashed image was built from the same
 universal credential bundle.
+
+## PPK2 Energy Measurement
+
+`--power-profiler` enables PPK2 Source Mode for the nRF52840DK. The runner
+flashes the DK first, pauses for wiring, configures Source Mode with DUT power
+off, and pauses again before energizing the nRF52840 at the voltage configured
+by `power-profiler-vdd-mv` (3000 mV by default).
+
+With SB40 cut, keep the P22 jumper installed while flashing. At the runner
+prompt:
+
+1. Keep the DK USB connected and the P22 jumper installed.
+2. Set SW6 to `nRF ONLY` and SW10 to `VEXT -> nRF`.
+3. Connect PPK2 `VOUT` to P21 and PPK2 `GND` to DK `GND`.
+4. Connect DK `VDD_nRF`/`GND` to PPK2 logic `VCC`/`GND`.
+5. Connect `A0/P0.03 -> D7`, `A1/P0.04 -> D6`, `A2/P0.28 -> D5`, and
+   `A3/P0.29 -> D4`.
+6. Keep the Power Profiler desktop app closed while the Python runner owns the
+   PPK2 serial device.
+
+After the first confirmation the PPK2 is configured but the DUT output remains
+off. Check the wiring once more, then use the second confirmation to power and
+boot the nRF52840.
+
+The four GPIO windows measure total execution, TLS handshake, client KEM, and
+client signature. Current is integrated at the PPK2 native 100 kS/s rate; the
+configured output rate only controls the compressed `power_trace_*.csv.gz`.
+Run a single-case smoke test with:
+
+```bash
+python3 benchmarking/run_benchmarks.py \
+  --cases benchmarking/cases/simple_cases.csv \
+  --seed 123 \
+  --limit 1 \
+  --sessions-per-case 1 \
+  --power-profiler
+```
+
+Source Mode is intentionally limited to `nrf52840dk/nrf52840` and a single
+firmware profile because SW6 isolates the target from the debugger during
+capture.
+
+### Save and resume
+
+Every completed schedule block is committed to its case `attempts.csv` and
+then to an atomic `checkpoint.json`. If the process is interrupted during a
+block, that block is absent from the checkpoint and is executed again.
+
+Resume using the run ID printed after `results=`:
+
+```bash
+python benchmarking/run_benchmarks.py \
+  --resume 20260704_004453_123
+```
+
+The saved seed, shuffled `session_manifest.csv`, client ML-KEM backend, server
+backend, and RSA fallback policy are reused. Existing attempts are loaded and
+new rows are appended without overwriting completed work. `--resume` cannot be
+combined with `--cases`, `--run-id`, `--limit`, or `--only-case`.
 
 Generated certificate identities are cached across runs in
 `benchmarking/work/certificate-cache`. Cached certificates are reused while
@@ -165,43 +361,15 @@ Bluetooth controller, and waits for a fresh `BENCH_READY` marker. The firmware
 also bounds its disconnect wait and reboots itself only if the controller
 teardown callback is lost. This recovery does not rebuild or reflash the board.
 
-The firmware keeps TFM at `FP_MAX_BITS=16384` for RSA-15360 compatibility, but
-routes P-256/P-384/P-521 through wolfSSL's Cortex-M SP-ECC backend. Without
-that split, every ECC operation inherits the oversized TFM representation and
-P-256 handshakes become tens of seconds slower.
-
-### RSA-15360 reflash profile
-
-RSA-PSS-15360 cases automatically use the separate large-RSA firmware profile.
-This is equivalent to passing `--reflash-known-unsupported-rsa` and is enabled
-by default:
-
-```bash
-python benchmarking/run_benchmarks.py \
-  --cases benchmarking/cases/<cases>.csv \
-  --seed 123
-```
-
-The runner creates independent CA bundles and firmware images for:
-
-- `fast-math`: the normal image using `USE_FAST_MATH`;
-- `integer-heap-16384`: disables fast math, enables
-  `USE_INTEGER_HEAP_MATH`, and raises `RSA_MAX_SIZE`,
-  `WC_MAX_RSA_BITS`, and the pinned wolfSSL ASN/TLS buffers to 16384 bits.
-
-The runner executes the normal shuffled schedule first. It then flashes the
-large-RSA image once and runs every RSA-PSS-15360 case at the end, with all
-attempts of each case contiguous. The profile is recorded in `attempts.csv`,
-`summary.csv`, and the serial readiness marker.
-
-This fallback cannot be combined with `--skip-build` or `--skip-flash` when
-large-RSA cases are selected. Pass `--no-reflash-known-unsupported-rsa` to
-retain the old behavior of recording those cases as unsupported without
-executing them.
+The firmware keeps `FP_MAX_BITS=32768` and patches wolfSSL's disposable
+FetchContent copy so the single `fast-math` image can parse and encode
+RSA-PSS-15360 material. P-256/P-384/P-521 continue to route through wolfSSL's
+Cortex-M SP-ECC backend so ECC does not inherit oversized TFM arithmetic.
 
 ### Default pqm4 ML-KEM backend
 
-The nRF52840 uses pqm4's Cortex-M4F ML-KEM implementation by default, including
+The nRF52840 uses pqm4's Cortex-M4F ML-KEM implementation by
+default, including
 the ML-KEM component of hybrid groups. Use `--mlkem-backend wolfssl` only when
 an explicit wolfSSL baseline is required:
 
@@ -210,11 +378,7 @@ python benchmarking/run_benchmarks.py \
   --cases benchmarking/cases/simple_cases.csv \
   --seed 123 \
   --limit 1 \
-  --mlkem-backend wolfssl \
-  --serial-device /dev/ttyACM0 \
-  --pi-host thiago@10.12.194.1 \
-  --ssh-key "$HOME/.ssh/id_ed25519_pi_gateway" \
-  --ble-addr F9:79:AE:2A:9A:1E
+  --mlkem-backend wolfssl
 ```
 
 The runner clones a pinned pqm4 revision into `benchmarking/work/pqm4`.
@@ -226,13 +390,13 @@ encapsulation and decapsulation to pqm4. The selected backend is saved in
 signatures and verification remain handled by wolfSSL.
 
 The `m4fstack` implementation is intentionally used instead of `m4fspeed`.
-Both use Cortex-M4F assembly, while `m4fstack` leaves more stack headroom for
-the TLS call chain on the 256 KiB nRF52840.
+It is optimized for the nRF52840's Cortex-M4F, while its smaller stack demand
+leaves more headroom for the TLS call chain.
 
 ## Measurements
 
 `raw_handshake_ms` covers only `wolfSSL_connect()`. `tls_setup_ms` includes
-context, CA, client certificate, key, group, and `WOLFSSL` object setup.
+context, selected root, group, and `WOLFSSL` object setup.
 `mqtt_connect_ms` ends at MQTT CONNACK. `full_connect_ms` starts at TLS setup,
 while `end_to_end_ms` starts when the firmware L2CAP channel becomes ready.
 Gateway-side BLE and TCP setup durations are recorded separately.
@@ -267,14 +431,45 @@ The firmware also records the following per-attempt values:
   the ML-KEM primitive calls made on the client. In a normal TLS client
   handshake, key generation and decapsulation occur on the board while
   encapsulation occurs on the server, so client encapsulation can be zero.
-- `certificate_signature_verify_ms` is the cumulative time spent by wolfSSL
-  in `ConfirmSignature()` while validating certificate-chain signatures.
+- `classical_kex_keygen_ms` and `classical_kex_shared_secret_ms` measure the
+  ECDHE/X25519 component. `kem_client_total_ms` includes only the primitives
+  belonging to the selected group: ML-KEM for pure ML-KEM, classic operations
+  for ECDHE, and both for hybrid groups. Speculative classic key generation by
+  wolfSSL remains visible in the raw classic field but is excluded from a pure
+  ML-KEM total.
+- `x509_chain_signature_verify_ms` measures wolfSSL `ConfirmSignature()` calls
+  while validating the server certificate chain. The legacy
+  `certificate_signature_verify_ms` column contains the same value.
+- `root_cert_der_bytes`, `intermediate_cert_der_bytes`, and
+  `leaf_cert_der_bytes` are the individual DER sizes. `server_chain_bytes` is
+  the transmitted DER payload size, computed as leaf plus intermediate; the
+  root is excluded from the TLS chain.
+- `tls_certificate_verify_signature_verify_ms` measures processing and
+  cryptographic verification of the server TLS 1.3 `CertificateVerify`.
+- By default the benchmark authenticates only the server. Add `--mtls-mode`
+  to make the server require a fixed ECDSA P-256 client certificate signed by
+  the benchmark client CA. In that mode, `mtls_signature_generate_ms` measures
+  the client's TLS 1.3 `CertificateVerify` signature and
+  `client_signature_total_ms` also includes that operation.
+- `server_kem_encapsulation_ms` and `server_certificate_verify_sign_ms` are
+  measured inside the Raspberry Pi OpenSSL EVP calls. The runner preloads
+  `server_crypto_metrics.so` into Mosquitto, so these values exclude BLE/TCP
+  transport and are read from `[BENCH_SERVER]` records in `broker.log`.
 - `l2cap_tx_packets`, `l2cap_tx_bytes`, `l2cap_rx_packets`, and
   `l2cap_rx_bytes` cover TLS plus MQTT CONNECT/CONNACK. Packet counts are
   Zephyr L2CAP SDUs, not Bluetooth Link Layer packets or radio transmissions.
 - `l2cap_tx_retries`, `l2cap_tx_wait_ms`, and `l2cap_rx_overflows` expose
   transport pressure caused by exhausted TX buffers, radio backpressure, and
   insufficient RX ring-buffer capacity.
+- `client_icache_hits` and `client_icache_misses` are populated only when the
+  selected Nordic SoC exposes NVMC instruction-cache profiling registers; the
+  runner derives requests and hit/miss percentages from those counters.
+- `client_memory_access_counters_supported` is `0` on this nRF52840 build. Its
+  Cortex-M4F configuration has no enabled PMU event counters for globally retired data-memory reads
+  and writes. The DWT `LSUCNT` register counts extra load/store-unit cycles,
+  saturates at eight bits, and is therefore deliberately not mislabeled as
+  read/write operations. Use the exact L2CAP byte counters above when the
+  quantity of interest is communication data moved during the attempt.
 
 `summary.csv` contains the mean of these fields for successful measured
 attempts. The raw values remain available in each case's `attempts.csv`.
@@ -282,6 +477,91 @@ attempts. The raw values remain available in each case's `attempts.csv`.
 Each run writes immutable artifacts below `results/<timestamp>_<seed>/`,
 including the input CSV, run and session manifests, per-case attempts and logs,
 and the aggregate `summary.csv`.
+
+## Disk Usage And Caches
+
+Certificate chains are generated once in `work/certificate-cache/` and reused
+by later runs. Public certificates are hard-linked into per-case result
+directories when the filesystem permits it; private keys are copied because
+stateful LMS/XMSS keys must never share mutable state.
+
+Firmware builds use the content-addressed `work/firmware-cache/`. The cache key
+includes the firmware sources, generated trust bundle, board and build options,
+so an identical benchmark reuses one Zephyr build while any relevant change
+creates a separate entry.
+
+Old run-specific build directories can be inspected and removed without
+touching benchmark results or the reusable certificate cache:
+
+```bash
+python3 benchmarking/clean_work.py
+python3 benchmarking/clean_work.py --apply
+```
+
+## Bidirectional Payload Benchmark
+
+`run_transfer_benchmarks.py` reuses the same case CSV, PKI generation,
+universal firmware profiles, Raspberry Pi bridge, TLS backends, and seed. Each
+case uses one fresh BLE/TLS/MQTT connection. CSV `iterations=N` repeats each of
+the twelve QoS 1 transfers N times inside that connection: 128 bytes, 1 KiB,
+8 KiB, 16 KiB, 32 KiB and 64 KiB in both directions. Payloads are generated
+and validated as a stream.
+`warmup_iterations` and
+`--sessions-per-case` are ignored by this runner.
+
+```bash
+python3 benchmarking/run_transfer_benchmarks.py \
+  --cases benchmarking/cases/simple_cases.csv \
+  --seed 123 \
+  --limit 1
+```
+
+Use `--mtls-mode` to retain mutual TLS. Resume an interrupted run with:
+
+```bash
+python3 benchmarking/run_transfer_benchmarks.py --resume <run_id>
+```
+
+The case order and all `12 * iterations` operations are shuffled
+deterministically from the seed. Results are
+written to `round_manifest.csv`, `transfer_manifest.csv`,
+`handshake_summary.csv`, `transfer_summary.csv`, and per-case
+`handshakes.csv`/`transmissions.csv`. Payload integrity uses a deterministic
+stream and SHA-256 plus MQTT PUBACK and an application-level ACK. Failed retry
+data remains in `transmissions.csv`, while aggregates include only complete
+rounds with confirmed integrity.
+
+The transfer runner accepts the same nRF52840DK PPK2 Source Mode option as the
+handshake runner:
+
+```bash
+python3 benchmarking/run_transfer_benchmarks.py \
+  --cases benchmarking/cases/simple_cases.csv \
+  --seed 123 \
+  --limit 1 \
+  --power-profiler
+```
+
+The handshake keeps the existing D7-D4 windows. After it completes, each
+payload transfer emits a separate D7 pulse. Its duration, charge, energy,
+average current, and peak current are written to `transmissions.csv`; current
+is still integrated from the native 100 kS/s samples. Without
+`--power-profiler`, these transfer energy fields are marked `unsupported`.
+
+To require every recorded execution, including warmups, to have succeeded:
+
+```bash
+python benchmarking/check_results.py <run_id>
+```
+
+The checker prints `PASS` or `FAIL` for every case and exits with status `1`
+when at least one case is missing attempts or contains a non-success status.
+For a benchmark that is still running, hide cases without attempts while
+retaining completed passes, failures and timeouts with:
+
+```bash
+python benchmarking/check_results.py <run_id> --ongoing
+```
 
 ## Tests
 

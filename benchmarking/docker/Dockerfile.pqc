@@ -57,19 +57,32 @@ ENV OPENSSL_MODULES=/usr/local/lib/ossl-modules
 
 RUN openssl list -providers | grep -q oqsprovider \
     && openssl list -kem-algorithms | grep -Eq 'MLKEM512|ML-KEM-512' \
-    && openssl list -signature-algorithms | grep -q 'SLH-DSA-SHAKE-256s'
+    && openssl list -signature-algorithms | grep -q 'SLH-DSA-SHAKE-256s' \
+    && openssl list -signature-algorithms | grep -q 'SLH-DSA-SHAKE-256f'
 
 ARG WOLFSSL_REV=dd6da70d395a0cb26446326f329678fe3bfb212c
-RUN git clone https://github.com/wolfSSL/wolfssl.git /tmp/wolfssl \
+RUN git init /tmp/wolfssl \
     && cd /tmp/wolfssl \
-    && git checkout "${WOLFSSL_REV}" \
+    && git remote add origin https://github.com/wolfSSL/wolfssl.git \
+    && git fetch --depth 1 origin "${WOLFSSL_REV}" \
+    && git checkout --detach FETCH_HEAD \
     && perl -0pi -e 's/# SLH-DSA/if (WOLFSSL_XMSS)\n    list(APPEND WOLFSSL_DEFINITIONS "-DWOLFSSL_HAVE_XMSS")\n    set_wolfssl_definitions("WOLFSSL_HAVE_XMSS" RESULT)\nendif()\n\n# SLH-DSA/' CMakeLists.txt \
+    && perl -0pi -e 's{#define ENCRYPT_BASE_BITS  8192}{#define ENCRYPT_BASE_BITS  (FP_MAX_BITS / 2)}' wolfssl/internal.h \
     && cmake -S . -B build -GNinja \
         -DCMAKE_BUILD_TYPE=Release \
         -DCMAKE_INSTALL_PREFIX=/usr/local \
+        -DCMAKE_C_FLAGS="-Wno-error=maybe-uninitialized -DFP_MAX_BITS=32768 -DRSA_MAX_SIZE=16384 -DWC_MAX_RSA_BITS=16384" \
         -DWOLFSSL_TLS13=yes \
         -DWOLFSSL_ECC=yes \
+        -DWOLFSSL_CURVE25519=yes \
+        -DWOLFSSL_PQC_HYBRIDS=yes \
+        -DWOLFSSL_FAST_MATH=yes \
+        -DWOLFSSL_SP_MATH_ALL=no \
+        -DWOLFSSL_EXAMPLES=no \
+        -DWOLFSSL_CRYPT_TESTS=no \
         -DWOLFSSL_TLS_NO_MLKEM_STANDALONE=no \
+        -DWOLFSSL_MLDSA=yes \
+        -DWOLFSSL_SLHDSA=yes \
         -DWOLFSSL_LMS=yes \
         -DWOLFSSL_XMSS=yes \
         -DWOLFSSL_CERTGEN=yes \
@@ -84,6 +97,7 @@ RUN git clone https://github.com/wolfSSL/wolfssl.git /tmp/wolfssl \
 
 COPY tools/hbs_certgen.c /tmp/hbs_certgen.c
 RUN cc -O2 -Wall -Wextra -DWOLFSSL_HAVE_XMSS \
+        -DFP_MAX_BITS=32768 -DRSA_MAX_SIZE=16384 -DWC_MAX_RSA_BITS=16384 \
         -o /usr/local/bin/hbs_certgen /tmp/hbs_certgen.c \
         $(pkg-config --cflags --libs wolfssl) \
     && rm -f /tmp/hbs_certgen.c

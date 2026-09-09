@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 from pathlib import Path
 
@@ -134,14 +135,44 @@ def build(
     mlkem_backend: str,
     pqm4_dir: Path | None,
     large_rsa: bool = False,
+    power_markers: bool = False,
+    ble_telemetry: bool = False,
+    mtls_mode: bool = False,
+    certificate_gen: bool = False,
+    kem_benchmark: bool = False,
+    transfer_mode: bool = False,
 ) -> None:
+    if certificate_gen and kem_benchmark:
+        raise ValueError("certificate_gen and kem_benchmark are mutually exclusive")
+    standalone_benchmark = certificate_gen or kem_benchmark
     cmake_args = [
-        f"-DBENCH_GENERATED_DIR={generated_dir}",
         f"-DBENCH_MLKEM_BACKEND={mlkem_backend}",
-        f"-DBENCH_LARGE_RSA={'ON' if large_rsa else 'OFF'}",
+        f"-DBENCH_POWER_MARKERS={'ON' if power_markers else 'OFF'}",
+        f"-DBENCH_BLE_TELEMETRY={'ON' if ble_telemetry else 'OFF'}",
+        f"-DBENCH_MTLS_MODE={'ON' if mtls_mode else 'OFF'}",
+        f"-DBENCH_CERTIFICATE_GEN={'ON' if certificate_gen else 'OFF'}",
+        f"-DBENCH_KEM_OPERATIONS={'ON' if kem_benchmark else 'OFF'}",
+        f"-DBENCH_TRANSFER_MODE={'ON' if transfer_mode else 'OFF'}",
     ]
+    if not standalone_benchmark:
+        cmake_args.append(f"-DBENCH_GENERATED_DIR={generated_dir}")
+        if power_markers:
+            cmake_args.append(f"-DEXTRA_CONF_FILE={firmware_dir / 'power.conf'}")
+    else:
+        cmake_args.append(
+            f"-DEXTRA_CONF_FILE={firmware_dir / ('kem_bench.conf' if kem_benchmark else 'certgen.conf')}"
+        )
+    is_nrf5340 = board.startswith("nrf5340dk/")
     if pqm4_dir is not None:
         cmake_args.append(f"-DPQM4_ROOT={pqm4_dir}")
+    build_env = toolchain_environment(nrfutil)
+    if not standalone_benchmark:
+        build_env["BENCH_GENERATED_DIR"] = str(generated_dir)
+    build_env["BENCH_MLKEM_BACKEND"] = mlkem_backend
+    build_env["BENCH_MTLS_MODE"] = "ON" if mtls_mode else "OFF"
+    build_env["BENCH_TRANSFER_MODE"] = "ON" if transfer_mode else "OFF"
+    if pqm4_dir is not None:
+        build_env["PQM4_ROOT"] = str(pqm4_dir)
     command, cwd, env = west_command(
         nrfutil=nrfutil,
         ncs_version=ncs_version,
@@ -150,12 +181,16 @@ def build(
             "build",
             "-d", str(build_dir),
             "-p", "always",
-            "--no-sysbuild",
+            "--sysbuild" if is_nrf5340 and not standalone_benchmark else "--no-sysbuild",
             "-b", board,
             str(firmware_dir),
             "--", *cmake_args,
         ],
     )
+    if env is None:
+        env = build_env
+    else:
+        env.update(build_env)
     run_logged(command, log, cwd=cwd, env=env)
 
 
@@ -174,3 +209,30 @@ def flash(
         west_args=["flash", "-d", str(build_dir), "--runner", "nrfutil"],
     )
     run_logged(command, log, cwd=cwd, env=env)
+
+
+def flash_usage(build_dir: Path) -> tuple[int, int]:
+    """Read the linked image footprint and FLASH capacity from Zephyr's map."""
+    map_paths = (
+        build_dir / "zephyr" / "zephyr.map",
+        build_dir / "firmware" / "zephyr" / "zephyr.map",
+    )
+    map_path = next((path for path in map_paths if path.exists()), map_paths[0])
+    text = map_path.read_text(errors="replace")
+    used_match = re.search(r"0x([0-9a-fA-F]+)\s+_flash_used\s*=", text)
+    region_match = re.search(
+        r"^FLASH\s+0x[0-9a-fA-F]+\s+0x([0-9a-fA-F]+)\s+", text,
+        re.MULTILINE,
+    )
+    if used_match is None or region_match is None:
+        raise ValueError(f"cannot parse FLASH usage from {map_path}")
+    return int(used_match.group(1), 16), int(region_match.group(1), 16)
+
+
+def reset(*, log: Path, nrfutil: str) -> None:
+    """Reset the attached DK after its measured VDD rail is restored."""
+    run_logged(
+        [nrfutil, "device", "reset", "--traits", "jlink"],
+        log,
+        env=toolchain_environment(nrfutil),
+    )
