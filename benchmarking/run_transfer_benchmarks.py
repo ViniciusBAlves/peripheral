@@ -9,4 +9,6 @@ from run_benchmarks import main
 
 
 if __name__ == "__main__":
-    raise SystemExit(main(["--transfer-mode", *sys.argv[1:]]))
+    # A 5 KiB CoC SDU keeps sustained transfers below signaling-credit limits.
+    # A caller-provided --mtu appears later and can still override this default.
+    raise SystemExit(main(["--transfer-mode", "--mtu", "5120", *sys.argv[1:]]))

@@ -392,6 +392,19 @@ class BenchmarkTests(unittest.TestCase):
         self.assertEqual(result["status"], "success")
         self.assertEqual(result["raw_handshake_ms"], "123")
 
+    def test_ble_result_returns_when_bridge_transport_fails(self) -> None:
+        gateway = Mock()
+        gateway.remote_benchmark_result.return_value = ""
+        gateway.remote_bridge_failure.return_value = (
+            "[-] L2CAP send failed: Connection timed out"
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            result = wait_for_ble_result(
+                gateway, "case", Path(tmpdir) / "board.log", timeout=60.0
+            )
+        self.assertEqual(result["status"], "fail")
+        self.assertEqual(result["stage"], "ble_l2cap_transport")
+
     def test_power_windows_sum_all_crypto_pulses(self) -> None:
         capture = PowerProfilerCapture("/dev/null", 3000, 100)
         samples = (

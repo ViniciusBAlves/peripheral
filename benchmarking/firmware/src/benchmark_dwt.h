@@ -26,6 +26,9 @@ struct benchmark_dwt_delta {
     bool event_supported;
 };
 
+/*
+ * Capture the current ARM DWT cycle and event counters.
+ */
 static inline struct benchmark_dwt_snapshot benchmark_dwt_snapshot_get(void)
 {
     struct benchmark_dwt_snapshot snapshot = {0};
@@ -61,6 +64,9 @@ static inline struct benchmark_dwt_snapshot benchmark_dwt_snapshot_get(void)
     return snapshot;
 }
 
+/*
+ * Compute modulo-safe DWT counter deltas from a prior snapshot.
+ */
 static inline struct benchmark_dwt_delta benchmark_dwt_delta_get(
     const struct benchmark_dwt_snapshot *start)
 {

@@ -13,6 +13,7 @@ from pathlib import Path
 try:
     import matplotlib.pyplot as plt
     from matplotlib.colors import LinearSegmentedColormap
+    from matplotlib.patches import Ellipse
     import numpy as np
 except ModuleNotFoundError as exc:
     raise SystemExit(
@@ -30,7 +31,7 @@ PURE_PQC_KEM_PREFIXES = ("MLKEM",)
 HYBRID_KEM_PREFIXES = ("SecP", "X25519MLKEM")
 PQC_SIG_PREFIXES = ("ML-DSA", "SLH-DSA", "LMS", "XMSS")
 SECURITY_LEVELS = (1, 3, 5)
-HANDSHAKE_HEATMAP_MAX_MS = 6000
+HANDSHAKE_HEATMAP_MAX_MS = 10000
 HEATMAP_CMAP = LinearSegmentedColormap.from_list(
     "benchmark_green_to_red",
     ("#15803d", "#facc15", "#b91c1c"),
@@ -114,6 +115,15 @@ def pki_signature_label(row: dict[str, str]) -> str:
         return leaf
     root = row.get("root_sig_alg", "")
     return f"{root} -> {leaf}" if root and leaf else row.get("pki_chain_id", leaf)
+
+
+def scatter_certificate_algorithm(row: dict[str, str]) -> str:
+    """Group scatter plots by root algorithm, with legacy-data fallbacks."""
+    return (
+        row.get("root_sig_alg")
+        or row.get("leaf_sig_alg")
+        or row.get("cert_sig_alg", "unknown")
+    )
 
 
 def heatmap_axes_by_descending_mean(
@@ -331,9 +341,46 @@ def load_from_attempts(run_dir: Path) -> list[dict[str, str]]:
                     "communication_overhead_ms"
                 ),
                 "mean_client_cpu_ms": attempt_mean("client_cpu_ms"),
+                "mean_average_cpu_usage_percent": attempt_mean(
+                    "average_cpu_usage_percent"
+                ),
+                "mean_l2cap_tx_bytes": attempt_mean("l2cap_tx_bytes"),
+                "mean_l2cap_rx_bytes": attempt_mean("l2cap_rx_bytes"),
+                "mean_l2cap_tx_wait_ms": attempt_mean("l2cap_tx_wait_ms"),
+                "mean_x509_chain_signature_verify_ms": attempt_mean(
+                    "x509_chain_signature_verify_ms"
+                ),
+                "mean_tls_certificate_verify_signature_verify_ms": attempt_mean(
+                    "tls_certificate_verify_signature_verify_ms"
+                ),
+                "mean_mtls_signature_generate_ms": attempt_mean(
+                    "mtls_signature_generate_ms"
+                ),
                 "mean_client_icache_hit_percent": attempt_mean(
                     "client_icache_hit_percent"
                 ),
+                "mean_client_icache_miss_percent": attempt_mean(
+                    "client_icache_miss_percent"
+                ),
+                "mean_handshake_energy_uj": attempt_mean(
+                    "handshake_energy_uj"
+                ),
+                "mean_client_kem_energy_uj": attempt_mean(
+                    "client_kem_energy_uj"
+                ),
+                "mean_client_signature_energy_uj": attempt_mean(
+                    "client_signature_energy_uj"
+                ),
+                "firmware_static_ram_used_bytes": first.get(
+                    "firmware_static_ram_used_bytes", ""
+                ),
+                "firmware_ram_capacity_bytes": first.get(
+                    "firmware_ram_capacity_bytes", ""
+                ),
+                "firmware_static_ram_usage_percent": first.get(
+                    "firmware_static_ram_usage_percent", ""
+                ),
+                "server_chain_bytes": first.get("server_chain_bytes", ""),
             }
         )
     return rows
@@ -383,6 +430,17 @@ def add_attempt_resource_metrics(
                     )
                 ) is not None
             ]
+            stack_values = [
+                value
+                for attempt in attempts
+                if attempt.get("status") == "success"
+                and attempt.get("warmup") != "1"
+                and (
+                    value := float_or_none(
+                        attempt.get("thread_stack_used_bytes")
+                    )
+                ) is not None
+            ]
         if cpu_values:
             target["mean_system_cpu_usage_percent"] = (
                 f"{statistics.mean(cpu_values):.3f}"
@@ -395,15 +453,40 @@ def add_attempt_resource_metrics(
             )
         if heap_values:
             target["max_client_heap_peak_bytes"] = f"{max(heap_values):.3f}"
+        if stack_values:
+            target["max_thread_stack_used_bytes"] = f"{max(stack_values):.3f}"
+
+
+def add_total_memory_metrics(rows: list[dict[str, str]]) -> None:
+    """Derive occupied RAM without counting reserved heap and stacks twice."""
+    for row in rows:
+        static_used = float_or_none(row.get("firmware_static_ram_used_bytes"))
+        capacity = float_or_none(row.get("firmware_ram_capacity_bytes"))
+        heap_capacity = float_or_none(row.get("client_heap_capacity_bytes"))
+        heap_peak = float_or_none(row.get("max_client_heap_peak_bytes"))
+        stack_capacity = float_or_none(row.get("thread_stack_capacity_bytes"))
+        stack_used = float_or_none(row.get("max_thread_stack_used_bytes"))
+        if None in (
+            static_used, capacity, heap_capacity, heap_peak,
+            stack_capacity, stack_used,
+        ) or capacity == 0:
+            continue
+        total_used = (
+            static_used - heap_capacity - stack_capacity + heap_peak + stack_used
+        )
+        row["total_memory_used_bytes"] = f"{total_used:.3f}"
+        row["total_memory_usage_percent"] = f"{100.0 * total_used / capacity:.3f}"
 
 
 def load_rows(run_dir: Path) -> list[dict[str, str]]:
     rows = load_from_summary(run_dir / "summary.csv")
     if rows:
         add_attempt_resource_metrics(rows, run_dir)
+        add_total_memory_metrics(rows)
         return rows
     rows = load_from_attempts(run_dir)
     add_attempt_resource_metrics(rows, run_dir)
+    add_total_memory_metrics(rows)
     return rows
 
 
@@ -655,6 +738,263 @@ def plot_security_levels(
                 out_dir / f"{filename_prefix}_nist_level_{level}.{extension}",
             )
     return counts
+
+
+def plot_cpu_vs_handshake(
+    rows: list[dict[str, str]], output: Path, run_id: str, pki: str,
+    color_by_certificate: dict[str, object],
+) -> int:
+    """Summarize CPU/handshake ranges across KEMs with one ellipse per DSA."""
+    certificates = sorted({
+        scatter_certificate_algorithm(row) for row in rows
+    })
+    fig, ax = plt.subplots(figsize=(9, 8), constrained_layout=True)
+    count = 0
+    limits: list[float] = [0.0]
+    for certificate in certificates:
+        points = [
+            (mean_metric(row, "mean_client_cpu_ms"), handshake_value(row))
+            for row in rows
+            if scatter_certificate_algorithm(row) == certificate
+        ]
+        points = [(x, y) for x, y in points if x > 0 and y is not None]
+        if not points:
+            continue
+        x_values, y_values = zip(*points)
+        limits.extend(x_values)
+        limits.extend(y_values)
+        x_min, x_max = min(x_values), max(x_values)
+        y_min, y_max = min(y_values), max(y_values)
+        color = color_by_certificate[certificate]
+        ax.add_patch(Ellipse(
+            ((x_min + x_max) / 2.0, (y_min + y_max) / 2.0),
+            width=x_max - x_min,
+            height=y_max - y_min,
+            facecolor=(*color[:3], 0.32), edgecolor=color,
+            linewidth=1.4, label=certificate,
+        ))
+        ax.update_datalim(((x_min, y_min), (x_max, y_max)))
+        count += 1
+    maximum = max(limits) * 1.03
+    ax.plot([0, maximum], [0, maximum], linestyle="--", color="#333333",
+            linewidth=1.0, label="y = x")
+    ax.set_xlim(0, maximum)
+    ax.set_ylim(0, maximum)
+    ax.set_title(
+        f"Active client CPU time vs TLS handshake time "
+        f"({pki.capitalize()} PKI) - {run_id}"
+    )
+    ax.set_xlabel("Mean active client CPU time (ms)")
+    ax.set_ylabel("Mean raw TLS handshake time (ms)")
+    ax.grid(linestyle=":", alpha=0.35)
+    ax.legend(title="Root certificate algorithm", fontsize=7, ncol=2)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(output, dpi=180)
+    plt.close(fig)
+    return count
+
+
+def plot_heap_vs_handshake(
+    rows: list[dict[str, str]], output: Path, run_id: str, pki: str,
+    color_by_certificate: dict[str, object],
+) -> int:
+    """Summarize heap/handshake ranges across KEMs with one ellipse per DSA."""
+    leaves = sorted({
+        scatter_certificate_algorithm(row) for row in rows
+    })
+    fig, ax = plt.subplots(figsize=(10, 8), constrained_layout=True)
+    count = 0
+    for leaf in leaves:
+        points = []
+        for row in rows:
+            heap = float_or_none(row.get("max_client_heap_peak_bytes"))
+            handshake = handshake_value(row)
+            if (scatter_certificate_algorithm(row) == leaf
+                    and heap is not None and handshake is not None):
+                points.append((heap / 1024.0, handshake))
+        if not points:
+            continue
+        x_values, y_values = zip(*points)
+        x_min, x_max = min(x_values), max(x_values)
+        y_min, y_max = min(y_values), max(y_values)
+        color = color_by_certificate[leaf]
+        ax.add_patch(Ellipse(
+            ((x_min + x_max) / 2.0, (y_min + y_max) / 2.0),
+            width=x_max - x_min,
+            height=y_max - y_min,
+            facecolor=(*color[:3], 0.32), edgecolor=color,
+            linewidth=1.4, label=leaf,
+        ))
+        ax.update_datalim(((x_min, y_min), (x_max, y_max)))
+        count += 1
+    ax.autoscale_view()
+    ax.set_title(
+        f"Peak wolfSSL heap vs TLS handshake time "
+        f"({pki.capitalize()} PKI) - {run_id}"
+    )
+    ax.set_xlabel("Peak wolfSSL heap allocation (KiB)")
+    ax.set_ylabel("Mean raw TLS handshake time (ms)")
+    ax.grid(linestyle=":", alpha=0.35)
+    ax.legend(title="Root certificate algorithm", fontsize=7, ncol=2)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(output, dpi=180)
+    plt.close(fig)
+    return count
+
+
+def residual_components(row: dict[str, str]) -> tuple[float, ...]:
+    raw = handshake_value(row) or 0.0
+    components = (
+        mean_metric(row, "mean_kem_client_total_ms"),
+        mean_metric(row, "mean_x509_chain_signature_verify_ms"),
+        mean_metric(row, "mean_tls_certificate_verify_signature_verify_ms"),
+        mean_metric(row, "mean_mtls_signature_generate_ms"),
+        mean_metric(row, "mean_communication_overhead_ms"),
+    )
+    residual = raw - sum(components)
+    return (*components, residual)
+
+
+def plot_nist_residual_bars(
+    rows: list[dict[str, str]], output: Path, run_id: str,
+    pki: str, level: int,
+) -> int:
+    rows = sorted(rows, key=lambda row: handshake_value(row) or 0.0, reverse=True)
+    if not rows:
+        return 0
+    labels = [
+        f"{row.get('kex_group', '')}\n{pki_signature_label(row)}" for row in rows
+    ]
+    names = (
+        "Client KEM", "X.509 chain verify", "CertificateVerify verify",
+        "mTLS sign", "Communication", "Residual",
+    )
+    colors = ("#2a9d8f", "#e9c46a", "#f4a261", "#bc6c25", "#e76f51", "#457b9d")
+    positions = np.arange(len(rows))
+    bottoms = np.zeros(len(rows))
+    fig_width = max(12.0, min(44.0, len(rows) * 0.55))
+    fig, ax = plt.subplots(figsize=(fig_width, 9), constrained_layout=True)
+    for index, (name, color) in enumerate(zip(names, colors)):
+        heights = np.asarray([residual_components(row)[index] for row in rows])
+        ax.bar(
+            positions, heights, width=1.0, bottom=bottoms, label=name,
+            color=color, edgecolor="#1a1a1a", linewidth=0.25,
+        )
+        bottoms += heights
+    ax.set_title(
+        f"TLS handshake decomposition - KEM NIST level {level} - "
+        f"{pki.capitalize()} PKI - {run_id}"
+    )
+    ax.set_ylabel("Mean raw TLS handshake time (ms)")
+    ax.set_xlabel("KEM / PKI signature chain")
+    ax.set_xticks(positions)
+    ax.set_xticklabels(labels, rotation=70, ha="right", fontsize=7)
+    ax.set_xlim(-0.5, len(rows) - 0.5)
+    ax.margins(x=0)
+    ax.grid(axis="y", linestyle=":", alpha=0.35)
+    ax.legend(fontsize=8, ncol=2)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(output, dpi=180)
+    plt.close(fig)
+    return len(rows)
+
+
+CORRELATION_FIELDS = (
+    ("raw_handshake_ms", "Raw handshake"),
+    ("handshake_energy_uj", "Handshake energy"),
+    ("client_kem_energy_uj", "Client KEM energy"),
+    ("client_signature_energy_uj", "Client signature energy"),
+    ("client_cpu_ms", "Client CPU"),
+    ("client_heap_peak_bytes", "Heap peak"),
+    ("server_chain_bytes", "Server chain"),
+    ("l2cap_tx_bytes", "L2CAP TX"),
+    ("l2cap_rx_bytes", "L2CAP RX"),
+    ("l2cap_tx_wait_ms", "L2CAP TX wait"),
+    ("communication_overhead_ms", "Communication"),
+    ("x509_chain_signature_verify_ms", "X.509 verify"),
+    ("tls_certificate_verify_signature_verify_ms", "CertificateVerify"),
+    ("client_icache_miss_percent", "I-cache miss"),
+)
+
+
+def correlation_value(row: dict[str, str], field: str) -> float | None:
+    if field == "raw_handshake_ms":
+        return handshake_value(row)
+    mappings = {
+        "handshake_energy_uj": "mean_handshake_energy_uj",
+        "client_kem_energy_uj": "mean_client_kem_energy_uj",
+        "client_signature_energy_uj": "mean_client_signature_energy_uj",
+        "client_cpu_ms": "mean_client_cpu_ms",
+        "client_heap_peak_bytes": "max_client_heap_peak_bytes",
+        "l2cap_tx_bytes": "mean_l2cap_tx_bytes",
+        "l2cap_rx_bytes": "mean_l2cap_rx_bytes",
+        "l2cap_tx_wait_ms": "mean_l2cap_tx_wait_ms",
+        "communication_overhead_ms": "mean_communication_overhead_ms",
+        "x509_chain_signature_verify_ms": "mean_x509_chain_signature_verify_ms",
+        "tls_certificate_verify_signature_verify_ms": (
+            "mean_tls_certificate_verify_signature_verify_ms"
+        ),
+        "client_icache_miss_percent": "mean_client_icache_miss_percent",
+    }
+    return float_or_none(row.get(mappings.get(field, field)))
+
+
+def rank_values(values: np.ndarray) -> np.ndarray:
+    order = np.argsort(values, kind="mergesort")
+    ranks = np.empty(len(values), dtype=float)
+    start = 0
+    while start < len(values):
+        end = start + 1
+        while end < len(values) and values[order[end]] == values[order[start]]:
+            end += 1
+        ranks[order[start:end]] = (start + end - 1) / 2.0 + 1.0
+        start = end
+    return ranks
+
+
+def plot_spearman_matrix(
+    rows: list[dict[str, str]], output: Path, csv_output: Path, run_id: str
+) -> int:
+    size = len(CORRELATION_FIELDS)
+    matrix = np.full((size, size), np.nan)
+    for row_index, (field_a, _) in enumerate(CORRELATION_FIELDS):
+        for column_index, (field_b, _) in enumerate(CORRELATION_FIELDS):
+            pairs = [
+                (a, b) for row in rows
+                if (a := correlation_value(row, field_a)) is not None
+                and (b := correlation_value(row, field_b)) is not None
+            ]
+            if len(pairs) < 3:
+                continue
+            a_values = rank_values(np.asarray([a for a, _ in pairs]))
+            b_values = rank_values(np.asarray([b for _, b in pairs]))
+            if np.std(a_values) > 0 and np.std(b_values) > 0:
+                matrix[row_index, column_index] = np.corrcoef(a_values, b_values)[0, 1]
+    labels = [label for _, label in CORRELATION_FIELDS]
+    fig, ax = plt.subplots(figsize=(14, 12), constrained_layout=True)
+    image = ax.imshow(matrix, cmap="coolwarm", vmin=-1, vmax=1)
+    ax.set_title(f"Spearman correlation matrix - {run_id}")
+    ax.set_xticks(range(size), labels=labels, rotation=55, ha="right", fontsize=8)
+    ax.set_yticks(range(size), labels=labels, fontsize=8)
+    for row_index in range(size):
+        for column_index in range(size):
+            value = matrix[row_index, column_index]
+            if not np.isnan(value):
+                ax.text(column_index, row_index, f"{value:.2f}",
+                        ha="center", va="center", fontsize=8,
+                        color="white" if abs(value) > 0.55 else "black")
+    fig.colorbar(image, ax=ax).set_label("Spearman rho")
+    output.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(output, dpi=180)
+    plt.close(fig)
+    with csv_output.open("w", newline="") as stream:
+        writer = csv.writer(stream)
+        writer.writerow(("metric", *[field for field, _ in CORRELATION_FIELDS]))
+        for (field, _), values in zip(CORRELATION_FIELDS, matrix):
+            writer.writerow((field, *[
+                "" if np.isnan(value) else f"{value:.6f}" for value in values
+            ]))
+    return len(rows)
 
 
 def plot_heatmap(rows: list[dict[str, str]], output: Path, run_id: str) -> None:
@@ -966,8 +1306,65 @@ def main() -> int:
             output=out_dir / f"signature_execution_time_{pki}.{extension}",
         )
 
+    certificates = sorted({
+        scatter_certificate_algorithm(row) for row in rows
+    })
+    certificate_colors = {
+        certificate: color for certificate, color in zip(
+            certificates,
+            plt.get_cmap("turbo")(
+                np.linspace(0.03, 0.97, max(1, len(certificates)))
+            ),
+        )
+    }
+    cpu_scatter_count = 0
+    heap_scatter_count = 0
+    for pki, pki_rows in pki_groups.items():
+        if not pki_rows:
+            continue
+        cpu_scatter_count += plot_cpu_vs_handshake(
+            pki_rows,
+            out_dir / f"scatter_client_cpu_vs_handshake_{pki}.{extension}",
+            run_dir.name,
+            pki,
+            certificate_colors,
+        )
+        heap_scatter_count += plot_heap_vs_handshake(
+            pki_rows,
+            out_dir / f"scatter_heap_peak_vs_handshake_{pki}.{extension}",
+            run_dir.name,
+            pki,
+            certificate_colors,
+        )
+    residual_bar_count = 0
+    for pki, pki_rows in pki_groups.items():
+        for level in SECURITY_LEVELS:
+            level_rows = [
+                row for row in pki_rows if kem_security_level(row) == level
+            ]
+            residual_bar_count += plot_nist_residual_bars(
+                level_rows,
+                out_dir / (
+                    f"tls_handshake_residual_nist_level_{level}_{pki}."
+                    f"{extension}"
+                ),
+                run_dir.name, pki, level,
+            )
+    correlation_count = plot_spearman_matrix(
+        rows,
+        out_dir / f"spearman_correlation_matrix.{extension}",
+        out_dir / "spearman_correlation_matrix.csv",
+        run_dir.name,
+    )
+
     if args.heatmap:
         hardware_heatmaps = (
+            (
+                "mean_average_cpu_usage_percent",
+                "Average client processing CPU usage (communication excluded) - "
+                f"{run_dir.name}",
+                "heatmap_cpu_processing_usage_percent",
+            ),
             (
                 "mean_system_cpu_usage_percent",
                 f"Average system CPU usage - {run_dir.name}",
@@ -980,8 +1377,13 @@ def main() -> int:
             ),
             (
                 "firmware_static_ram_usage_percent",
-                f"Firmware static RAM usage - {run_dir.name}",
+                f"Total firmware static RAM usage - {run_dir.name}",
                 "heatmap_static_ram_usage_percent",
+            ),
+            (
+                "total_memory_usage_percent",
+                f"Total occupied RAM including peak heap and stack - {run_dir.name}",
+                "heatmap_total_memory_usage_percent",
             ),
             (
                 "max_thread_stack_peak_percent",
@@ -990,6 +1392,18 @@ def main() -> int:
             ),
         )
         reconnect_rows = load_reconnect_count_rows(run_dir)
+        static_ram_capacity = max(
+            (
+                value
+                for row in rows
+                if (
+                    value := float_or_none(
+                        row.get("firmware_ram_capacity_bytes")
+                    )
+                ) is not None
+            ),
+            default=None,
+        )
         heatmap_count = 0
         for pki, pki_rows in heatmap_pki_groups.items():
             if not pki_rows:
@@ -1008,6 +1422,36 @@ def main() -> int:
                 )
                 heatmap_count += int(plotted > 0)
                 print(f"{pki}_{metric}_heatmap_cells={plotted}")
+            static_ram_bytes_cells = plot_percent_heatmap(
+                pki_rows,
+                "firmware_static_ram_used_bytes",
+                f"Total firmware static RAM usage in bytes - {run_dir.name} - {pki_title}",
+                out_dir / f"heatmap_static_ram_used_bytes_{pki}.{extension}",
+                value_suffix="",
+                value_decimals=0,
+                colorbar_label="Firmware static RAM used (bytes)",
+                vmax=static_ram_capacity,
+            )
+            heatmap_count += int(static_ram_bytes_cells > 0)
+            print(
+                f"{pki}_firmware_static_ram_used_bytes_heatmap_cells="
+                f"{static_ram_bytes_cells}"
+            )
+            total_memory_bytes_cells = plot_percent_heatmap(
+                pki_rows,
+                "total_memory_used_bytes",
+                f"Total occupied RAM including peak heap and stack in bytes - {run_dir.name} - {pki_title}",
+                out_dir / f"heatmap_total_memory_used_bytes_{pki}.{extension}",
+                value_suffix="",
+                value_decimals=0,
+                colorbar_label="Total occupied RAM (bytes)",
+                vmax=static_ram_capacity,
+            )
+            heatmap_count += int(total_memory_bytes_cells > 0)
+            print(
+                f"{pki}_total_memory_used_bytes_heatmap_cells="
+                f"{total_memory_bytes_cells}"
+            )
             cache_cells = plot_percent_heatmap(
                 pki_rows,
                 "mean_client_icache_hit_percent",
@@ -1030,6 +1474,19 @@ def main() -> int:
             )
             heatmap_count += int(heap_bytes_cells > 0)
             print(f"{pki}_max_client_heap_peak_bytes_heatmap_cells={heap_bytes_cells}")
+            chain_bytes_cells = plot_percent_heatmap(
+                pki_rows,
+                "server_chain_bytes",
+                f"Server certificate chain size - {run_dir.name} - {pki_title}",
+                out_dir / f"heatmap_server_chain_bytes_{pki}.{extension}",
+                value_suffix="",
+                value_decimals=0,
+                colorbar_label="Server certificate chain transferred (bytes)",
+                vmin=None,
+                vmax=None,
+            )
+            heatmap_count += int(chain_bytes_cells > 0)
+            print(f"{pki}_server_chain_bytes_heatmap_cells={chain_bytes_cells}")
             pki_reconnect_rows = [
                 row for row in reconnect_rows if pki_category(row) == pki
             ]
@@ -1046,6 +1503,10 @@ def main() -> int:
     print(f"bar_chart_rows={len(plot_rows)}")
     print(f"kem_algorithm_bars={kem_bar_count}")
     print(f"signature_algorithm_bars={signature_bar_count}")
+    print(f"cpu_handshake_scatter_points={cpu_scatter_count}")
+    print(f"heap_handshake_scatter_points={heap_scatter_count}")
+    print(f"nist_residual_bar_rows={residual_bar_count}")
+    print(f"spearman_correlation_rows={correlation_count}")
     print(f"format={extension}")
     for (pki, category), category_rows in categories.items():
         print(f"{pki}_{category}={len(category_rows)}")

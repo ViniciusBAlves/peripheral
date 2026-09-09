@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from functools import lru_cache
 
 
-PAYLOAD_SIZES = (128, 1024, 16 * 1024)
+PAYLOAD_SIZES = (128, 1024, 8 * 1024, 16 * 1024, 32 * 1024, 64 * 1024)
 DIRECTIONS = ("server_to_device", "device_to_server")
 PAYLOAD_PERIOD_SIZE = 1 << 16
 _BASE_PAYLOAD_PERIOD = bytes(

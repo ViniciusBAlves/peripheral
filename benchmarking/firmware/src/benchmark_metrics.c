@@ -9,22 +9,34 @@ static bool metrics_active;
 static uint32_t icache_hits_start;
 static uint32_t icache_misses_start;
 
+/*
+ * Clear all metrics and begin recording a benchmark interval.
+ */
 void benchmark_metrics_reset(void)
 {
     metrics = (struct benchmark_metrics){0};
     metrics_active = true;
 }
 
+/*
+ * Stop accepting updates to the current metrics snapshot.
+ */
 void benchmark_metrics_stop(void)
 {
     metrics_active = false;
 }
 
+/*
+ * Yield between expensive cryptographic operations.
+ */
 void benchmark_crypto_reschedule(void)
 {
     k_yield();
 }
 
+/*
+ * Start the available hardware cache counters.
+ */
 void benchmark_hardware_counters_start(void)
 {
 #if defined(NVMC_FEATURE_CACHE_PRESENT)
@@ -34,6 +46,9 @@ void benchmark_hardware_counters_start(void)
 #endif
 }
 
+/*
+ * Stop hardware counters and save their deltas.
+ */
 void benchmark_hardware_counters_stop(void)
 {
 #if defined(NVMC_FEATURE_CACHE_PRESENT)
@@ -45,11 +60,17 @@ void benchmark_hardware_counters_stop(void)
 #endif
 }
 
+/*
+ * Return a monotonic timestamp for a measured interval.
+ */
 benchmark_timepoint_t benchmark_metric_start(void)
 {
     return k_uptime_ticks();
 }
 
+/*
+ * Start timing a cryptographic operation and its power marker.
+ */
 benchmark_timepoint_t benchmark_crypto_metric_start(
     enum benchmark_crypto_operation operation)
 {
@@ -57,6 +78,9 @@ benchmark_timepoint_t benchmark_crypto_metric_start(
     return benchmark_metric_start();
 }
 
+/*
+ * Convert elapsed Zephyr ticks since a timestamp to microseconds.
+ */
 static uint64_t elapsed_us(benchmark_timepoint_t start)
 {
     int64_t elapsed_ticks = k_uptime_ticks() - start;
@@ -64,6 +88,9 @@ static uint64_t elapsed_us(benchmark_timepoint_t start)
     return elapsed_ticks > 0 ? k_ticks_to_us_floor64(elapsed_ticks) : 0;
 }
 
+/*
+ * Finish and accumulate one cryptographic operation interval.
+ */
 void benchmark_metric_stop(enum benchmark_crypto_operation operation,
                            benchmark_timepoint_t start)
 {
@@ -102,6 +129,9 @@ void benchmark_metric_stop(enum benchmark_crypto_operation operation,
     }
 }
 
+/*
+ * Accumulate time spent inside transport callbacks.
+ */
 void benchmark_communication_stop(benchmark_timepoint_t start)
 {
     if (metrics_active) {
@@ -109,6 +139,9 @@ void benchmark_communication_stop(benchmark_timepoint_t start)
     }
 }
 
+/*
+ * Record one successfully transmitted L2CAP SDU.
+ */
 void benchmark_l2cap_tx(uint32_t bytes)
 {
     if (metrics_active) {
@@ -117,6 +150,9 @@ void benchmark_l2cap_tx(uint32_t bytes)
     }
 }
 
+/*
+ * Record one received L2CAP SDU.
+ */
 void benchmark_l2cap_rx(uint32_t bytes)
 {
     if (metrics_active) {
@@ -125,6 +161,9 @@ void benchmark_l2cap_rx(uint32_t bytes)
     }
 }
 
+/*
+ * Count an L2CAP transmit retry.
+ */
 void benchmark_l2cap_tx_retry(void)
 {
     if (metrics_active) {
@@ -132,6 +171,9 @@ void benchmark_l2cap_tx_retry(void)
     }
 }
 
+/*
+ * Accumulate time waiting to transmit over L2CAP.
+ */
 void benchmark_l2cap_tx_wait_stop(benchmark_timepoint_t start)
 {
     if (metrics_active) {
@@ -139,6 +181,9 @@ void benchmark_l2cap_tx_wait_stop(benchmark_timepoint_t start)
     }
 }
 
+/*
+ * Count an L2CAP receive-buffer overflow.
+ */
 void benchmark_l2cap_rx_overflow(void)
 {
     if (metrics_active) {
@@ -146,6 +191,9 @@ void benchmark_l2cap_rx_overflow(void)
     }
 }
 
+/*
+ * Update the maximum observed L2CAP receive-ring occupancy.
+ */
 void benchmark_l2cap_rx_ring_usage(uint32_t bytes)
 {
     if (metrics_active) {
@@ -154,6 +202,9 @@ void benchmark_l2cap_rx_ring_usage(uint32_t bytes)
     }
 }
 
+/*
+ * Save the SignatureScheme observed in server CertificateVerify.
+ */
 void benchmark_record_server_certificate_verify_scheme(uint16_t scheme)
 {
     if (metrics_active) {
@@ -162,6 +213,9 @@ void benchmark_record_server_certificate_verify_scheme(uint16_t scheme)
     }
 }
 
+/*
+ * Map a TLS SignatureScheme identifier to its benchmark name.
+ */
 const char *benchmark_signature_scheme_name(uint16_t scheme)
 {
     switch (scheme) {
@@ -178,6 +232,9 @@ const char *benchmark_signature_scheme_name(uint16_t scheme)
     }
 }
 
+/*
+ * Return the current read-only metrics snapshot.
+ */
 const struct benchmark_metrics *benchmark_metrics_get(void)
 {
     return &metrics;

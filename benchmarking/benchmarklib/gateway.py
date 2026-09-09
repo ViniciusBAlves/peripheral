@@ -114,6 +114,28 @@ class PiGateway:
         )
         return proc.stdout.strip() if proc.returncode == 0 else ""
 
+    def remote_bridge_failure(self, case_id: str) -> str:
+        """Return a terminal bridge error instead of waiting for the round deadline."""
+        path = f"{self.workdir}/logs/{case_id}.gateway.log"
+        regex = "|".join((
+            r"L2CAP send failed", r"L2CAP receive failed",
+            r"TCP send failed", r"TCP receive failed",
+        ))
+        script = (
+            f"if test -f {shlex.quote(path)} && "
+            f"failure=$(grep -Eim1 -- {shlex.quote(regex)} {shlex.quote(path)}); "
+            "then printf '%s\\n' \"$failure\"; "
+            f"else pid=$(cat {self.workdir}/bridge.pid 2>/dev/null || true); "
+            "[ -n \"$pid\" ] && kill -0 \"$pid\" 2>/dev/null || "
+            "printf '%s\\n' 'bridge process exited'; fi"
+        )
+        command = [*self.ssh_base(), self.host, f"bash -lc {shlex.quote(script)}"]
+        proc = subprocess.run(
+            command, text=True, stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+        )
+        return proc.stdout.strip().splitlines()[0] if proc.stdout.strip() else ""
+
     def deploy_file(self, source: Path, destination: str, log: Path) -> None:
         ssh_transport = " ".join(shlex.quote(part) for part in self.ssh_base())
         self._local(
@@ -388,7 +410,7 @@ class PiGateway:
                 f"setsid python3 {self.workdir}/bin/mqtt_transfer_controller.py "
                 f"--plan {shlex.quote(transfer_json)} "
                 "--port 18884 "
-                f"--timeout {max(30, int(tls_timeout_sec))} "
+                f"--timeout {max(30, min(90, int(tls_timeout_sec)))} "
                 f"> {controller_log} 2>&1 < /dev/null & "
                 f"echo $! > {self.workdir}/controller.pid; "
             )

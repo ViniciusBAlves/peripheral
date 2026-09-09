@@ -503,8 +503,9 @@ python3 benchmarking/clean_work.py --apply
 `run_transfer_benchmarks.py` reuses the same case CSV, PKI generation,
 universal firmware profiles, Raspberry Pi bridge, TLS backends, and seed. Each
 case uses one fresh BLE/TLS/MQTT connection. CSV `iterations=N` repeats each of
-the six QoS 1 transfers N times inside that connection: 128 bytes, 1 KiB and
-16 KiB in both directions. Payloads are generated and validated as a stream.
+the twelve QoS 1 transfers N times inside that connection: 128 bytes, 1 KiB,
+8 KiB, 16 KiB, 32 KiB and 64 KiB in both directions. Payloads are generated
+and validated as a stream.
 `warmup_iterations` and
 `--sessions-per-case` are ignored by this runner.
 
@@ -521,7 +522,7 @@ Use `--mtls-mode` to retain mutual TLS. Resume an interrupted run with:
 python3 benchmarking/run_transfer_benchmarks.py --resume <run_id>
 ```
 
-The case order and all `6 * iterations` operations are shuffled
+The case order and all `12 * iterations` operations are shuffled
 deterministically from the seed. Results are
 written to `round_manifest.csv`, `transfer_manifest.csv`,
 `handshake_summary.csv`, `transfer_summary.csv`, and per-case

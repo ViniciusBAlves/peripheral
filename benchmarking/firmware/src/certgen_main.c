@@ -142,6 +142,9 @@ static const struct certgen_algorithm algorithms[] = {
      68, 2573, 2820},
 };
 
+/*
+ * Provide a fixed valid wall-clock time to wolfSSL.
+ */
 time_t time_sec(time_t *timer)
 {
     time_t now = 1893456000;
@@ -152,6 +155,9 @@ time_t time_sec(time_t *timer)
     return now;
 }
 
+/*
+ * Provide Zephyr uptime to wolfSSL's millisecond time hook.
+ */
 int time_ms(int64_t *timer)
 {
     if (timer != NULL) {
@@ -160,21 +166,33 @@ int time_ms(int64_t *timer)
     return 0;
 }
 
+/*
+ * Allocate certificate-benchmark memory from its dedicated heap.
+ */
 static void *bench_malloc(size_t size)
 {
     return k_heap_alloc(&certgen_heap, size, K_NO_WAIT);
 }
 
+/*
+ * Release memory back to the certificate benchmark heap.
+ */
 static void bench_free(void *ptr)
 {
     k_heap_free(&certgen_heap, ptr);
 }
 
+/*
+ * Resize an allocation in the certificate benchmark heap.
+ */
 static void *bench_realloc(void *ptr, size_t size)
 {
     return k_heap_realloc(&certgen_heap, ptr, size, K_NO_WAIT);
 }
 
+/*
+ * Persist LMS state in the benchmark's in-memory state buffer.
+ */
 static int lms_write(const byte *data, word32 size, void *context)
 {
     ARG_UNUSED(context);
@@ -186,6 +204,9 @@ static int lms_write(const byte *data, word32 size, void *context)
     return WC_LMS_RC_SAVED_TO_NV_MEMORY;
 }
 
+/*
+ * Restore LMS state from the benchmark's in-memory state buffer.
+ */
 static int lms_read(byte *data, word32 size, void *context)
 {
     ARG_UNUSED(context);
@@ -196,6 +217,9 @@ static int lms_read(byte *data, word32 size, void *context)
     return WC_LMS_RC_READ_TO_MEMORY;
 }
 
+/*
+ * Persist XMSS state in the benchmark's in-memory state buffer.
+ */
 static enum wc_XmssRc xmss_write(const byte *data, word32 size, void *context)
 {
     ARG_UNUSED(context);
@@ -207,6 +231,9 @@ static enum wc_XmssRc xmss_write(const byte *data, word32 size, void *context)
     return WC_XMSS_RC_SAVED_TO_NV_MEMORY;
 }
 
+/*
+ * Restore XMSS state from the benchmark's in-memory state buffer.
+ */
 static enum wc_XmssRc xmss_read(byte *data, word32 size, void *context)
 {
     ARG_UNUSED(context);
@@ -217,6 +244,9 @@ static enum wc_XmssRc xmss_read(byte *data, word32 size, void *context)
     return WC_XMSS_RC_READ_TO_MEMORY;
 }
 
+/*
+ * Find certificate-generation metadata by algorithm name.
+ */
 static const struct certgen_algorithm *find_algorithm(const char *name)
 {
     for (size_t i = 0; i < ARRAY_SIZE(algorithms); ++i) {
@@ -227,6 +257,9 @@ static const struct certgen_algorithm *find_algorithm(const char *name)
     return NULL;
 }
 
+/*
+ * Return the active wolfCrypt key object for an algorithm family.
+ */
 static void *key_pointer(enum key_kind kind)
 {
     switch (kind) {
@@ -240,6 +273,9 @@ static void *key_pointer(enum key_kind kind)
     return NULL;
 }
 
+/*
+ * Generate a key pair for the selected certificate algorithm.
+ */
 static int generate_key(const struct certgen_algorithm *algorithm)
 {
     int ret;
@@ -301,6 +337,9 @@ static int generate_key(const struct certgen_algorithm *algorithm)
     return BAD_FUNC_ARG;
 }
 
+/*
+ * Free the wolfCrypt key object for an algorithm family.
+ */
 static void free_key(enum key_kind kind)
 {
     switch (kind) {
@@ -313,6 +352,9 @@ static void free_key(enum key_kind kind)
     }
 }
 
+/*
+ * Build the unsigned body of a self-signed benchmark certificate.
+ */
 static int make_certificate(const struct certgen_algorithm *algorithm,
                             const char *case_id)
 {
@@ -345,6 +387,9 @@ static int make_certificate(const struct certgen_algorithm *algorithm,
     return ret > 0 ? 0 : ret;
 }
 
+/*
+ * Verify the generated certificate through wolfSSL's certificate manager.
+ */
 static int verify_certificate(int certificate_size)
 {
     WOLFSSL_CERT_MANAGER *manager = wolfSSL_CertManagerNew();
@@ -364,16 +409,25 @@ static int verify_certificate(int certificate_size)
     return ret == WOLFSSL_SUCCESS ? 0 : ret;
 }
 
+/*
+ * Convert elapsed Zephyr ticks since a timestamp to microseconds.
+ */
 static uint64_t elapsed_us(int64_t start_ticks)
 {
     return k_ticks_to_us_floor64(k_uptime_ticks() - start_ticks);
 }
 
+/*
+ * Return a guarded monotonically increasing cycle delta.
+ */
 static uint64_t cycle_delta(uint64_t current, uint64_t start)
 {
     return current >= start ? current - start : 0;
 }
 
+/*
+ * Convert a certificate diagnostic stage to a printable name.
+ */
 static const char *diagnostic_stage_name(enum diagnostic_stage stage)
 {
     switch (stage) {
@@ -386,6 +440,9 @@ static const char *diagnostic_stage_name(enum diagnostic_stage stage)
     return "unknown";
 }
 
+/*
+ * Initialize live diagnostics for one certificate-generation attempt.
+ */
 static void diagnostic_begin(const char *case_id,
                              const struct certgen_algorithm *algorithm)
 {
@@ -404,6 +461,9 @@ static void diagnostic_begin(const char *case_id,
     k_mutex_unlock(&diagnostic_lock);
 }
 
+/*
+ * Mark the certificate operation currently being executed.
+ */
 static void diagnostic_set_stage(enum diagnostic_stage stage)
 {
     k_mutex_lock(&diagnostic_lock, K_FOREVER);
@@ -412,6 +472,9 @@ static void diagnostic_set_stage(enum diagnostic_stage stage)
     k_mutex_unlock(&diagnostic_lock);
 }
 
+/*
+ * Save the completed duration of a certificate operation stage.
+ */
 static void diagnostic_complete_stage(enum diagnostic_stage stage,
                                       uint64_t elapsed)
 {
@@ -428,6 +491,9 @@ static void diagnostic_complete_stage(enum diagnostic_stage stage,
     k_mutex_unlock(&diagnostic_lock);
 }
 
+/*
+ * Capture progress, CPU, DWT, heap, and stack diagnostics.
+ */
 static bool diagnostic_capture(struct diagnostic_snapshot *snapshot)
 {
     struct diagnostic_state state;
@@ -490,6 +556,9 @@ static bool diagnostic_capture(struct diagnostic_snapshot *snapshot)
     return true;
 }
 
+/*
+ * Capture the final diagnostic state and disable progress reporting.
+ */
 static void diagnostic_stop(struct diagnostic_snapshot *snapshot)
 {
     (void)diagnostic_capture(snapshot);
@@ -498,6 +567,9 @@ static void diagnostic_stop(struct diagnostic_snapshot *snapshot)
     k_mutex_unlock(&diagnostic_lock);
 }
 
+/*
+ * Print an intermediate certificate-generation diagnostic record.
+ */
 static void emit_progress(const struct diagnostic_snapshot *snapshot)
 {
     printk("[BENCH_CERT_PROGRESS] case_id=%s cert_sig_alg=%s stage=%s "
@@ -532,6 +604,9 @@ static void emit_progress(const struct diagnostic_snapshot *snapshot)
            snapshot->algorithm->signature_bytes);
 }
 
+/*
+ * Periodically emit diagnostics while certificate work is active.
+ */
 static void diagnostic_loop(void *unused1, void *unused2, void *unused3)
 {
     ARG_UNUSED(unused1);
@@ -548,6 +623,9 @@ static void diagnostic_loop(void *unused1, void *unused2, void *unused3)
     }
 }
 
+/*
+ * Print the final structured result for a certificate attempt.
+ */
 static void emit_result(const char *case_id,
                         const struct certgen_algorithm *algorithm,
                         const char *status, const char *stage, int error,
@@ -594,6 +672,9 @@ static void emit_result(const char *case_id,
            snapshot != NULL ? (unsigned int)snapshot->stack_free_bytes : 0);
 }
 
+/*
+ * Execute keygen, certificate creation, signing, and verification.
+ */
 static void run_case(const char *case_id, const char *algorithm_name)
 {
     const struct certgen_algorithm *algorithm = find_algorithm(algorithm_name);
@@ -671,6 +752,9 @@ done:
     free_key(algorithm->kind);
 }
 
+/*
+ * Initialize certificate benchmarking and process console commands.
+ */
 int main(void)
 {
     wolfSSL_SetAllocators(bench_malloc, bench_free, bench_realloc);

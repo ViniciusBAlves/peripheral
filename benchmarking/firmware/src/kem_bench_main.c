@@ -74,6 +74,9 @@ static const struct kem_algorithm algorithms[] = {
      ECC_SECP384R1, 48, 1665, 3216, 1665, 80},
 };
 
+/*
+ * Provide a fixed valid wall-clock time to wolfSSL.
+ */
 time_t time_sec(time_t *timer)
 {
     time_t now = 1893456000;
@@ -84,6 +87,9 @@ time_t time_sec(time_t *timer)
     return now;
 }
 
+/*
+ * Provide Zephyr uptime to wolfSSL's millisecond time hook.
+ */
 int time_ms(int64_t *timer)
 {
     if (timer != NULL) {
@@ -92,21 +98,33 @@ int time_ms(int64_t *timer)
     return 0;
 }
 
+/*
+ * Allocate KEM-benchmark memory from its dedicated heap.
+ */
 static void *bench_malloc(size_t size)
 {
     return k_heap_alloc(&kem_bench_heap, size, K_NO_WAIT);
 }
 
+/*
+ * Release memory back to the KEM benchmark heap.
+ */
 static void bench_free(void *ptr)
 {
     k_heap_free(&kem_bench_heap, ptr);
 }
 
+/*
+ * Resize an allocation in the KEM benchmark heap.
+ */
 static void *bench_realloc(void *ptr, size_t size)
 {
     return k_heap_realloc(&kem_bench_heap, ptr, size, K_NO_WAIT);
 }
 
+/*
+ * Find KEM benchmark metadata by algorithm name.
+ */
 static const struct kem_algorithm *find_algorithm(const char *name)
 {
     for (size_t i = 0; i < ARRAY_SIZE(algorithms); ++i) {
@@ -117,17 +135,26 @@ static const struct kem_algorithm *find_algorithm(const char *name)
     return NULL;
 }
 
+/*
+ * Return whether a KEM case contains an ML-KEM component.
+ */
 static bool uses_mlkem(const struct kem_algorithm *algorithm)
 {
     return algorithm->kind != KEM_ECDH;
 }
 
+/*
+ * Return whether a KEM case contains a Weierstrass ECC component.
+ */
 static bool uses_ecc(const struct kem_algorithm *algorithm)
 {
     return algorithm->kind == KEM_ECDH ||
            algorithm->kind == KEM_HYBRID_ECDH;
 }
 
+/*
+ * Return the ciphertext size for a selected ML-KEM parameter set.
+ */
 static word32 mlkem_ciphertext_bytes(const struct kem_algorithm *algorithm)
 {
     switch (algorithm->mlkem_type) {
@@ -142,6 +169,9 @@ static word32 mlkem_ciphertext_bytes(const struct kem_algorithm *algorithm)
     }
 }
 
+/*
+ * Initialize all key objects required by a KEM case.
+ */
 static int init_keys(const struct kem_algorithm *algorithm)
 {
     int ret = 0;
@@ -169,6 +199,9 @@ static int init_keys(const struct kem_algorithm *algorithm)
     return ret;
 }
 
+/*
+ * Free all key objects allocated for a KEM case.
+ */
 static void free_keys(const struct kem_algorithm *algorithm)
 {
     if (uses_mlkem(algorithm)) {
@@ -184,6 +217,9 @@ static void free_keys(const struct kem_algorithm *algorithm)
     }
 }
 
+/*
+ * Generate the recipient key material for a KEM case.
+ */
 static int generate_recipient_key(const struct kem_algorithm *algorithm)
 {
     int ret = 0;
@@ -202,6 +238,9 @@ static int generate_recipient_key(const struct kem_algorithm *algorithm)
     return ret;
 }
 
+/*
+ * Produce ciphertext and sender-side shared secret for a KEM case.
+ */
 static int encapsulate(const struct kem_algorithm *algorithm)
 {
     int ret = 0;
@@ -237,6 +276,9 @@ static int encapsulate(const struct kem_algorithm *algorithm)
     return ret;
 }
 
+/*
+ * Recover the recipient-side shared secret for a KEM case.
+ */
 static int decapsulate(const struct kem_algorithm *algorithm)
 {
     int ret = 0;
@@ -265,11 +307,17 @@ static int decapsulate(const struct kem_algorithm *algorithm)
     return ret;
 }
 
+/*
+ * Convert elapsed Zephyr ticks since a timestamp to microseconds.
+ */
 static uint64_t elapsed_us(int64_t start_ticks)
 {
     return k_ticks_to_us_floor64(k_uptime_ticks() - start_ticks);
 }
 
+/*
+ * Print the final structured result for a KEM attempt.
+ */
 static void emit_result(const char *case_id,
                         const struct kem_algorithm *algorithm,
                         const char *status, const char *stage, int error,
@@ -314,6 +362,9 @@ static void emit_result(const char *case_id,
                ? "none" : BENCH_MLKEM_BACKEND_NAME);
 }
 
+/*
+ * Execute keygen, encapsulation, decapsulation, and secret comparison.
+ */
 static void run_case(const char *case_id, const char *algorithm_name)
 {
     const struct kem_algorithm *algorithm = find_algorithm(algorithm_name);
@@ -397,6 +448,9 @@ done:
     free_keys(algorithm);
 }
 
+/*
+ * Initialize KEM benchmarking and process console commands.
+ */
 int main(void)
 {
     wolfSSL_SetAllocators(bench_malloc, bench_free, bench_realloc);

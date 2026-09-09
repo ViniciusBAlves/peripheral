@@ -655,6 +655,14 @@ def wait_for_ble_result(
                 observations.append(parsed)
             if parsed and parsed[0] == "RESULT":
                 return parsed[1]
+        bridge_failure = gateway.remote_bridge_failure(case_id)
+        if bridge_failure:
+            return {
+                "status": "fail",
+                "stage": "ble_l2cap_transport",
+                "error": "bridge_failure",
+                "fatal_message": bridge_failure,
+            }
         now = time.monotonic()
         if fatal_detector is not None and now >= next_fatal_check:
             fatal_line = fatal_detector()
@@ -691,6 +699,7 @@ def wait_for_board_ready(serial_port, board_log: Path, timeout: float) -> None:
 
 
 MAX_HANDSHAKE_TIMEOUT_SEC = 60.0
+MAX_TRANSFER_ROUND_TIMEOUT_SEC = 600.0
 
 
 def timeout_for_case(case: dict[str, str], override: float | None) -> float:
@@ -699,6 +708,17 @@ def timeout_for_case(case: dict[str, str], override: float | None) -> float:
     if override is None:
         return MAX_HANDSHAKE_TIMEOUT_SEC
     return min(override, MAX_HANDSHAKE_TIMEOUT_SEC)
+
+
+def timeout_for_transfer_round(
+    case: dict[str, str], operations: tuple[TransferOperation, ...],
+    override: float | None,
+) -> float:
+    """Bound a complete transfer round while retaining per-operation deadlines."""
+    requested = timeout_for_case(case, override) + sum(
+        timeout_for_payload(operation.payload_bytes) for operation in operations
+    )
+    return min(requested, MAX_TRANSFER_ROUND_TIMEOUT_SEC)
 
 
 def classify_gateway_start_failure(
@@ -932,16 +952,25 @@ def run_job(
     final: dict[str, str] = {}
     reconnect_count = 0
     attempt_timeout = timeout_for_case(case, args.attempt_timeout_sec)
-    if getattr(args, "transfer_mode", False):
-        attempt_timeout += sum(
-            timeout_for_payload(operation.payload_bytes)
-            for operation in job.operations
+    if isinstance(job, TransferRound):
+        attempt_timeout = timeout_for_transfer_round(
+            case, job.operations, args.attempt_timeout_sec
         )
     power_values: dict[str, object] = {}
     power_session = getattr(args, "power_profiler_session", None)
     observations: list[tuple[str, dict[str, str]]] = []
     all_transfer_rows: list[dict[str, object]] = []
+    case_deadline = time.monotonic() + attempt_timeout
     for retry in range(args.reconnect_retries + 1):
+        remaining_timeout = case_deadline - time.monotonic()
+        if remaining_timeout <= 0:
+            final = {
+                "status": "timeout",
+                "stage": "case_deadline",
+                "error": "timeout",
+            }
+            break
+        retry_timeout = max(1.0, min(attempt_timeout, remaining_timeout))
         observations = []
         power_capture = None
         retry_trace = None
@@ -980,7 +1009,7 @@ def run_job(
                 signature_scheme=SIGNATURES_BY_NAME[
                     case["cert_sig_alg"]
                 ].tls_signature_scheme,
-                tls_timeout_sec=attempt_timeout,
+                tls_timeout_sec=retry_timeout,
                 mtls_mode=getattr(args, "mtls_mode", False),
                 transfer_plan=(
                     transfer_plan_for_job(job)
@@ -993,13 +1022,13 @@ def run_job(
                 )
                 if getattr(args, "power_profiler", False):
                     final = wait_for_ble_result(
-                        gateway, case["case_id"], board_log, attempt_timeout,
+                        gateway, case["case_id"], board_log, retry_timeout,
                         fatal_detector=fatal_detector,
                         observations=observations,
                     )
                 else:
                     final = wait_for_result(
-                        serial_port, board_log, attempt_timeout,
+                        serial_port, board_log, retry_timeout,
                         fatal_detector=fatal_detector,
                         observations=observations,
                     )
@@ -1073,7 +1102,15 @@ def run_job(
             all_transfer_rows.extend(retry_rows)
 
         if final.get("status") == "success" or final.get("fatal") == "1" or \
-                retry >= args.reconnect_retries:
+                retry >= args.reconnect_retries or \
+                time.monotonic() >= case_deadline:
+            if time.monotonic() >= case_deadline and \
+                    final.get("status") != "success":
+                final = {
+                    "status": "timeout",
+                    "stage": "case_deadline",
+                    "error": "timeout",
+                }
             if retry_trace is not None and retry_trace.exists():
                 retry_trace.replace(
                     case_dir / f"power_trace_{attempt_index:03d}.csv.gz"
@@ -2577,10 +2614,9 @@ def main(argv: list[str] | None = None) -> int:
                     )
                     active_profile = required_profile
                 timeout = timeout_for_case(case, args.attempt_timeout_sec)
-                if args.transfer_mode:
-                    timeout += sum(
-                        timeout_for_payload(operation.payload_bytes)
-                        for operation in job.operations
+                if isinstance(job, TransferRound):
+                    timeout = timeout_for_transfer_round(
+                        case, job.operations, args.attempt_timeout_sec
                     )
                 print(
                     f"[{execution_order}/{len(jobs)}] {job.case_id} "

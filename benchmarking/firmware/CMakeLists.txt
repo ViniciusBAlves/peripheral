@@ -11,6 +11,8 @@ option(BENCH_POWER_MARKERS "Enable PPK2 GPIO timing markers" OFF)
 option(BENCH_BLE_TELEMETRY "Send structured benchmark output over BLE L2CAP" OFF)
 option(BENCH_MTLS_MODE "Load the fixed client identity for mutual TLS" OFF)
 option(BENCH_TRANSFER_MODE "Run bidirectional MQTT payload transfers" OFF)
+option(BENCH_L2CAP_LINUX_ZERO_IDENT_CREDITS
+    "Accept Linux LE credit updates after its signaling ident pool wraps" ON)
 if(DEFINED ENV{BENCH_TRANSFER_MODE})
     set(BENCH_TRANSFER_MODE "$ENV{BENCH_TRANSFER_MODE}" CACHE BOOL
         "Run bidirectional MQTT payload transfers" FORCE)
@@ -18,6 +20,34 @@ endif()
 if(DEFINED ENV{BENCH_MTLS_MODE})
     set(BENCH_MTLS_MODE "$ENV{BENCH_MTLS_MODE}" CACHE BOOL
         "Load the fixed client identity for mutual TLS" FORCE)
+endif()
+
+# Some Raspberry Pi kernels leak one signaling identifier per LE credit update.
+# Apply the narrow Zephyr-side interoperability fix only for transfer builds.
+if(BENCH_TRANSFER_MODE AND BENCH_L2CAP_LINUX_ZERO_IDENT_CREDITS)
+    set(BENCH_L2CAP_PATCH
+        "${CMAKE_CURRENT_LIST_DIR}/patches/zephyr-l2cap-zero-credit-ident.patch")
+    execute_process(
+        COMMAND git -C "${ZEPHYR_BASE}" apply --reverse --check "${BENCH_L2CAP_PATCH}"
+        RESULT_VARIABLE BENCH_L2CAP_PATCHED
+        OUTPUT_QUIET ERROR_QUIET
+    )
+    if(NOT BENCH_L2CAP_PATCHED EQUAL 0)
+        execute_process(
+            COMMAND git -C "${ZEPHYR_BASE}" apply --check "${BENCH_L2CAP_PATCH}"
+            RESULT_VARIABLE BENCH_L2CAP_PATCH_APPLIES
+            OUTPUT_QUIET ERROR_VARIABLE BENCH_L2CAP_PATCH_ERROR
+        )
+        if(NOT BENCH_L2CAP_PATCH_APPLIES EQUAL 0)
+            message(FATAL_ERROR
+                "Cannot apply the Zephyr L2CAP credit compatibility patch: "
+                "${BENCH_L2CAP_PATCH_ERROR}")
+        endif()
+        execute_process(
+            COMMAND git -C "${ZEPHYR_BASE}" apply "${BENCH_L2CAP_PATCH}"
+            COMMAND_ERROR_IS_FATAL ANY
+        )
+    endif()
 endif()
 option(BENCH_CERTIFICATE_GEN "Build the on-device certificate benchmark" OFF)
 option(BENCH_KEM_OPERATIONS "Build the on-device KEM operation benchmark" OFF)

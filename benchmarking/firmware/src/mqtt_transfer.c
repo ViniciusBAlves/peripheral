@@ -40,6 +40,9 @@ struct cpu_snapshot {
 static uint16_t next_packet_id = 10;
 static int32_t mqtt_timeout_ms = MQTT_TIMEOUT_MS;
 
+/*
+ * Capture current-thread and whole-system runtime counters.
+ */
 static struct cpu_snapshot cpu_snapshot_get(void)
 {
     k_thread_runtime_stats_t thread = {0};
@@ -56,6 +59,9 @@ static struct cpu_snapshot cpu_snapshot_get(void)
     return result;
 }
 
+/*
+ * Read an exact byte count from TLS before the transfer deadline.
+ */
 static int tls_read_exact(WOLFSSL *ssl, uint8_t *data, size_t size)
 {
     size_t offset = 0;
@@ -77,6 +83,9 @@ static int tls_read_exact(WOLFSSL *ssl, uint8_t *data, size_t size)
     return offset == size ? 0 : -ETIMEDOUT;
 }
 
+/*
+ * Write a complete buffer to TLS before the transfer deadline.
+ */
 static int tls_write_all(WOLFSSL *ssl, const uint8_t *data, size_t size)
 {
     size_t offset = 0;
@@ -98,6 +107,9 @@ static int tls_write_all(WOLFSSL *ssl, const uint8_t *data, size_t size)
     return offset == size ? 0 : -ETIMEDOUT;
 }
 
+/*
+ * Encode an MQTT variable-length Remaining Length field.
+ */
 static size_t encode_remaining(uint32_t value, uint8_t output[4])
 {
     size_t count = 0;
@@ -112,6 +124,9 @@ static size_t encode_remaining(uint32_t value, uint8_t output[4])
     return count;
 }
 
+/*
+ * Parse an MQTT fixed header from the TLS stream.
+ */
 static int read_packet_header(WOLFSSL *ssl, struct mqtt_packet *packet)
 {
     uint32_t multiplier = 1;
@@ -134,12 +149,18 @@ static int read_packet_header(WOLFSSL *ssl, struct mqtt_packet *packet)
     return -EINVAL;
 }
 
+/*
+ * Send an MQTT QoS 1 PUBACK for a packet identifier.
+ */
 static int send_puback(WOLFSSL *ssl, uint16_t packet_id)
 {
     uint8_t packet[] = {0x40, 0x02, packet_id >> 8, packet_id & 0xff};
     return tls_write_all(ssl, packet, sizeof(packet));
 }
 
+/*
+ * Wait for and validate an MQTT QoS 1 PUBACK.
+ */
 static int wait_puback(WOLFSSL *ssl, uint16_t packet_id)
 {
     struct mqtt_packet packet;
@@ -151,11 +172,17 @@ static int wait_puback(WOLFSSL *ssl, uint16_t packet_id)
     return (((uint16_t)body[0] << 8) | body[1]) == packet_id ? 0 : -EINVAL;
 }
 
+/*
+ * Generate one deterministic payload byte for integrity checks.
+ */
 static uint8_t pattern_byte(uint32_t seed, uint32_t offset)
 {
     return (uint8_t)(seed + offset * 31U + (offset >> 8) * 17U);
 }
 
+/*
+ * Convert a SHA-256 digest to lowercase hexadecimal text.
+ */
 static void hash_to_hex(const uint8_t hash[WC_SHA256_DIGEST_SIZE], char hex[65])
 {
     static const char digits[] = "0123456789abcdef";
@@ -166,6 +193,9 @@ static void hash_to_hex(const uint8_t hash[WC_SHA256_DIGEST_SIZE], char hex[65])
     hex[64] = '\0';
 }
 
+/*
+ * Publish an in-memory MQTT payload with QoS 1.
+ */
 static int publish_memory(WOLFSSL *ssl, const char *topic,
                           const uint8_t *payload, size_t payload_size,
                           uint16_t *packet_id_out)
@@ -195,6 +225,9 @@ static int publish_memory(WOLFSSL *ssl, const char *topic,
     return 0;
 }
 
+/*
+ * Stream a deterministic MQTT payload while computing its digest.
+ */
 static int publish_pattern(WOLFSSL *ssl, const char *topic, uint32_t seed,
                            uint32_t payload_size, uint16_t *packet_id_out,
                            char hash_hex[65])
@@ -257,6 +290,9 @@ static int publish_pattern(WOLFSSL *ssl, const char *topic, uint32_t seed,
     return 0;
 }
 
+/*
+ * Stream, hash, and validate one incoming MQTT PUBLISH packet.
+ */
 static int read_publish(WOLFSSL *ssl, char *topic, size_t topic_capacity,
                         uint8_t *small_payload, size_t small_capacity,
                         uint32_t expected_size, uint32_t expected_seed,
@@ -316,6 +352,9 @@ static int read_publish(WOLFSSL *ssl, char *topic, size_t topic_capacity,
     return 0;
 }
 
+/*
+ * Subscribe the device to benchmark control and download topics.
+ */
 static int subscribe_topics(WOLFSSL *ssl)
 {
     uint8_t packet[96], remaining[4];
@@ -342,6 +381,10 @@ static int subscribe_topics(WOLFSSL *ssl)
     return 0;
 }
 
+#ifndef BENCH_POWER_MARKERS
+/*
+ * Emit transfer timing and resource records over the board console.
+ */
 static void emit_transfer_result(uint32_t sequence, const char *direction,
                                  uint32_t payload_size, bool success,
                                  int error_code, uint16_t packet_id,
@@ -391,7 +434,11 @@ static void emit_transfer_result(uint32_t sequence, const char *direction,
            metrics->l2cap_tx_retries, metrics->l2cap_tx_wait_us,
            metrics->l2cap_rx_overflows, BENCHMARK_DWT_VALUES(*dwt));
 }
+#endif
 
+/*
+ * Publish structured transfer metrics back through MQTT.
+ */
 static int publish_transfer_metrics(
     WOLFSSL *ssl, uint32_t sequence, const char *direction,
     uint32_t payload_size, bool success, int error_code,
@@ -444,6 +491,9 @@ static int publish_transfer_metrics(
     return wait_puback(ssl, metrics_packet_id);
 }
 
+/*
+ * Execute the ordered bidirectional MQTT transfer operations.
+ */
 int benchmark_mqtt_transfer_run(WOLFSSL *ssl, struct k_heap *heap,
                                 uint32_t heap_capacity)
 {
@@ -556,6 +606,8 @@ int benchmark_mqtt_transfer_run(WOLFSSL *ssl, struct k_heap *heap,
         struct sys_memory_stats heap_stats = {0};
         (void)sys_heap_runtime_stats_get(&heap->heap, &heap_stats);
         valid = valid && ret == 0 && strcmp(actual_hash, expected_hash) == 0;
+#ifndef BENCH_POWER_MARKERS
+        /* Source Mode has no DK UART; MQTT carries the same structured metrics. */
         emit_transfer_result(
             sequence,
             strcmp(direction, "DOWN") == 0 ? "server_to_device" :
@@ -565,6 +617,7 @@ int benchmark_mqtt_transfer_run(WOLFSSL *ssl, struct k_heap *heap,
             k_ticks_to_us_floor64(ended - data_done),
             k_ticks_to_us_floor64(ended - started),
             &cpu_start, &cpu_end, &dwt, &heap_stats);
+#endif
         if (publish_transfer_metrics(
                 ssl, sequence,
                 strcmp(direction, "DOWN") == 0 ? "server_to_device" :
@@ -576,8 +629,10 @@ int benchmark_mqtt_transfer_run(WOLFSSL *ssl, struct k_heap *heap,
                 &cpu_start, &cpu_end, &dwt, &heap_stats) != 0) {
             return -EIO;
         }
+#ifndef BENCH_POWER_MARKERS
         /* Let the asynchronous UART backend drain the metrics records. */
         k_sleep(K_MSEC(300));
+#endif
         if (!valid) return -EIO;
     }
     return 0;

@@ -15,6 +15,9 @@ static unsigned int mlkem_depth;
 static unsigned int classical_kex_depth;
 static unsigned int signature_depth;
 
+/*
+ * Return whether an operation belongs to the ML-KEM phase.
+ */
 static bool is_mlkem(enum benchmark_crypto_operation operation)
 {
     return operation == BENCH_CRYPTO_KEM_KEYGEN ||
@@ -22,12 +25,18 @@ static bool is_mlkem(enum benchmark_crypto_operation operation)
            operation == BENCH_CRYPTO_KEM_DECAPSULATE;
 }
 
+/*
+ * Return whether an operation belongs to classical key exchange.
+ */
 static bool is_classical_kex(enum benchmark_crypto_operation operation)
 {
     return operation == BENCH_CRYPTO_CLASSICAL_KEX_KEYGEN ||
            operation == BENCH_CRYPTO_CLASSICAL_KEX_SHARED_SECRET;
 }
 
+/*
+ * Return whether an operation belongs to certificate processing.
+ */
 static bool is_signature(enum benchmark_crypto_operation operation)
 {
     return operation == BENCH_CRYPTO_CERT_VERIFY ||
@@ -35,6 +44,9 @@ static bool is_signature(enum benchmark_crypto_operation operation)
            operation == BENCH_CRYPTO_MTLS_SIGN;
 }
 
+/*
+ * Configure all benchmark power-marker GPIO outputs.
+ */
 void benchmark_power_markers_init(void)
 {
     if (!device_is_ready(gpio0)) {
@@ -47,6 +59,9 @@ void benchmark_power_markers_init(void)
     markers_ready = true;
 }
 
+/*
+ * Clear marker GPIOs and nested-operation counters.
+ */
 void benchmark_power_markers_reset(void)
 {
     if (!markers_ready) {
@@ -60,6 +75,9 @@ void benchmark_power_markers_reset(void)
         BIT(MARKER_SIGNATURE_PIN));
 }
 
+/*
+ * Set the total-execution power marker.
+ */
 void benchmark_power_total_set(bool active)
 {
     if (markers_ready) {
@@ -67,6 +85,9 @@ void benchmark_power_total_set(bool active)
     }
 }
 
+/*
+ * Set the TLS-handshake power marker.
+ */
 void benchmark_power_handshake_set(bool active)
 {
     if (markers_ready) {
@@ -74,6 +95,9 @@ void benchmark_power_handshake_set(bool active)
     }
 }
 
+/*
+ * Enter a marked cryptographic operation region.
+ */
 void benchmark_power_crypto_start(enum benchmark_crypto_operation operation)
 {
     if (!markers_ready) {
@@ -93,6 +117,9 @@ void benchmark_power_crypto_start(enum benchmark_crypto_operation operation)
     }
 }
 
+/*
+ * Leave a marked cryptographic operation region.
+ */
 void benchmark_power_crypto_stop(enum benchmark_crypto_operation operation)
 {
     if (!markers_ready) {
@@ -118,10 +145,28 @@ void benchmark_power_crypto_stop(enum benchmark_crypto_operation operation)
     }
 }
 #else
+/*
+ * Provide a no-op marker initializer when power profiling is disabled.
+ */
 void benchmark_power_markers_init(void) {}
+/*
+ * Provide a no-op marker reset when power profiling is disabled.
+ */
 void benchmark_power_markers_reset(void) {}
+/*
+ * Ignore total-execution marker updates when profiling is disabled.
+ */
 void benchmark_power_total_set(bool active) { ARG_UNUSED(active); }
+/*
+ * Ignore handshake marker updates when profiling is disabled.
+ */
 void benchmark_power_handshake_set(bool active) { ARG_UNUSED(active); }
+/*
+ * Ignore cryptographic marker starts when profiling is disabled.
+ */
 void benchmark_power_crypto_start(enum benchmark_crypto_operation operation) { ARG_UNUSED(operation); }
+/*
+ * Ignore cryptographic marker stops when profiling is disabled.
+ */
 void benchmark_power_crypto_stop(enum benchmark_crypto_operation operation) { ARG_UNUSED(operation); }
 #endif

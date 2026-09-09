@@ -57,6 +57,9 @@
 #define BENCH_LOG(...) do { } while (0)
 #endif
 
+/*
+ * Emit structured benchmark output through the active transport.
+ */
 static void benchmark_output(const char *format, ...);
 #define BENCH_OUT(...) benchmark_output(__VA_ARGS__)
 #define BENCH_RESULT_OUT(...) do { \
@@ -64,14 +67,21 @@ static void benchmark_output(const char *format, ...);
     BENCH_OUT(__VA_ARGS__); \
 } while (0)
 
+#ifdef BENCH_TRANSFER_MODE
+/* Large transfer SDUs avoid one LE credit update for every 672 payload bytes. */
+#define L2CAP_RX_SDU_MTU 5120
+#define L2CAP_RX_POOL_COUNT 1
+#else
 #define L2CAP_RX_SDU_MTU 672
+#define L2CAP_RX_POOL_COUNT 11
+#endif
 #define L2CAP_TX_SDU_MTU 5120
 /*
  * The nRF52840 shares its 256 KiB RAM with the BLE controller. wolfSSL reads
  * records incrementally, so this ring need not retain a complete PQC chain.
  */
 #if defined(CONFIG_SOC_NRF52840)
-#define TLS_RX_RINGBUF_SIZE (11 * L2CAP_RX_SDU_MTU)
+#define TLS_RX_RINGBUF_SIZE (L2CAP_RX_POOL_COUNT * L2CAP_RX_SDU_MTU)
 #else
 #define TLS_RX_RINGBUF_SIZE 65536
 #endif
@@ -93,7 +103,8 @@ static void benchmark_output(const char *format, ...);
 #if defined(CONFIG_SOC_NRF5340_CPUAPP)
 #define WOLFSSL_HEAP_SIZE (300 * 1024)
 #elif defined(CONFIG_SOC_NRF52840)
-#define WOLFSSL_HEAP_SIZE (200 * 1024)
+/* SLH-DSA-SHAKE-256f peaks just below 201 KiB while parsing its X.509 chain. */
+#define WOLFSSL_HEAP_SIZE (201 * 1024)
 #else
 #define WOLFSSL_HEAP_SIZE (200 * 1024)
 #endif
@@ -115,8 +126,14 @@ static uint32_t wolfssl_alloc_last_failed_bytes;
 static uint32_t wolfssl_alloc_max_failed_bytes;
 K_SEM_DEFINE(pki_profile_selected_sem, 0, 1);
 
+/*
+ * Send one framed benchmark-control message over L2CAP.
+ */
 static int benchmark_control_send(const char *message, size_t length);
 
+/*
+ * Log current usage and failures from the dedicated wolfSSL heap.
+ */
 static void wolfssl_heap_report(const char *where)
 {
     struct sys_memory_stats stats;
@@ -129,6 +146,9 @@ static void wolfssl_heap_report(const char *where)
     }
 }
 
+/*
+ * Report progress while a long TLS handshake remains active.
+ */
 static void tls_handshake_progress(struct k_timer *timer)
 {
     ARG_UNUSED(timer);
@@ -144,6 +164,9 @@ static void tls_handshake_progress(struct k_timer *timer)
 
 K_TIMER_DEFINE(tls_progress_timer, tls_handshake_progress, NULL);
 
+/*
+ * Return the hardware cycle-counter frequency used by CPU metrics.
+ */
 static uint32_t benchmark_cpu_cycles_per_sec(void)
 {
     return sys_clock_hw_cycles_per_sec();
@@ -170,6 +193,9 @@ struct benchmark_processing_cpu {
 
 static struct benchmark_stack_snapshot stack_snapshot;
 
+/*
+ * Capture current-thread and whole-system runtime counters.
+ */
 static struct benchmark_cpu_snapshot benchmark_cpu_snapshot_get(void)
 {
     k_thread_runtime_stats_t thread_stats = {0};
@@ -187,11 +213,17 @@ static struct benchmark_cpu_snapshot benchmark_cpu_snapshot_get(void)
     return snapshot;
 }
 
+/*
+ * Convert a ratio to basis points with a 100 percent ceiling.
+ */
 static uint32_t benchmark_percent_bp(uint64_t part, uint64_t total)
 {
     return total ? (uint32_t)MIN((part * 10000ULL) / total, 10000ULL) : 0;
 }
 
+/*
+ * Derive thread and system CPU usage from two runtime snapshots.
+ */
 static void benchmark_cpu_delta(
     const struct benchmark_cpu_snapshot *start,
     const struct benchmark_cpu_snapshot *end,
@@ -216,8 +248,9 @@ static void benchmark_cpu_delta(
         end->non_idle_cycles - start->non_idle_cycles, system_cycles);
 }
 
-/* Measure CPU utilization only while wolfSSL is processing, excluding the
- * time accumulated by the L2CAP send/receive callbacks. */
+/*
+ * Accumulate CPU utilization while excluding L2CAP callback time.
+ */
 static void benchmark_processing_cpu_update(
     struct benchmark_processing_cpu *processing,
     const struct benchmark_cpu_snapshot *start,
@@ -250,6 +283,9 @@ static void benchmark_processing_cpu_update(
     processing->peak_usage_bp = MAX(processing->peak_usage_bp, usage_bp);
 }
 
+/*
+ * Accumulate stack usage reported for each Zephyr thread.
+ */
 static void benchmark_stack_analyzer_cb(struct thread_analyzer_info *info)
 {
     uint32_t percent_bp;
@@ -261,6 +297,9 @@ static void benchmark_stack_analyzer_cb(struct thread_analyzer_info *info)
         MAX(stack_snapshot.peak_percent_bp, percent_bp);
 }
 
+/*
+ * Run the thread analyzer and return aggregate stack usage.
+ */
 static struct benchmark_stack_snapshot benchmark_stack_snapshot_get(void)
 {
     stack_snapshot = (struct benchmark_stack_snapshot){0};
@@ -268,6 +307,9 @@ static struct benchmark_stack_snapshot benchmark_stack_snapshot_get(void)
     return stack_snapshot;
 }
 
+/*
+ * Print a detailed thread and memory runtime report for diagnostics.
+ */
 static void benchmark_runtime_report(const char *where)
 {
     BENCH_LOG("[BENCHMARK_RESULT] Runtime_Report: %s\n", where);
@@ -288,6 +330,9 @@ static void benchmark_runtime_report(const char *where)
     BENCH_LOG("[BENCHMARK_RESULT] Thread_Analyzer_End\n");
 }
 
+/*
+ * Allocate wolfSSL memory and track allocation failures.
+ */
 static void *wolfssl_malloc(size_t size)
 {
     void *ptr = k_heap_alloc(&wolfssl_heap, size, K_NO_WAIT);
@@ -304,11 +349,17 @@ static void *wolfssl_malloc(size_t size)
     return ptr;
 }
 
+/*
+ * Release memory back to the dedicated wolfSSL heap.
+ */
 static void wolfssl_free(void *ptr)
 {
     k_heap_free(&wolfssl_heap, ptr);
 }
 
+/*
+ * Resize wolfSSL memory and track allocation failures.
+ */
 static void *wolfssl_realloc(void *ptr, size_t size)
 {
     void *new_ptr = k_heap_realloc(&wolfssl_heap, ptr, size, K_NO_WAIT);
@@ -339,6 +390,9 @@ K_SEM_DEFINE(l2cap_tx_complete_sem, 0, 1);
 #endif
 
 /* --- WOLFSSL TIME HOOKS --- */
+/*
+ * Provide a valid wall-clock timestamp to wolfSSL certificate checks.
+ */
 time_t time_sec(time_t *timer) {
     /* * Unix timestamp for 2030-01-01.
      * This tricks wolfSSL into thinking it is the modern day
@@ -353,6 +407,9 @@ time_t time_sec(time_t *timer) {
     return t;
 }
 
+/*
+ * Provide Zephyr uptime to wolfSSL's millisecond time hook.
+ */
 int time_ms(int *timer) {
     int t = (int)k_uptime_get_32();
     if (timer) *timer = t;
@@ -375,6 +432,9 @@ static const struct gpio_dt_spec led = GPIO_DT_SPEC_GET(LED0_NODE, gpios);
 #define BENCHMARK_CLOSE_AFTER_TLS 0
 #endif
 
+/*
+ * Set the optional board status LED without affecting unsupported boards.
+ */
 static void update_led(bool on)
 {
 #if HAS_STATUS_LED
@@ -392,7 +452,8 @@ static void update_led(bool on)
  * LE credit limit. Sends are serialized, so one TX buffer is sufficient.
  */
 NET_BUF_POOL_DEFINE(l2cap_tx_pool, 1, BT_L2CAP_BUF_SIZE(L2CAP_TX_SDU_MTU), 8, NULL);
-NET_BUF_POOL_DEFINE(l2cap_rx_pool, 11, BT_L2CAP_BUF_SIZE(L2CAP_RX_SDU_MTU), 8, NULL);
+NET_BUF_POOL_DEFINE(l2cap_rx_pool, L2CAP_RX_POOL_COUNT,
+                    BT_L2CAP_BUF_SIZE(L2CAP_RX_SDU_MTU), 8, NULL);
 
 static struct bt_l2cap_le_chan l2cap_chan;
 static volatile bool l2cap_rx_overflow;
@@ -403,6 +464,9 @@ static struct bt_conn *active_conn;
 static const struct bt_le_conn_param benchmark_conn_params =
     BT_LE_CONN_PARAM_INIT(16, 16, 0, 3200);
 
+/*
+ * Track an ACL connection and request benchmark BLE parameters.
+ */
 static void bt_connected(struct bt_conn *conn, uint8_t err)
 {
     char addr[BT_ADDR_LE_STR_LEN];
@@ -425,6 +489,9 @@ static void bt_connected(struct bt_conn *conn, uint8_t err)
     }
 }
 
+/*
+ * Release ACL state and wake operations after a BLE disconnect.
+ */
 static void bt_disconnected(struct bt_conn *conn, uint8_t reason)
 {
     char addr[BT_ADDR_LE_STR_LEN];
@@ -440,6 +507,9 @@ static void bt_disconnected(struct bt_conn *conn, uint8_t reason)
     k_sem_give(&rx_sem);
 }
 
+/*
+ * Record completion of the requested BLE connection parameters.
+ */
 static void bt_le_param_updated(struct bt_conn *conn, uint16_t interval,
                                 uint16_t latency, uint16_t timeout)
 {
@@ -459,11 +529,16 @@ BT_CONN_CB_DEFINE(conn_callbacks) = {
     .le_param_updated = bt_le_param_updated,
 };
 
-/* FIX 2: Provide an allocation callback so Zephyr doesn't drop incoming data */
+/*
+ * Allocate an L2CAP receive SDU from the dedicated pool.
+ */
 static struct net_buf *l2cap_alloc_buf(struct bt_l2cap_chan *chan) {
     return net_buf_alloc(&l2cap_rx_pool, K_MSEC(100));
 }
 
+/*
+ * Route control frames or queue TLS bytes received over L2CAP.
+ */
 static int l2cap_recv(struct bt_l2cap_chan *chan, struct net_buf *buf) {
     if (buf->len >= BENCH_CONTROL_HEADER_SIZE &&
         memcmp(buf->data, "BCTL1", 5) == 0) {
@@ -510,6 +585,9 @@ static int l2cap_recv(struct bt_l2cap_chan *chan, struct net_buf *buf) {
     return -EINPROGRESS;
 }
 
+/*
+ * Initialize per-channel state after an L2CAP CoC connection.
+ */
 static void l2cap_connected(struct bt_l2cap_chan *chan) {
     struct bt_l2cap_le_chan *le_chan =
         CONTAINER_OF(chan, struct bt_l2cap_le_chan, chan);
@@ -525,6 +603,9 @@ static void l2cap_connected(struct bt_l2cap_chan *chan) {
     k_sem_give(&l2cap_connected_sem);
 }
 
+/*
+ * Mark the L2CAP channel closed and wake blocked I/O.
+ */
 static void l2cap_disconnected(struct bt_l2cap_chan *chan) {
     BENCH_LOG("[L2CAP] Disconnected.\n");
     l2cap_peer_disconnected = true;
@@ -532,6 +613,9 @@ static void l2cap_disconnected(struct bt_l2cap_chan *chan) {
     k_sem_give(&l2cap_tx_complete_sem);
 }
 
+/*
+ * Signal completion of an L2CAP transmit operation.
+ */
 static void l2cap_sent(struct bt_l2cap_chan *chan)
 {
     ARG_UNUSED(chan);
@@ -556,6 +640,9 @@ static const struct bt_data ad_l2cap_error[] = {
     BT_DATA_BYTES(BT_DATA_NAME_COMPLETE, 'P', 'Q', 'C', '-', 'L', '2', 'E', 'R', 'R')
 };
 
+/*
+ * Apply MQTT LED and disconnect commands received by the device.
+ */
 static void handle_command(const byte *payload, word32 len)
 {
 	char msg[64];
@@ -585,6 +672,9 @@ static void handle_command(const byte *payload, word32 len)
 	// }
 }
 
+/*
+ * Accept an incoming benchmark L2CAP CoC channel.
+ */
 static int l2cap_accept(struct bt_conn *conn, struct bt_l2cap_server *server, struct bt_l2cap_chan **chan);
 
 static struct bt_l2cap_server l2cap_server = {
@@ -593,6 +683,9 @@ static struct bt_l2cap_server l2cap_server = {
     .accept = l2cap_accept,
 };
 
+/*
+ * Configure and return the single benchmark L2CAP channel.
+ */
 static int l2cap_accept(struct bt_conn *conn, struct bt_l2cap_server *server, struct bt_l2cap_chan **chan) {
     char addr[BT_ADDR_LE_STR_LEN];
     bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
@@ -612,6 +705,9 @@ static int l2cap_accept(struct bt_conn *conn, struct bt_l2cap_server *server, st
     return 0;
 }
 
+/*
+ * Send wolfSSL records as flow-controlled L2CAP SDU fragments.
+ */
 int l2cap_wolfssl_send(WOLFSSL* ssl, char* buf, int sz, void* ctx) {
     struct bt_l2cap_chan *chan = (struct bt_l2cap_chan *)ctx;
     struct bt_l2cap_le_chan *le_chan = CONTAINER_OF(chan, struct bt_l2cap_le_chan, chan);
@@ -701,6 +797,9 @@ int l2cap_wolfssl_send(WOLFSSL* ssl, char* buf, int sz, void* ctx) {
 #undef SEND_RETURN
 }
 
+/*
+ * Fragment and send one framed benchmark-control message over L2CAP.
+ */
 static int benchmark_control_send(const char *message, size_t length)
 {
     struct bt_l2cap_chan *chan = &l2cap_chan.chan;
@@ -756,6 +855,9 @@ static int benchmark_control_send(const char *message, size_t length)
     return 0;
 }
 
+/*
+ * Format and emit structured output over console or L2CAP control frames.
+ */
 static void benchmark_output(const char *format, ...)
 {
 #ifdef BENCH_BLE_TELEMETRY
@@ -782,7 +884,9 @@ static void benchmark_output(const char *format, ...)
 #endif
 }
 
-/* FIX 5: Safely wait for data without locking up wolfSSL */
+/*
+ * Supply queued L2CAP bytes to wolfSSL with bounded waits.
+ */
 int l2cap_wolfssl_recv(WOLFSSL* ssl, char* buf, int sz, void* ctx) {
     struct bt_l2cap_chan *chan = (struct bt_l2cap_chan *)ctx;
     benchmark_timepoint_t io_start = benchmark_metric_start();
@@ -836,6 +940,9 @@ int l2cap_wolfssl_recv(WOLFSSL* ssl, char* buf, int sz, void* ctx) {
 #undef RECV_RETURN
 }
 
+/*
+ * Exchange TLS close notifications and then disconnect L2CAP.
+ */
 static void shutdown_tls_gracefully(WOLFSSL *ssl, struct bt_l2cap_chan *chan)
 {
     if (!ssl || !chan) {
@@ -881,6 +988,9 @@ static void shutdown_tls_gracefully(WOLFSSL *ssl, struct bt_l2cap_chan *chan)
     BENCH_LOG("TLS shutdown close_notify sent; peer did not finish shutdown in time.\n");
 }
 
+/*
+ * Configure TLS, connect MQTT, collect metrics, and run optional transfers.
+ */
 void start_secure_mqtt_session(struct bt_l2cap_chan *chan)
 {
     WOLFSSL_CTX *ctx = NULL;
@@ -1296,6 +1406,9 @@ static const struct bt_le_adv_param adv_param = {
     .interval_max = 0x0150,
 };
 
+/*
+ * Print all configured Bluetooth identities for gateway discovery.
+ */
 static void print_local_identities(void)
 {
     bt_addr_le_t addrs[CONFIG_BT_ID_MAX];
@@ -1311,6 +1424,9 @@ static void print_local_identities(void)
     }
 }
 
+/*
+ * Initialize the benchmark firmware and serve repeated BLE sessions.
+ */
 int main(void) {
     benchmark_power_markers_init();
     benchmark_power_markers_reset();

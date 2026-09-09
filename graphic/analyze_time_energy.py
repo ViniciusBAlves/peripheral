@@ -65,6 +65,9 @@ NUMERIC_COLUMNS = (
     "sig_signature_bytes",
     "l2cap_tx_bytes",
     "l2cap_rx_bytes",
+    "client_cpu_ms",
+    "client_heap_peak_bytes",
+    "server_chain_bytes",
     "client_kem_duration_ms",
     "client_kem_energy_uj",
     "client_kem_avg_current_ua",
@@ -293,6 +296,9 @@ def load_attempt_data(
     )
     data["transmitted_bytes"] = data["l2cap_tx_bytes"]
     data["total_l2cap_bytes"] = data["l2cap_tx_bytes"] + data["l2cap_rx_bytes"]
+    data["case_cluster_id"] = (
+        data["run_id"].astype(str) + "::" + data["case_id"].astype(str)
+    )
     session_text = data["session"].fillna(-1).astype(int).astype(str)
     data["session_id"] = (
         data["run_id"].astype(str)
@@ -301,6 +307,22 @@ def load_attempt_data(
         + "::"
         + session_text
     )
+    categorical_defaults = {
+        "kex_group": "unknown_kem",
+        "pki_chain_id": "",
+        "pki_kind": "legacy_homogeneous",
+        "root_sig_alg": "",
+        "leaf_sig_alg": "",
+        "cert_sig_alg": "unknown_signature",
+    }
+    for field, default in categorical_defaults.items():
+        if field not in data:
+            data[field] = default
+        data[field] = data[field].fillna("").astype(str)
+        data.loc[data[field].str.strip() == "", field] = default
+    data.loc[data["pki_chain_id"] == "", "pki_chain_id"] = data["cert_sig_alg"]
+    data.loc[data["root_sig_alg"] == "", "root_sig_alg"] = data["cert_sig_alg"]
+    data.loc[data["leaf_sig_alg"] == "", "leaf_sig_alg"] = data["cert_sig_alg"]
     missing_text = pd.Series("", index=data.index, dtype=str)
     data["algorithm_category"] = [
         algorithm_category(kex, sig)
@@ -388,20 +410,28 @@ def cluster_bootstrap_ci(
     *,
     iterations: int,
     rng: np.random.Generator,
+    cluster_column: str = "session_id",
 ) -> tuple[float, float, int]:
     if iterations == 0 or frame.empty:
         return math.nan, math.nan, 0
-    clusters = frame["session_id"].dropna().unique()
+    if cluster_column not in frame:
+        return math.nan, math.nan, 0
+    grouped = frame.groupby(cluster_column, sort=False, observed=True).indices
+    clusters = np.asarray(list(grouped), dtype=object)
     if len(clusters) < 2:
         return math.nan, math.nan, 0
-    grouped = {cluster: frame[frame["session_id"] == cluster] for cluster in clusters}
     values: list[float] = []
     for _ in range(iterations):
         selected = rng.choice(clusters, size=len(clusters), replace=True)
-        sample = pd.concat(
-            [grouped[cluster] for cluster in selected],
-            ignore_index=True,
+        positions = np.concatenate([grouped[cluster] for cluster in selected])
+        labels = np.concatenate(
+            [
+                np.full(len(grouped[cluster]), draw_index, dtype=int)
+                for draw_index, cluster in enumerate(selected)
+            ]
         )
+        sample = frame.iloc[positions].copy()
+        sample["__bootstrap_cluster"] = labels
         value = statistic(sample)
         if math.isfinite(value):
             values.append(value)
@@ -409,6 +439,151 @@ def cluster_bootstrap_ci(
         return math.nan, math.nan, len(values)
     low, high = np.percentile(values, [2.5, 97.5])
     return float(low), float(high), len(values)
+
+
+def _bootstrap_interval(values: np.ndarray, iterations: int) -> tuple[float, float, int]:
+    clean = np.asarray(values, dtype=float)
+    clean = clean[np.isfinite(clean)]
+    if len(clean) < max(20, iterations // 10):
+        return math.nan, math.nan, len(clean)
+    low, high = np.percentile(clean, [2.5, 97.5])
+    return float(low), float(high), len(clean)
+
+
+def fast_cluster_correlation_ci(
+    frame: pd.DataFrame,
+    x_name: str,
+    y_name: str,
+    method: str,
+    level: str,
+    *,
+    iterations: int,
+    rng: np.random.Generator,
+    cluster_column: str,
+) -> tuple[float, float, int]:
+    """Bootstrap a correlation from per-cluster sufficient statistics."""
+    if iterations == 0 or frame.empty or cluster_column not in frame:
+        return math.nan, math.nan, 0
+    subset = frame[[cluster_column, x_name, y_name]].dropna().copy()
+    grouped = subset.groupby(cluster_column, sort=False, observed=True).indices
+    if len(grouped) < 2:
+        return math.nan, math.nan, 0
+
+    if level == "between_case":
+        values = subset.groupby(cluster_column, sort=False, observed=True)[
+            [x_name, y_name]
+        ].mean()
+        x = values[x_name].to_numpy(dtype=float)
+        y = values[y_name].to_numpy(dtype=float)
+        if method == "spearman":
+            x = stats.rankdata(x)
+            y = stats.rankdata(y)
+        statistics = np.column_stack(
+            [np.ones(len(x)), x, y, x * x, y * y, x * y]
+        )
+    else:
+        x = subset[x_name].to_numpy(dtype=float)
+        y = subset[y_name].to_numpy(dtype=float)
+        if method == "spearman" and level == "pooled":
+            x = stats.rankdata(x)
+            y = stats.rankdata(y)
+        group_statistics = []
+        for positions in grouped.values():
+            group_x = x[positions].copy()
+            group_y = y[positions].copy()
+            if level == "within_case":
+                if method == "spearman":
+                    group_x = stats.rankdata(group_x)
+                    group_y = stats.rankdata(group_y)
+                group_x -= group_x.mean()
+                group_y -= group_y.mean()
+            group_statistics.append(
+                [
+                    len(group_x),
+                    group_x.sum(),
+                    group_y.sum(),
+                    np.dot(group_x, group_x),
+                    np.dot(group_y, group_y),
+                    np.dot(group_x, group_y),
+                ]
+            )
+        statistics = np.asarray(group_statistics, dtype=float)
+
+    cluster_count = len(statistics)
+    counts = rng.multinomial(
+        cluster_count,
+        np.full(cluster_count, 1.0 / cluster_count),
+        size=iterations,
+    )
+    totals = counts @ statistics
+    n, sum_x, sum_y, sum_xx, sum_yy, sum_xy = totals.T
+    covariance = sum_xy - sum_x * sum_y / n
+    variance_x = sum_xx - np.square(sum_x) / n
+    variance_y = sum_yy - np.square(sum_y) / n
+    with np.errstate(divide="ignore", invalid="ignore"):
+        coefficients = covariance / np.sqrt(variance_x * variance_y)
+    return _bootstrap_interval(coefficients, iterations)
+
+
+def fast_cluster_partial_ci(
+    frame: pd.DataFrame,
+    x_name: str,
+    y_name: str,
+    controls: Sequence[str],
+    method: str,
+    *,
+    iterations: int,
+    rng: np.random.Generator,
+    cluster_column: str,
+) -> tuple[float, float, int]:
+    """Bootstrap partial correlation from weighted cluster cross-products."""
+    if iterations == 0 or frame.empty or cluster_column not in frame:
+        return math.nan, math.nan, 0
+    fields = [cluster_column, "run_id", x_name, y_name, *controls]
+    subset = frame[fields].dropna().copy()
+    matrix = subset[[x_name, y_name, *controls]].astype(float)
+    if method == "spearman":
+        matrix = matrix.rank(method="average")
+    if subset["run_id"].nunique() > 1:
+        run_dummies = pd.get_dummies(
+            subset["run_id"], prefix="run", drop_first=True, dtype=float
+        )
+        matrix = pd.concat([matrix, run_dummies], axis=1)
+    values = matrix.to_numpy(dtype=float)
+    grouped = subset.groupby(cluster_column, sort=False, observed=True).indices
+    if len(grouped) < 2:
+        return math.nan, math.nan, 0
+    counts_per_cluster = []
+    sums = []
+    cross_products = []
+    for positions in grouped.values():
+        chunk = values[positions]
+        counts_per_cluster.append(len(chunk))
+        sums.append(chunk.sum(axis=0))
+        cross_products.append(chunk.T @ chunk)
+    cluster_count = len(grouped)
+    weights = rng.multinomial(
+        cluster_count,
+        np.full(cluster_count, 1.0 / cluster_count),
+        size=iterations,
+    )
+    total_n = weights @ np.asarray(counts_per_cluster, dtype=float)
+    total_sum = weights @ np.asarray(sums, dtype=float)
+    total_cross = np.einsum(
+        "ic,cjk->ijk", weights, np.asarray(cross_products, dtype=float)
+    )
+    centered = total_cross - np.einsum(
+        "ij,ik->ijk", total_sum, total_sum
+    ) / total_n[:, None, None]
+    try:
+        precision = np.linalg.pinv(centered)
+    except np.linalg.LinAlgError:
+        return math.nan, math.nan, 0
+    with np.errstate(divide="ignore", invalid="ignore"):
+        coefficients = -precision[:, 0, 1] / np.sqrt(
+            precision[:, 0, 0] * precision[:, 1, 1]
+        )
+    return _bootstrap_interval(coefficients, iterations)
 
 
 def correlation_table(
@@ -426,16 +601,15 @@ def correlation_table(
                 subset[x_name], subset[y_name], method
             )
 
-            def calculate(sample: pd.DataFrame) -> float:
-                return safe_correlation(
-                    sample[x_name], sample[y_name], method
-                )[0]
-
-            ci_low, ci_high, valid = cluster_bootstrap_ci(
+            ci_low, ci_high, valid = fast_cluster_correlation_ci(
                 subset,
-                calculate,
+                x_name,
+                y_name,
+                method,
+                "pooled",
                 iterations=bootstrap_iterations,
                 rng=rng,
+                cluster_column="session_id",
             )
             rows.append(
                 {
@@ -452,6 +626,97 @@ def correlation_table(
                     "status": status,
                 }
             )
+    return pd.DataFrame(rows)
+
+
+def _correlation_at_level(
+    frame: pd.DataFrame,
+    x_name: str,
+    y_name: str,
+    method: str,
+    level: str,
+) -> tuple[float, float, int, str]:
+    """Calculate pooled, between-case, or within-case association."""
+    subset = frame.dropna(subset=[x_name, y_name]).copy()
+    if level == "pooled":
+        return safe_correlation(subset[x_name], subset[y_name], method)
+
+    group_column = (
+        "__bootstrap_cluster"
+        if "__bootstrap_cluster" in subset
+        else "case_cluster_id"
+    )
+    if group_column not in subset:
+        return math.nan, math.nan, 0, "missing_case_cluster"
+    if level == "between_case":
+        means = subset.groupby(group_column, observed=True)[[x_name, y_name]].mean()
+        return safe_correlation(means[x_name], means[y_name], method)
+    if level != "within_case":
+        raise ValueError(f"Unknown correlation level: {level}")
+
+    values = subset[[group_column, x_name, y_name]].copy()
+    if method == "spearman":
+        values[x_name] = values.groupby(group_column, observed=True)[x_name].rank(
+            method="average", pct=True
+        )
+        values[y_name] = values.groupby(group_column, observed=True)[y_name].rank(
+            method="average", pct=True
+        )
+    values[x_name] -= values.groupby(group_column, observed=True)[x_name].transform(
+        "mean"
+    )
+    values[y_name] -= values.groupby(group_column, observed=True)[y_name].transform(
+        "mean"
+    )
+    return safe_correlation(values[x_name], values[y_name], "pearson")
+
+
+def between_within_correlation_table(
+    data: pd.DataFrame,
+    *,
+    bootstrap_iterations: int,
+    seed: int,
+) -> pd.DataFrame:
+    """Decompose associations into pooled, case-mean, and case-centered parts."""
+    rows: list[dict[str, object]] = []
+    rng = np.random.default_rng(seed + 10)
+    for analysis, x_name, y_name in CORRELATION_SPECS:
+        subset = data.dropna(
+            subset=[x_name, y_name, "case_cluster_id"]
+        ).copy()
+        for method in ("pearson", "spearman"):
+            for level in ("pooled", "between_case", "within_case"):
+                coefficient, p_value, n, status = _correlation_at_level(
+                    subset, x_name, y_name, method, level
+                )
+
+                ci_low, ci_high, valid = fast_cluster_correlation_ci(
+                    subset,
+                    x_name,
+                    y_name,
+                    method,
+                    level,
+                    iterations=bootstrap_iterations,
+                    rng=rng,
+                    cluster_column="case_cluster_id",
+                )
+                rows.append(
+                    {
+                        "analysis": analysis,
+                        "level": level,
+                        "method": method,
+                        "x": x_name,
+                        "y": y_name,
+                        "n": n,
+                        "case_count": subset["case_cluster_id"].nunique(),
+                        "coefficient": coefficient,
+                        "p_value": p_value,
+                        "ci95_low": ci_low,
+                        "ci95_high": ci_high,
+                        "bootstrap_valid": valid,
+                        "status": status,
+                    }
+                )
     return pd.DataFrame(rows)
 
 
@@ -481,11 +746,17 @@ def partial_coefficient(
     x_name: str,
     y_name: str,
     controls: Sequence[str],
+    method: str = "pearson",
 ) -> tuple[float, float, int, str]:
     fields = [x_name, y_name, *controls, "run_id"]
     subset = frame[fields].dropna().copy()
     if len(subset) <= len(controls) + 2:
         return math.nan, math.nan, len(subset), "insufficient_data"
+    if method not in {"pearson", "spearman"}:
+        raise ValueError(f"Unknown partial-correlation method: {method}")
+    if method == "spearman":
+        for field in (x_name, y_name, *controls):
+            subset[field] = subset[field].rank(method="average")
     try:
         x_residual = residualize(subset, x_name, controls)
         y_residual = residualize(subset, y_name, controls)
@@ -500,58 +771,100 @@ def partial_correlation_table(
     bootstrap_iterations: int,
     seed: int,
 ) -> tuple[pd.DataFrame, dict[str, tuple[pd.Series, pd.Series]]]:
-    controls = ("kem_time_ms", "communication_overhead_ms")
     specs = (
-        ("signature_total_energy", "handshake_energy_uj"),
-        ("signature_window_energy", "client_signature_energy_uj"),
+        (
+            "signature_total_energy",
+            "signature_time_ms",
+            "handshake_energy_uj",
+            ("kem_time_ms", "communication_overhead_ms"),
+        ),
+        (
+            "signature_window_energy",
+            "signature_time_ms",
+            "client_signature_energy_uj",
+            ("kem_time_ms", "communication_overhead_ms"),
+        ),
+        (
+            "kem_total_energy",
+            "kem_time_ms",
+            "handshake_energy_uj",
+            ("signature_time_ms", "communication_overhead_ms"),
+        ),
+        (
+            "kem_window_energy",
+            "kem_time_ms",
+            "client_kem_energy_uj",
+            ("signature_time_ms", "communication_overhead_ms"),
+        ),
+        (
+            "signature_handshake_time",
+            "signature_time_ms",
+            "raw_handshake_ms",
+            ("kem_time_ms", "communication_overhead_ms"),
+        ),
+        (
+            "kem_handshake_time",
+            "kem_time_ms",
+            "raw_handshake_ms",
+            ("signature_time_ms", "communication_overhead_ms"),
+        ),
+        (
+            "communication_handshake_time",
+            "communication_overhead_ms",
+            "raw_handshake_ms",
+            ("kem_time_ms", "signature_time_ms"),
+        ),
     )
     rows: list[dict[str, object]] = []
     residuals: dict[str, tuple[pd.Series, pd.Series]] = {}
     rng = np.random.default_rng(seed + 1)
-    for name, y_name in specs:
+    for name, x_name, y_name, controls in specs:
         fields = [
-            "signature_time_ms",
+            x_name,
             y_name,
             *controls,
             "run_id",
             "session_id",
+            "case_cluster_id",
         ]
         subset = data[fields].dropna().copy()
-        coefficient, p_value, n, status = partial_coefficient(
-            subset, "signature_time_ms", y_name, controls
-        )
-
-        def calculate(sample: pd.DataFrame) -> float:
-            return partial_coefficient(
-                sample, "signature_time_ms", y_name, controls
-            )[0]
-
-        ci_low, ci_high, valid = cluster_bootstrap_ci(
-            subset,
-            calculate,
-            iterations=bootstrap_iterations,
-            rng=rng,
-        )
-        if status == "ok":
-            residuals[name] = (
-                residualize(subset, "signature_time_ms", controls),
-                residualize(subset, y_name, controls),
+        for method in ("pearson", "spearman"):
+            coefficient, p_value, n, status = partial_coefficient(
+                subset, x_name, y_name, controls, method=method
             )
-        rows.append(
-            {
-                "analysis": name,
-                "x": "signature_time_ms",
-                "y": y_name,
-                "controls": ";".join(controls),
-                "n": n,
-                "coefficient": coefficient,
-                "p_value": p_value,
-                "ci95_low": ci_low,
-                "ci95_high": ci_high,
-                "bootstrap_valid": valid,
-                "status": status,
-            }
-        )
+
+            ci_low, ci_high, valid = fast_cluster_partial_ci(
+                subset,
+                x_name,
+                y_name,
+                controls,
+                method,
+                iterations=bootstrap_iterations,
+                rng=rng,
+                cluster_column="case_cluster_id",
+            )
+            if method == "pearson" and status == "ok":
+                residuals[name] = (
+                    residualize(subset, x_name, controls),
+                    residualize(subset, y_name, controls),
+                )
+            rows.append(
+                {
+                    "analysis": name,
+                    "method": method,
+                    "x": x_name,
+                    "y": y_name,
+                    "controls": ";".join(controls),
+                    "n": n,
+                    "case_count": subset["case_cluster_id"].nunique(),
+                    "coefficient": coefficient,
+                    "p_value": p_value,
+                    "ci95_low": ci_low,
+                    "ci95_high": ci_high,
+                    "bootstrap_valid": valid,
+                    "status": status,
+                }
+            )
     return pd.DataFrame(rows), residuals
 
 
@@ -570,18 +883,21 @@ def fit_mixed_model(
     predictors: Sequence[str],
     standardized: bool = False,
 ) -> tuple[ModelFit, pd.DataFrame]:
+    group_field = "case_cluster_id" if "case_cluster_id" in data else "case_id"
     fields = [
         response,
         *predictors,
         "run_id",
         "case_id",
+        group_field,
         "session_id",
     ]
+    fields = list(dict.fromkeys(fields))
     frame = data[fields].dropna().copy()
     if len(frame) < max(12, len(predictors) + 6):
         fit = ModelFit(name, "insufficient_data", None, "", "too few rows")
         return fit, pd.DataFrame()
-    if frame["case_id"].nunique() < 2 or frame["session_id"].nunique() < 2:
+    if frame[group_field].nunique() < 2 or frame["session_id"].nunique() < 2:
         fit = ModelFit(
             name, "insufficient_data", None, "", "too few cases or sessions"
         )
@@ -611,7 +927,7 @@ def fit_mixed_model(
         model = smf.mixedlm(
             formula,
             frame,
-            groups=frame["case_id"],
+            groups=frame[group_field],
             re_formula="1",
             vc_formula={"session": "0 + C(session_id)"},
         )
@@ -653,12 +969,315 @@ def fit_mixed_model(
                 "ci95_low": float(confidence.loc[term, 0]),
                 "ci95_high": float(confidence.loc[term, 1]),
                 "n": len(frame),
-                "case_count": frame["case_id"].nunique(),
+                "case_count": frame[group_field].nunique(),
                 "session_count": frame["session_id"].nunique(),
             }
         )
     fit = ModelFit(name, status, result, formula, " | ".join(messages))
     return fit, pd.DataFrame(coefficients)
+
+
+def _session_level_frame(data: pd.DataFrame, response: str) -> pd.DataFrame:
+    """Collapse repeated attempts to independent session-level observations."""
+    categorical = [
+        "run_id",
+        "case_cluster_id",
+        "case_id",
+        "session_id",
+        "kex_group",
+        "pki_chain_id",
+        "pki_kind",
+        "root_sig_alg",
+        "leaf_sig_alg",
+    ]
+    fields = [*categorical, response]
+    frame = data[fields].dropna(subset=[response]).copy()
+    frame = frame[frame[response] > 0]
+    if frame.empty:
+        return frame
+    return (
+        frame.groupby(categorical, observed=True, dropna=False)[response]
+        .mean()
+        .reset_index()
+    )
+
+
+def fit_factorial_model(
+    data: pd.DataFrame,
+    *,
+    name: str,
+    response: str,
+) -> tuple[ModelFit, pd.DataFrame, pd.DataFrame]:
+    """Fit a full KEM by PKI fixed-effects model on session means."""
+    frame = _session_level_frame(data, response)
+    if (
+        len(frame) < 12
+        or frame["kex_group"].nunique() < 2
+        or frame["pki_chain_id"].nunique() < 2
+    ):
+        fit = ModelFit(name, "insufficient_data", None, "", "too few factor levels")
+        return fit, pd.DataFrame(), pd.DataFrame()
+
+    frame["log_response"] = np.log(frame[response])
+    terms = ["C(kex_group) * C(pki_chain_id)"]
+    if frame["run_id"].nunique() > 1:
+        terms.append("C(run_id)")
+    formula = "log_response ~ " + " + ".join(terms)
+    try:
+        result = smf.ols(formula, frame).fit()
+        robust = result.get_robustcov_results(
+            cov_type="cluster", groups=frame["case_cluster_id"]
+        )
+        anova = sm.stats.anova_lm(result, typ=2).reset_index(
+            names="term"
+        )
+        anova = anova.rename(
+            columns={"F": "f_statistic", "PR(>F)": "p_value"}
+        )
+    except Exception as exc:
+        fit = ModelFit(name, "model_error", None, formula, str(exc))
+        return fit, pd.DataFrame(), pd.DataFrame()
+
+    residual_row = anova[anova["term"] == "Residual"]
+    residual_ss = (
+        float(residual_row["sum_sq"].iloc[0]) if not residual_row.empty else math.nan
+    )
+    total_ss = float(anova["sum_sq"].sum())
+    anova["model"] = name
+    anova["response"] = response
+    anova["eta_squared"] = anova["sum_sq"] / total_ss
+    anova["partial_eta_squared"] = anova["sum_sq"] / (
+        anova["sum_sq"] + residual_ss
+    )
+    anova.loc[anova["term"] == "Residual", "partial_eta_squared"] = np.nan
+    anova["n"] = len(frame)
+    anova["case_count"] = frame["case_cluster_id"].nunique()
+    anova["session_count"] = frame["session_id"].nunique()
+    anova["status"] = "ok"
+    anova["formula"] = formula
+
+    names = result.model.exog_names
+    confidence = np.asarray(robust.conf_int())
+    coefficients = pd.DataFrame(
+        {
+            "model": name,
+            "model_status": "ok",
+            "response": response,
+            "term": names,
+            "coefficient": np.asarray(robust.params),
+            "standard_error": np.asarray(robust.bse),
+            "p_value": np.asarray(robust.pvalues),
+            "ci95_low": confidence[:, 0],
+            "ci95_high": confidence[:, 1],
+            "n": len(frame),
+            "case_count": frame["case_cluster_id"].nunique(),
+            "session_count": frame["session_id"].nunique(),
+            "formula": formula,
+        }
+    )
+    fit = ModelFit(name, "ok", result, formula)
+    return fit, anova, coefficients
+
+
+def fit_factorial_mixed_model(
+    data: pd.DataFrame,
+    *,
+    name: str,
+    response: str,
+) -> tuple[ModelFit, pd.DataFrame]:
+    """Fit a compact factorial mixed model with a PKI-chain random intercept."""
+    frame = _session_level_frame(data, response)
+    if (
+        len(frame) < 20
+        or frame["kex_group"].nunique() < 2
+        or frame["pki_chain_id"].nunique() < 2
+    ):
+        fit = ModelFit(name, "insufficient_data", None, "", "too few factor levels")
+        return fit, pd.DataFrame()
+
+    frame["log_response"] = np.log(frame[response])
+    # Root and leaf algorithms are encoded by the chain random effect. Including
+    # them again as fixed effects makes the design matrix rank deficient.
+    terms = ["C(kex_group) * C(pki_kind)"]
+    if frame["run_id"].nunique() > 1:
+        terms.append("C(run_id)")
+    formula = "log_response ~ " + " + ".join(terms)
+    try:
+        model = smf.mixedlm(
+            formula,
+            frame,
+            groups=frame["pki_chain_id"],
+            re_formula="1",
+        )
+    except Exception as exc:
+        return ModelFit(name, "model_error", None, formula, str(exc)), pd.DataFrame()
+
+    result = None
+    messages: list[str] = []
+    for method in ("lbfgs", "powell"):
+        try:
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")
+                candidate = model.fit(method=method, reml=False, maxiter=2000)
+            messages.extend(str(item.message) for item in caught)
+            result = candidate
+            if bool(candidate.converged):
+                break
+        except Exception as exc:
+            messages.append(f"{method}: {exc}")
+    if result is None:
+        fit = ModelFit(name, "model_error", None, formula, " | ".join(messages))
+        return fit, pd.DataFrame()
+
+    status = "ok" if bool(result.converged) else "not_converged"
+    confidence = result.conf_int()
+    rows = []
+    for term in result.fe_params.index:
+        rows.append(
+            {
+                "model": name,
+                "model_status": status,
+                "response": response,
+                "term": term,
+                "coefficient": float(result.params[term]),
+                "standard_error": float(result.bse[term]),
+                "p_value": float(result.pvalues[term]),
+                "ci95_low": float(confidence.loc[term, 0]),
+                "ci95_high": float(confidence.loc[term, 1]),
+                "n": len(frame),
+                "case_count": frame["case_cluster_id"].nunique(),
+                "session_count": frame["session_id"].nunique(),
+                "pki_chain_count": frame["pki_chain_id"].nunique(),
+                "formula": formula,
+            }
+        )
+    fit = ModelFit(name, status, result, formula, " | ".join(messages))
+    return fit, pd.DataFrame(rows)
+
+
+def pareto_ranks(values: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Return non-dominated rank and original dominated-by count."""
+    values = np.asarray(values, dtype=float)
+    ranks = np.zeros(len(values), dtype=int)
+    dominated_by = np.zeros(len(values), dtype=int)
+    for index, point in enumerate(values):
+        dominates_point = np.all(values <= point, axis=1) & np.any(
+            values < point, axis=1
+        )
+        dominated_by[index] = int(dominates_point.sum())
+
+    remaining = np.ones(len(values), dtype=bool)
+    rank = 1
+    while remaining.any():
+        indexes = np.flatnonzero(remaining)
+        current = values[indexes]
+        dominance = np.all(
+            current[:, None, :] <= current[None, :, :], axis=2
+        ) & np.any(current[:, None, :] < current[None, :, :], axis=2)
+        front = indexes[dominance.sum(axis=0) == 0]
+        if not len(front):
+            ranks[indexes] = rank
+            break
+        ranks[front] = rank
+        remaining[front] = False
+        rank += 1
+    return ranks, dominated_by
+
+
+def pareto_frontier(data: pd.DataFrame, quality: pd.DataFrame) -> pd.DataFrame:
+    """Build a multi-objective Pareto table for benchmark configurations."""
+    aggregations = {
+        "kex_group": "first",
+        "pki_chain_id": "first",
+        "pki_kind": "first",
+        "root_sig_alg": "first",
+        "leaf_sig_alg": "first",
+        "raw_handshake_ms": "mean",
+        "handshake_energy_uj": "mean",
+        "client_heap_peak_bytes": "max",
+        "server_chain_bytes": "mean",
+        "session_id": "nunique",
+    }
+    cases = data.groupby("case_id", observed=True).agg(aggregations).reset_index()
+    cases = cases.rename(
+        columns={
+            "raw_handshake_ms": "mean_raw_handshake_ms",
+            "handshake_energy_uj": "mean_handshake_energy_uj",
+            "client_heap_peak_bytes": "max_client_heap_peak_bytes",
+            "server_chain_bytes": "mean_server_chain_bytes",
+            "session_id": "session_count",
+        }
+    )
+
+    if not quality.empty and "reason" in quality:
+        status = quality[quality["reason"].astype(str).str.startswith("status_")]
+        if not status.empty:
+            status = (
+                status.groupby(["case_id", "reason"], observed=True)["count"]
+                .sum()
+                .unstack(fill_value=0)
+            )
+            status["recorded_attempt_count"] = status.sum(axis=1)
+            status["success_count"] = status.get("status_success", 0)
+            status["failure_count"] = (
+                status["recorded_attempt_count"] - status["success_count"]
+            )
+            status["failure_rate"] = status["failure_count"] / status[
+                "recorded_attempt_count"
+            ].replace(0, np.nan)
+            cases = cases.merge(
+                status[
+                    [
+                        "recorded_attempt_count",
+                        "success_count",
+                        "failure_count",
+                        "failure_rate",
+                    ]
+                ],
+                left_on="case_id",
+                right_index=True,
+                how="left",
+            )
+    for field, default in (
+        ("recorded_attempt_count", len(data)),
+        ("success_count", len(data)),
+        ("failure_count", 0),
+        ("failure_rate", 0.0),
+    ):
+        if field not in cases:
+            cases[field] = default
+        cases[field] = cases[field].fillna(default)
+
+    objectives = [
+        "mean_raw_handshake_ms",
+        "mean_handshake_energy_uj",
+        "max_client_heap_peak_bytes",
+        "mean_server_chain_bytes",
+        "failure_rate",
+    ]
+    cases["pareto_status"] = "complete"
+    complete = cases[objectives].notna().all(axis=1)
+    cases.loc[~complete, "pareto_status"] = "incomplete_objectives"
+    cases["pareto_rank"] = np.nan
+    cases["dominated_by_count"] = np.nan
+    cases["distance_to_ideal"] = np.nan
+    cases["pareto_optimal"] = False
+    if complete.any():
+        values = cases.loc[complete, objectives].to_numpy(dtype=float)
+        ranks, dominated_by = pareto_ranks(values)
+        minimum = values.min(axis=0)
+        spread = values.max(axis=0) - minimum
+        spread[spread == 0] = 1.0
+        normalized = (values - minimum) / spread
+        cases.loc[complete, "pareto_rank"] = ranks
+        cases.loc[complete, "dominated_by_count"] = dominated_by
+        cases.loc[complete, "distance_to_ideal"] = np.sqrt(
+            np.square(normalized).sum(axis=1)
+        )
+        cases.loc[complete, "pareto_optimal"] = ranks == 1
+    return cases.sort_values(
+        ["pareto_rank", "distance_to_ideal", "case_id"], na_position="last"
+    ).reset_index(drop=True)
 
 
 def add_outlier_flags(data: pd.DataFrame) -> pd.DataFrame:
@@ -919,6 +1538,213 @@ def save_frame(frame: pd.DataFrame, path: Path) -> None:
     frame.to_csv(path, index=False, quoting=csv.QUOTE_MINIMAL)
 
 
+def plot_between_within_correlations(
+    correlations: pd.DataFrame,
+    output: Path,
+) -> None:
+    """Plot pooled, between-case, and within-case coefficients side by side."""
+    figure, axes = plt.subplots(1, 2, figsize=(17, 7), sharey=True)
+    level_order = ("pooled", "between_case", "within_case")
+    colors = {
+        "pooled": "#33658a",
+        "between_case": "#f6ae2d",
+        "within_case": "#2f855a",
+    }
+    analyses = list(dict.fromkeys(correlations["analysis"].astype(str)))
+    positions = np.arange(len(analyses), dtype=float)
+    offsets = np.linspace(-0.22, 0.22, len(level_order))
+    for axis, method in zip(axes, ("pearson", "spearman"), strict=True):
+        subset = correlations[correlations["method"] == method]
+        for offset, level in zip(offsets, level_order, strict=True):
+            rows = subset[subset["level"] == level].set_index("analysis")
+            coefficients = np.asarray(
+                [rows.at[name, "coefficient"] if name in rows.index else np.nan for name in analyses],
+                dtype=float,
+            )
+            lows = np.asarray(
+                [rows.at[name, "ci95_low"] if name in rows.index else np.nan for name in analyses],
+                dtype=float,
+            )
+            highs = np.asarray(
+                [rows.at[name, "ci95_high"] if name in rows.index else np.nan for name in analyses],
+                dtype=float,
+            )
+            valid = np.isfinite(coefficients)
+            axis.scatter(
+                positions[valid] + offset,
+                coefficients[valid],
+                color=colors[level],
+                label=level.replace("_", " "),
+                zorder=3,
+            )
+            ci_valid = valid & np.isfinite(lows) & np.isfinite(highs)
+            if ci_valid.any():
+                axis.errorbar(
+                    positions[ci_valid] + offset,
+                    coefficients[ci_valid],
+                    yerr=np.vstack(
+                        [
+                            coefficients[ci_valid] - lows[ci_valid],
+                            highs[ci_valid] - coefficients[ci_valid],
+                        ]
+                    ),
+                    fmt="none",
+                    color=colors[level],
+                    capsize=3,
+                    linewidth=1,
+                )
+        axis.axhline(0, color="black", linewidth=1)
+        axis.set_title(method.capitalize())
+        axis.set_xticks(positions, [name.replace("_", " ") for name in analyses])
+        axis.tick_params(axis="x", rotation=35)
+        axis.set_ylim(-1.05, 1.05)
+        axis.legend(frameon=False)
+    axes[0].set_ylabel("Correlation coefficient (95% case-cluster bootstrap CI)")
+    figure.tight_layout()
+    figure.savefig(output)
+    plt.close(figure)
+
+
+def plot_factorial_effects(anova: pd.DataFrame, output: Path) -> None:
+    """Compare KEM, PKI, and interaction effect sizes."""
+    required = {"term", "partial_eta_squared", "response"}
+    if required.issubset(anova.columns):
+        subset = anova[
+            (anova["term"] != "Residual")
+            & pd.to_numeric(
+                anova["partial_eta_squared"], errors="coerce"
+            ).notna()
+        ].copy()
+    else:
+        subset = pd.DataFrame()
+    figure, axis = plt.subplots(figsize=(12, 6))
+    if subset.empty:
+        axis.text(0.5, 0.5, "Factorial model unavailable", ha="center", va="center")
+        axis.axis("off")
+    else:
+        labels = {
+            "C(kex_group)": "KEM",
+            "C(pki_chain_id)": "PKI chain",
+            "C(kex_group):C(pki_chain_id)": "KEM x PKI",
+        }
+        subset["factor"] = subset["term"].map(labels).fillna(subset["term"])
+        subset["response_label"] = subset["response"].map(
+            {
+                "raw_handshake_ms": "Handshake time",
+                "handshake_energy_uj": "Handshake energy",
+            }
+        ).fillna(subset["response"])
+        sns.barplot(
+            data=subset,
+            x="factor",
+            y="partial_eta_squared",
+            hue="response_label",
+            ax=axis,
+            palette="colorblind",
+        )
+        axis.set_xlabel("")
+        axis.set_ylabel("Partial eta squared")
+        axis.legend(title="Response", frameon=False)
+    figure.tight_layout()
+    figure.savefig(output)
+    plt.close(figure)
+
+
+def plot_mechanistic_coefficients(
+    coefficients: pd.DataFrame,
+    output: Path,
+) -> None:
+    """Forest-plot standardized mechanistic effects for time and energy."""
+    subset = coefficients[
+        coefficients.get("term", pd.Series(dtype=str)).astype(str).str.startswith("z_")
+    ].copy()
+    models = list(dict.fromkeys(subset.get("model", pd.Series(dtype=str)).astype(str)))
+    figure, axes = plt.subplots(
+        max(1, len(models)), 1, figsize=(11, max(5, 4.5 * len(models))), squeeze=False
+    )
+    for axis, model_name in zip(axes.flat, models, strict=False):
+        rows = subset[subset["model"] == model_name].sort_values("coefficient")
+        positions = np.arange(len(rows))
+        axis.errorbar(
+            rows["coefficient"],
+            positions,
+            xerr=np.vstack(
+                [
+                    rows["coefficient"] - rows["ci95_low"],
+                    rows["ci95_high"] - rows["coefficient"],
+                ]
+            ),
+            fmt="o",
+            capsize=4,
+        )
+        axis.axvline(0, color="black", linewidth=1)
+        axis.set_yticks(positions, rows["term"].str.removeprefix("z_"))
+        axis.set_title(model_name.replace("_", " "))
+        axis.set_xlabel("Fully standardized coefficient (95% CI)")
+    for axis in axes.flat[len(models):]:
+        axis.axis("off")
+    if not models:
+        axes.flat[0].text(0.5, 0.5, "Mechanistic models unavailable", ha="center")
+        axes.flat[0].axis("off")
+    figure.tight_layout()
+    figure.savefig(output)
+    plt.close(figure)
+
+
+def plot_pareto_frontier(frontier: pd.DataFrame, output: Path) -> None:
+    """Highlight multi-objective Pareto cases in two interpretable projections."""
+    complete = frontier[frontier["pareto_status"] == "complete"].copy()
+    figure, axes = plt.subplots(1, 2, figsize=(16, 6))
+    projections = (
+        (
+            "mean_raw_handshake_ms",
+            "mean_handshake_energy_uj",
+            "Mean handshake time (ms)",
+            "Mean handshake energy (uJ)",
+        ),
+        (
+            "mean_server_chain_bytes",
+            "max_client_heap_peak_bytes",
+            "Mean transmitted certificate chain (bytes)",
+            "Maximum client heap peak (bytes)",
+        ),
+    )
+    for axis, (x_name, y_name, x_label, y_label) in zip(
+        axes, projections, strict=True
+    ):
+        if complete.empty:
+            axis.text(0.5, 0.5, "Pareto objectives unavailable", ha="center")
+            axis.axis("off")
+            continue
+        sns.scatterplot(
+            data=complete,
+            x=x_name,
+            y=y_name,
+            hue="pki_kind",
+            style="pareto_optimal",
+            size="failure_rate",
+            sizes=(35, 160),
+            alpha=0.72,
+            ax=axis,
+        )
+        pareto = complete[complete["pareto_optimal"]]
+        axis.scatter(
+            pareto[x_name],
+            pareto[y_name],
+            facecolors="none",
+            edgecolors="black",
+            linewidths=1.4,
+            s=190,
+            label="Pareto front",
+        )
+        axis.set_xlabel(x_label)
+        axis.set_ylabel(y_label)
+        axis.legend(frameon=False, fontsize=8)
+    figure.tight_layout()
+    figure.savefig(output)
+    plt.close(figure)
+
+
 def plot_correlations(
     data: pd.DataFrame,
     output: Path,
@@ -956,17 +1782,21 @@ def plot_partial_residuals(
     residuals: dict[str, tuple[pd.Series, pd.Series]],
     output: Path,
 ) -> None:
-    figure, axes = plt.subplots(1, 2, figsize=(13, 5))
-    for axis, (name, values) in zip(axes, residuals.items(), strict=False):
-        frame = pd.DataFrame({"signature_residual": values[0], "energy_residual": values[1]})
+    columns = 2
+    rows = max(1, math.ceil(len(residuals) / columns))
+    figure, axes = plt.subplots(
+        rows, columns, figsize=(13, 5 * rows), squeeze=False
+    )
+    for axis, (name, values) in zip(axes.flat, residuals.items(), strict=False):
+        frame = pd.DataFrame({"x_residual": values[0], "y_residual": values[1]})
         sns.regplot(
             data=frame,
-            x="signature_residual",
-            y="energy_residual",
+            x="x_residual",
+            y="y_residual",
             ax=axis,
         )
         axis.set_title(name.replace("_", " "))
-    for axis in axes[len(residuals):]:
+    for axis in axes.flat[len(residuals):]:
         axis.axis("off")
     figure.tight_layout()
     figure.savefig(output)
@@ -1186,6 +2016,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         bootstrap_iterations=args.bootstrap_iterations,
         seed=args.seed,
     )
+    between_within = between_within_correlation_table(
+        data,
+        bootstrap_iterations=args.bootstrap_iterations,
+        seed=args.seed,
+    )
     partial, partial_residuals = partial_correlation_table(
         data,
         bootstrap_iterations=args.bootstrap_iterations,
@@ -1193,6 +2028,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
 
     data["log_handshake_energy_uj"] = np.log(data["handshake_energy_uj"])
+    data["log_raw_handshake_ms"] = np.log(data["raw_handshake_ms"])
     predictors = (
         "signature_time_ms",
         "kem_time_ms",
@@ -1212,6 +2048,64 @@ def main(argv: Sequence[str] | None = None) -> int:
         predictors=predictors,
         standardized=True,
     )
+    time_fit, time_coefficients = fit_mixed_model(
+        data,
+        name="handshake_time_mechanistic",
+        response="log_raw_handshake_ms",
+        predictors=predictors,
+    )
+    time_standardized_fit, time_standardized_coefficients = fit_mixed_model(
+        data,
+        name="handshake_time_mechanistic_standardized",
+        response="log_raw_handshake_ms",
+        predictors=predictors,
+        standardized=True,
+    )
+    mechanistic_coefficients = pd.concat(
+        [
+            primary_coefficients,
+            standardized_coefficients,
+            time_coefficients,
+            time_standardized_coefficients,
+        ],
+        ignore_index=True,
+        sort=False,
+    )
+
+    factorial_fits: list[ModelFit] = []
+    factorial_anova_parts: list[pd.DataFrame] = []
+    factorial_coefficient_parts: list[pd.DataFrame] = []
+    factorial_mixed_fits: list[ModelFit] = []
+    factorial_mixed_parts: list[pd.DataFrame] = []
+    for response, label in (
+        ("raw_handshake_ms", "handshake_time"),
+        ("handshake_energy_uj", "handshake_energy"),
+    ):
+        factorial_fit, anova, coefficients = fit_factorial_model(
+            data,
+            name=f"{label}_kem_x_pki",
+            response=response,
+        )
+        factorial_fits.append(factorial_fit)
+        factorial_anova_parts.append(anova)
+        factorial_coefficient_parts.append(coefficients)
+        mixed_fit, mixed_coefficients = fit_factorial_mixed_model(
+            data,
+            name=f"{label}_factorial_mixed",
+            response=response,
+        )
+        factorial_mixed_fits.append(mixed_fit)
+        factorial_mixed_parts.append(mixed_coefficients)
+    factorial_anova = pd.concat(
+        factorial_anova_parts, ignore_index=True, sort=False
+    )
+    factorial_coefficients = pd.concat(
+        factorial_coefficient_parts, ignore_index=True, sort=False
+    )
+    factorial_mixed_coefficients = pd.concat(
+        factorial_mixed_parts, ignore_index=True, sort=False
+    )
+    pareto = pareto_frontier(data, quality)
     nist = nist_comparisons(data)
     signature_size = signature_size_analysis(
         data,
@@ -1222,12 +2116,30 @@ def main(argv: Sequence[str] | None = None) -> int:
     save_frame(data, out_dir / "analysis_dataset.csv")
     save_frame(quality, out_dir / "data_quality.csv")
     save_frame(correlations, out_dir / "correlations.csv")
+    save_frame(
+        between_within,
+        out_dir / "between_within_correlations.csv",
+    )
     save_frame(partial, out_dir / "partial_correlations.csv")
     save_frame(primary_coefficients, out_dir / "mixed_model_coefficients.csv")
     save_frame(
         standardized_coefficients,
         out_dir / "standardized_coefficients.csv",
     )
+    save_frame(
+        mechanistic_coefficients,
+        out_dir / "mechanistic_mixed_model_coefficients.csv",
+    )
+    save_frame(factorial_anova, out_dir / "factorial_anova.csv")
+    save_frame(
+        factorial_coefficients,
+        out_dir / "factorial_model_coefficients.csv",
+    )
+    save_frame(
+        factorial_mixed_coefficients,
+        out_dir / "factorial_mixed_model_coefficients.csv",
+    )
+    save_frame(pareto, out_dir / "pareto_frontier.csv")
     save_frame(nist, out_dir / "nist_comparisons.csv")
     save_frame(signature_size, out_dir / "signature_size_overhead.csv")
 
@@ -1242,17 +2154,37 @@ def main(argv: Sequence[str] | None = None) -> int:
         "session_count": int(data["session_id"].nunique()),
         "primary_model_status": primary_fit.status,
         "standardized_model_status": standardized_fit.status,
+        "mechanistic_time_model_status": time_fit.status,
+        "mechanistic_time_standardized_model_status": time_standardized_fit.status,
+        "factorial_model_statuses": {
+            fit.name: fit.status for fit in factorial_fits
+        },
+        "factorial_mixed_model_statuses": {
+            fit.name: fit.status for fit in factorial_mixed_fits
+        },
+        "pareto_front_count": int(pareto["pareto_optimal"].sum()),
     }
     (out_dir / "analysis_manifest.json").write_text(
         json.dumps(manifest, indent=2) + "\n"
     )
     write_diagnostics(
         out_dir / "model_diagnostics.txt",
-        (primary_fit, standardized_fit),
+        (
+            primary_fit,
+            standardized_fit,
+            time_fit,
+            time_standardized_fit,
+            *factorial_fits,
+            *factorial_mixed_fits,
+        ),
         data,
     )
 
     plot_correlations(data, out_dir / f"time_energy_correlations.{extension}")
+    plot_between_within_correlations(
+        between_within,
+        out_dir / f"between_within_correlations.{extension}",
+    )
     plot_partial_residuals(
         partial_residuals,
         out_dir / f"partial_correlation_residuals.{extension}",
@@ -1260,6 +2192,22 @@ def main(argv: Sequence[str] | None = None) -> int:
     plot_standardized_coefficients(
         standardized_coefficients,
         out_dir / f"standardized_coefficients.{extension}",
+    )
+    plot_mechanistic_coefficients(
+        pd.concat(
+            [standardized_coefficients, time_standardized_coefficients],
+            ignore_index=True,
+            sort=False,
+        ),
+        out_dir / f"mechanistic_standardized_coefficients.{extension}",
+    )
+    plot_factorial_effects(
+        factorial_anova,
+        out_dir / f"factorial_effect_sizes.{extension}",
+    )
+    plot_pareto_frontier(
+        pareto,
+        out_dir / f"pareto_frontier.{extension}",
     )
     plot_nist(data, out_dir / f"nist_time_energy.{extension}")
     plot_signature_size(
@@ -1277,6 +2225,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     print(f"sessions={data['session_id'].nunique()}")
     print(f"primary_model_status={primary_fit.status}")
     print(f"standardized_model_status={standardized_fit.status}")
+    print(f"mechanistic_time_model_status={time_fit.status}")
+    print(
+        "factorial_model_statuses="
+        + ",".join(f"{fit.name}:{fit.status}" for fit in factorial_fits)
+    )
+    print(
+        "factorial_mixed_model_statuses="
+        + ",".join(f"{fit.name}:{fit.status}" for fit in factorial_mixed_fits)
+    )
+    print(f"pareto_front_count={int(pareto['pareto_optimal'].sum())}")
     print(f"output={out_dir}")
     return 0
 

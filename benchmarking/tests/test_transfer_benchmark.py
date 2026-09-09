@@ -20,7 +20,7 @@ from benchmarklib.transfer import (  # noqa: E402
     payload_sha256,
     timeout_for_payload,
 )
-from run_benchmarks import parse_args  # noqa: E402
+from run_benchmarks import parse_args, timeout_for_transfer_round  # noqa: E402
 
 
 class TransferBenchmarkTests(unittest.TestCase):
@@ -56,7 +56,7 @@ class TransferBenchmarkTests(unittest.TestCase):
         self.assertEqual(len(rounds), 2)
         self.assertEqual(
             sorted((item.case_id, len(item.operations)) for item in rounds),
-            [("case-a", 18), ("case-b", 12)],
+            [("case-a", 36), ("case-b", 24)],
         )
         for item in rounds:
             iterations = 3 if item.case_id == "case-a" else 2
@@ -78,7 +78,7 @@ class TransferBenchmarkTests(unittest.TestCase):
 
     def test_every_round_contains_each_size_and_direction_once(self) -> None:
         operations = operations_for_round(123, "case-a", 1)
-        self.assertEqual(len(operations), 6)
+        self.assertEqual(len(operations), 12)
         self.assertEqual(
             {(item.direction, item.payload_bytes) for item in operations},
             {
@@ -103,22 +103,32 @@ class TransferBenchmarkTests(unittest.TestCase):
                 )
                 self.assertEqual(payload_slice(seed, offset, size), expected)
 
-    def test_mqtt_remaining_length_supports_16_kib(self) -> None:
-        encoded = encode_remaining_length(16 * 1024 + 21)
+    def test_mqtt_remaining_length_supports_64_kib(self) -> None:
+        encoded = encode_remaining_length(64 * 1024 + 21)
         value = 0
         multiplier = 1
         for digit in encoded:
             value += (digit & 0x7F) * multiplier
             multiplier *= 128
-        self.assertEqual(value, 16 * 1024 + 21)
-        header = mqtt_publish_header("bench/down", 7, 16 * 1024)
+        self.assertEqual(value, 64 * 1024 + 21)
+        header = mqtt_publish_header("bench/down", 7, 64 * 1024)
         self.assertEqual(header[0], 0x32)
         self.assertLess(len(header), 32)
 
     def test_transfer_payloads_and_deadlines(self) -> None:
-        self.assertEqual(PAYLOAD_SIZES, (128, 1024, 16 * 1024))
+        self.assertEqual(
+            PAYLOAD_SIZES,
+            (128, 1024, 8 * 1024, 16 * 1024, 32 * 1024, 64 * 1024),
+        )
         for size in PAYLOAD_SIZES:
             self.assertEqual(timeout_for_payload(size), 30.0)
+
+    def test_large_transfer_round_has_a_bounded_deadline(self) -> None:
+        operations = build_transfer_rounds(
+            [{"case_id": "case-a", "iterations": "10"}], seed=123
+        )[0].operations
+        self.assertEqual(len(operations), 120)
+        self.assertEqual(timeout_for_transfer_round({}, operations, None), 600.0)
 
 
 if __name__ == "__main__":

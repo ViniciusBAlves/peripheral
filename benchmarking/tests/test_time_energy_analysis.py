@@ -16,10 +16,14 @@ sys.path.insert(0, str(ROOT / "graphic"))
 from analyze_time_energy import (
     add_power_and_edp_metrics,
     benjamini_hochberg,
+    between_within_correlation_table,
     categorical_nist_model,
     cluster_bootstrap_ci,
+    fast_cluster_correlation_ci,
+    fit_factorial_model,
     fit_mixed_model,
     load_attempt_data,
+    pareto_ranks,
     partial_coefficient,
     safe_correlation,
 )
@@ -47,6 +51,7 @@ class TimeEnergyAnalysisTests(unittest.TestCase):
 
         self.assertEqual(len(data), 2)
         self.assertEqual(data["session_id"].nunique(), 2)
+        self.assertEqual(data["case_cluster_id"].nunique(), 2)
         self.assertEqual(set(data["case_id"]), {"case_a", "case_b"})
         total = quality[
             (quality["reason"] == "accepted_attempts")
@@ -120,6 +125,103 @@ class TimeEnergyAnalysisTests(unittest.TestCase):
         self.assertGreater(valid, 90)
         self.assertAlmostEqual(low, 1.0)
         self.assertAlmostEqual(high, 1.0)
+
+    def test_moment_bootstrap_matches_perfect_clustered_correlation(self) -> None:
+        frame = pd.DataFrame(
+            {
+                "case_cluster_id": np.repeat([f"case_{i}" for i in range(8)], 5),
+                "x": np.arange(40, dtype=float),
+            }
+        )
+        frame["y"] = 3 * frame["x"] - 7
+        low, high, valid = fast_cluster_correlation_ci(
+            frame,
+            "x",
+            "y",
+            "pearson",
+            "pooled",
+            iterations=100,
+            rng=np.random.default_rng(123),
+            cluster_column="case_cluster_id",
+        )
+        self.assertEqual(valid, 100)
+        self.assertAlmostEqual(low, 1.0)
+        self.assertAlmostEqual(high, 1.0)
+
+    def test_between_within_decomposition_separates_case_effect(self) -> None:
+        rng = np.random.default_rng(29)
+        rows = []
+        for case_index in range(12):
+            for attempt in range(80):
+                rows.append(
+                    {
+                        "case_cluster_id": f"run::case_{case_index}",
+                        "raw_handshake_ms": 100 * case_index + rng.normal(0, 5),
+                        "handshake_energy_uj": 200 * case_index + rng.normal(0, 5),
+                    }
+                )
+        frame = pd.DataFrame(rows)
+        for _, x_name, y_name in (
+            ("kem", "kem_time_ms", "client_kem_energy_uj"),
+            ("sig", "signature_time_ms", "client_signature_energy_uj"),
+            ("total", "end_to_end_ms", "total_execution_energy_uj"),
+            ("size", "sig_signature_bytes", "communication_overhead_ms"),
+        ):
+            frame[x_name] = frame["raw_handshake_ms"]
+            frame[y_name] = frame["handshake_energy_uj"]
+        result = between_within_correlation_table(
+            frame, bootstrap_iterations=0, seed=123
+        )
+        rows = result[
+            (result["analysis"] == "handshake_time_energy")
+            & (result["method"] == "pearson")
+        ].set_index("level")
+        self.assertGreater(rows.at["between_case", "coefficient"], 0.99)
+        self.assertLess(abs(rows.at["within_case", "coefficient"]), 0.1)
+
+    def test_factorial_model_recovers_kem_and_pki_effects(self) -> None:
+        rng = np.random.default_rng(31)
+        rows = []
+        for kem_index, kem in enumerate(("k1", "k2", "k3")):
+            for pki_index, pki in enumerate(("p1", "p2", "p3")):
+                case = f"{kem}__{pki}"
+                for session in range(5):
+                    response = math.exp(
+                        1.0
+                        + 0.35 * kem_index
+                        + 0.25 * pki_index
+                        + rng.normal(0, 0.015)
+                    )
+                    rows.append(
+                        {
+                            "run_id": "run",
+                            "case_cluster_id": f"run::{case}",
+                            "case_id": case,
+                            "session_id": f"run::{case}::{session}",
+                            "kex_group": kem,
+                            "pki_chain_id": pki,
+                            "pki_kind": "synthetic",
+                            "root_sig_alg": pki,
+                            "leaf_sig_alg": pki,
+                            "response": response,
+                        }
+                    )
+        fit, anova, coefficients = fit_factorial_model(
+            pd.DataFrame(rows), name="synthetic_factorial", response="response"
+        )
+        self.assertEqual(fit.status, "ok")
+        self.assertFalse(coefficients.empty)
+        terms = anova.set_index("term")
+        self.assertLess(terms.at["C(kex_group)", "p_value"], 0.001)
+        self.assertLess(terms.at["C(pki_chain_id)", "p_value"], 0.001)
+
+    def test_pareto_rank_marks_dominated_configuration(self) -> None:
+        ranks, dominated_by = pareto_ranks(
+            np.asarray([[1.0, 4.0], [2.0, 2.0], [4.0, 1.0], [3.0, 3.0]])
+        )
+        self.assertEqual(list(ranks[:3]), [1, 1, 1])
+        self.assertEqual(ranks[3], 2)
+        self.assertGreaterEqual(dominated_by[3], 1)
 
     def test_mixed_model_recovers_positive_standardized_effects(self) -> None:
         rng = np.random.default_rng(23)

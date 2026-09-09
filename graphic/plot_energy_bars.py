@@ -5,11 +5,13 @@ from __future__ import annotations
 
 import argparse
 import csv
+import gzip
 import statistics
 from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
+from matplotlib.patches import Ellipse
 
 from plot_tls_handshake_bars import (
     HEATMAP_CMAP,
@@ -17,6 +19,9 @@ from plot_tls_handshake_bars import (
     case_category,
     heatmap_axes_by_descending_mean,
     kem_security_level,
+    pki_category,
+    pki_signature_label,
+    scatter_certificate_algorithm,
     signature_security_level,
 )
 
@@ -85,6 +90,7 @@ def load_rows(run_dir: Path) -> list[dict[str, str]]:
         result["case_id"] = attempts_path.parent.name.split("_", 1)[-1]
         for output, input_field in (
             ("mean_handshake_energy_uj", "handshake_energy_uj"),
+            ("mean_handshake_duration_ms", "handshake_duration_ms"),
             ("mean_client_kem_energy_uj", "client_kem_energy_uj"),
             ("mean_client_signature_energy_uj", "client_signature_energy_uj"),
         ):
@@ -143,6 +149,23 @@ def add_energy_confidence_intervals(
             if ci is not None:
                 target[f"ci_{field}"] = f"{ci:.6f}"
 
+        # Energy-delay product is calculated per attempt before aggregation:
+        # (uJ / 1000) * (ms / 1000) = mJ s.
+        edp_values = []
+        for attempt in attempts:
+            if attempt.get("status") != "success" or attempt.get("warmup") == "1":
+                continue
+            energy_uj = number(attempt, "handshake_energy_uj")
+            duration_ms = number(attempt, "handshake_duration_ms")
+            if energy_uj is not None and duration_ms is not None:
+                if energy_uj > 0.0 and duration_ms > 0.0:
+                    edp_values.append((energy_uj / 1000.0) * (duration_ms / 1000.0))
+        if edp_values:
+            target["mean_handshake_edp_mj_s"] = f"{statistics.mean(edp_values):.9f}"
+            ci = confidence_half_width(edp_values)
+            if ci is not None:
+                target["ci_handshake_edp_mj_s"] = f"{ci:.9f}"
+
 
 def handshake_energy_components(row: dict[str, str]) -> tuple[float, float, float]:
     """Return disjoint energy components whose sum is total handshake energy."""
@@ -161,24 +184,160 @@ def handshake_energy_components(row: dict[str, str]) -> tuple[float, float, floa
     return kem / 1000.0, signature / 1000.0, remaining / 1000.0
 
 
+def plot_energy_scatter(
+    rows: list[dict[str, str]], output: Path, run_id: str, pki: str,
+    color_by_certificate: dict[str, object], *, power: bool,
+) -> int:
+    """Plot one min/max range ellipse per certificate across all KEMs."""
+    points: list[tuple[float, float, str, str]] = []
+    for row in rows:
+        duration_ms = number(row, "mean_handshake_duration_ms")
+        energy_uj = number(row, "mean_handshake_energy_uj")
+        if not duration_ms or energy_uj is None or energy_uj <= 0.0:
+            continue
+        y_value = energy_uj / duration_ms if power else energy_uj / 1000.0
+        certificate = scatter_certificate_algorithm(row)
+        points.append((duration_ms, y_value, certificate, row.get("case_id", "")))
+
+    if not points:
+        print("warning: no valid powered handshake points found for scatter plot")
+        return 0
+
+    certificates = sorted({point[2] for point in points})
+    fig, ax = plt.subplots(figsize=(11.5, 7.5), constrained_layout=True)
+    for certificate in certificates:
+        selected = [point for point in points if point[2] == certificate]
+        if not selected:
+            continue
+        x_values = [point[0] for point in selected]
+        y_values = [point[1] for point in selected]
+        x_min, x_max = min(x_values), max(x_values)
+        y_min, y_max = min(y_values), max(y_values)
+        color = color_by_certificate[certificate]
+        ellipse = Ellipse(
+            ((x_min + x_max) / 2.0, (y_min + y_max) / 2.0),
+            width=x_max - x_min,
+            height=y_max - y_min,
+            facecolor=(*color[:3], 0.32),
+            edgecolor=color,
+            linewidth=1.4,
+            label=certificate,
+        )
+        ax.add_patch(ellipse)
+        ax.update_datalim(((x_min, y_min), (x_max, y_max)))
+    ax.autoscale_view()
+    ax.set_title(
+        f"Mean handshake power vs duration ({pki.capitalize()} PKI) - {run_id}"
+        if power else
+        f"Handshake energy vs duration ({pki.capitalize()} PKI) - {run_id}"
+    )
+    ax.set_xlabel("Mean TLS handshake duration (ms)")
+    ax.set_ylabel("Mean handshake power (mW)" if power else "Mean handshake energy (mJ)")
+    ax.grid(linestyle=":", alpha=0.35)
+    ax.legend(title="Root certificate algorithm", fontsize=7, ncol=2)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(output, dpi=180)
+    plt.close(fig)
+    return len(certificates)
+
+
+def resolve_trace_case(run_dir: Path, selector: str) -> Path:
+    candidates = [
+        path for path in sorted((run_dir / "cases").iterdir())
+        if path.is_dir()
+        and (path.name == selector or path.name.split("_", 1)[-1] == selector
+             or selector.lower() in path.name.lower())
+    ]
+    if len(candidates) != 1:
+        names = ", ".join(path.name for path in candidates) or "none"
+        raise ValueError(
+            f"Power-trace case selector must match exactly one case; matched: {names}"
+        )
+    return candidates[0]
+
+
+def plot_power_trace(
+    run_dir: Path, selector: str, attempt: int, output: Path,
+) -> Path:
+    """Plot current and the raw D7-D4 GPIO marker levels for one attempt."""
+    case_dir = resolve_trace_case(run_dir, selector)
+    trace_path = case_dir / f"power_trace_{attempt:03d}.csv.gz"
+    if not trace_path.exists():
+        raise FileNotFoundError(f"Power trace not found: {trace_path}")
+
+    times: list[float] = []
+    currents_ma: list[float] = []
+    masks: list[int] = []
+    with gzip.open(trace_path, "rt", newline="") as stream:
+        for row in csv.DictReader(stream):
+            times.append(float(row["time_s"]))
+            currents_ma.append(float(row["current_ua"]) / 1000.0)
+            masks.append(int(row["digital_mask"]))
+    if not times:
+        raise ValueError(f"Power trace is empty: {trace_path}")
+
+    # Limit the view to the measured execution window plus a small context pad.
+    active = [index for index, mask in enumerate(masks) if mask & (1 << 7)]
+    if active:
+        pad = max(2, int((active[-1] - active[0] + 1) * 0.05))
+        start = max(0, active[0] - pad)
+        end = min(len(times), active[-1] + pad + 1)
+        times, currents_ma, masks = times[start:end], currents_ma[start:end], masks[start:end]
+    origin = times[0]
+    elapsed_ms = [(value - origin) * 1000.0 for value in times]
+
+    marker_specs = (
+        (7, "D7 / P0.03  Total execution", "#264653"),
+        (6, "D6 / P0.04  TLS handshake", "#e76f51"),
+        (5, "D5 / P0.28  KEX marker", "#2a9d8f"),
+        (4, "D4 / P0.29  Signature / classical-KEX", "#e9c46a"),
+    )
+    fig, axes = plt.subplots(
+        5, 1, sharex=True, figsize=(13, 8.5),
+        gridspec_kw={"height_ratios": [4, 0.65, 0.65, 0.65, 0.65]},
+        constrained_layout=True,
+    )
+    axes[0].plot(elapsed_ms, currents_ma, color="#202020", linewidth=0.85)
+    axes[0].set_ylabel("Current (mA)")
+    axes[0].grid(linestyle=":", alpha=0.3)
+    axes[0].set_title(
+        f"PPK2 power trace - {case_dir.name.split('_', 1)[-1]} - attempt {attempt}"
+    )
+    for axis, (bit, label, color) in zip(axes[1:], marker_specs):
+        levels = [1 if mask & (1 << bit) else 0 for mask in masks]
+        axis.step(elapsed_ms, levels, where="post", color=color, linewidth=1.4)
+        axis.fill_between(elapsed_ms, levels, step="post", color=color, alpha=0.18)
+        axis.set_ylim(-0.15, 1.15)
+        axis.set_yticks([0, 1])
+        axis.set_ylabel(label, rotation=0, ha="right", va="center", fontsize=8)
+        axis.grid(axis="x", linestyle=":", alpha=0.25)
+    axes[-1].set_xlabel("Elapsed time in displayed trace (ms)")
+    output.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(output, dpi=180)
+    plt.close(fig)
+    return trace_path
+
+
 def plot_heatmap(
     rows: list[dict[str, str]],
     metric: str,
     output: Path,
     run_id: str,
     title: str,
+    divisor: float = 1000.0,
+    colorbar_label: str = "Mean energy (mJ); avg ± 95% CI",
 ) -> int:
     values_by_pair: dict[tuple[str, str], list[float]] = {}
     ci_by_pair: dict[tuple[str, str], float] = {}
     for row in rows:
         kem = row.get("kex_group", "")
-        signature = row.get("cert_sig_alg", "")
+        signature = pki_signature_label(row)
         value = number(row, metric)
         if kem and signature and value is not None:
-            values_by_pair.setdefault((kem, signature), []).append(value / 1000.0)
+            values_by_pair.setdefault((kem, signature), []).append(value / divisor)
             ci = number(row, f"ci_{metric.removeprefix('mean_')}")
             if ci is not None:
-                ci_by_pair[(kem, signature)] = ci / 1000.0
+                ci_by_pair[(kem, signature)] = ci / divisor
     if not values_by_pair:
         print(f"warning: no values found for {metric}")
         return 0
@@ -210,7 +369,7 @@ def plot_heatmap(
     ax.set_yticks(range(len(signatures)))
     kem_levels = {row.get("kex_group", ""): kem_security_level(row) for row in rows}
     sig_levels = {
-        row.get("cert_sig_alg", ""): signature_security_level(row)
+        pki_signature_label(row): signature_security_level(row)
         for row in rows
     }
     ax.set_xticklabels(
@@ -238,14 +397,15 @@ def plot_heatmap(
                 color="black",
             )
     colorbar = fig.colorbar(image, ax=ax)
-    colorbar.set_label("Mean energy (mJ); avg ± 95% CI")
+    colorbar.set_label(colorbar_label)
     fig.savefig(output, dpi=180)
     plt.close(fig)
     return len(values_by_pair)
 
 
 def plot(
-    rows: list[dict[str, str]], output: Path, run_id: str, category: str
+    rows: list[dict[str, str]], output: Path, run_id: str, category: str,
+    pki: str,
 ) -> int:
     rows = sorted(
         rows,
@@ -259,7 +419,7 @@ def plot(
 
     labels = [
         f"{algorithm_label(row.get('kex_group', ''), nist_level(row, 'kex_nist_level'))}\n"
-        f"{algorithm_label(row.get('cert_sig_alg', ''), nist_level(row, 'sig_nist_level'))}"
+        f"{algorithm_label(pki_signature_label(row), nist_level(row, 'sig_nist_level'))}"
         for row in rows
     ]
     # Source CSV values are in microjoules. The three disjoint components are
@@ -326,7 +486,8 @@ def plot(
         "mixed": "Mixed / hybrid",
     }
     ax.set_title(
-        f"Energy consumption by TLS case ({category_titles[category]}) - {run_id}"
+        f"Energy consumption by TLS case ({category_titles[category]}, "
+        f"{pki.capitalize()} PKI) - {run_id}"
     )
     ax.set_ylabel("Mean TLS handshake energy (mJ), with 95% CI")
     ax.set_xlabel("KEM / certificate signature")
@@ -361,43 +522,110 @@ def main() -> int:
         action="store_true",
         help="also generate three KEM × signature energy heatmaps",
     )
+    parser.add_argument(
+        "--power-trace-case",
+        metavar="CASE_ID",
+        help="also plot one case's PPK2 current trace and D7-D4 GPIO markers",
+    )
+    parser.add_argument(
+        "--power-trace-attempt",
+        type=int,
+        default=1,
+        help="attempt number used by --power-trace-case (default: 1)",
+    )
     args = parser.parse_args()
     run_dir = resolve_run_dir(args.run_dir)
     rows = load_rows(run_dir)
     extension = "png" if args.generate_png else "pdf"
     out_dir = args.out_dir or ROOT / "graphic" / "out" / run_dir.name
-    categories = {
-        "pqc_only": [row for row in rows if case_category(row) == "pqc_only"],
-        "classic_only": [
-            row for row in rows if case_category(row) == "classic_only"
-        ],
-        "mixed": [row for row in rows if case_category(row) == "mixed"],
+    pki_groups = {
+        pki: [row for row in rows if pki_category(row) == pki]
+        for pki in ("homogeneous", "heterogeneous")
     }
     total = 0
-    for category, category_rows in categories.items():
-        if not category_rows:
-            continue
-        output = out_dir / f"energy_handshake_kem_signature_{category}.{extension}"
-        count = plot(category_rows, output, run_dir.name, category)
-        total += count
-        print(f"{category}_cases={count}")
+    for pki, pki_rows in pki_groups.items():
+        for category in ("pqc_only", "classic_only", "mixed"):
+            category_rows = [
+                row for row in pki_rows if case_category(row) == category
+            ]
+            if not category_rows:
+                continue
+            output = out_dir / (
+                f"energy_handshake_kem_signature_{category}_{pki}.{extension}"
+            )
+            count = plot(category_rows, output, run_dir.name, category, pki)
+            total += count
+            print(f"{category}_{pki}_cases={count}")
     if args.heatmap:
         heatmaps = (
-            ("mean_handshake_energy_uj", "Total TLS handshake energy", "handshake"),
-            ("mean_client_kem_energy_uj", "Client KEM energy", "client_kem"),
+            ("mean_handshake_energy_uj", "Total TLS handshake energy", "handshake", 1000.0, "Mean energy (mJ); avg ± 95% CI"),
+            ("mean_client_kem_energy_uj", "Client KEM energy", "client_kem", 1000.0, "Mean energy (mJ); avg ± 95% CI"),
             (
                 "mean_client_signature_energy_uj",
                 "Client digital-signature energy",
                 "client_signature",
+                1000.0,
+                "Mean energy (mJ); avg ± 95% CI",
+            ),
+            (
+                "mean_handshake_edp_mj_s",
+                "TLS handshake energy-delay product",
+                "handshake_edp",
+                1.0,
+                "Mean EDP (mJ s); avg ± 95% CI",
             ),
         )
-        for metric, title, suffix in heatmaps:
-            cells = plot_heatmap(
-                rows, metric,
-                out_dir / f"energy_heatmap_{suffix}.{extension}",
-                run_dir.name, title,
+        for pki, pki_rows in pki_groups.items():
+            if not pki_rows:
+                continue
+            for metric, title, suffix, divisor, colorbar_label in heatmaps:
+                cells = plot_heatmap(
+                    pki_rows, metric,
+                    out_dir / f"energy_heatmap_{suffix}_{pki}.{extension}",
+                    run_dir.name, f"{title} ({pki.capitalize()} PKI)",
+                    divisor, colorbar_label,
+                )
+                print(f"{suffix}_{pki}_energy_heatmap_cells={cells}")
+
+    scatter_outputs = (
+        (False, "handshake_energy_vs_duration"),
+        (True, "handshake_mean_power_vs_duration"),
+    )
+    certificates = sorted({
+        scatter_certificate_algorithm(row) for row in rows
+    })
+    certificate_colors = {
+        certificate: color for certificate, color in zip(
+            certificates,
+            plt.get_cmap("turbo")(
+                np.linspace(0.03, 0.97, max(1, len(certificates)))
+            ),
+        )
+    }
+    for pki, pki_rows in pki_groups.items():
+        if not pki_rows:
+            continue
+        for power, stem in scatter_outputs:
+            count = plot_energy_scatter(
+                pki_rows,
+                out_dir / f"{stem}_{pki}.{extension}",
+                run_dir.name,
+                pki,
+                certificate_colors,
+                power=power,
             )
-            print(f"{suffix}_energy_heatmap_cells={cells}")
+            print(f"{stem}_{pki}_ellipses={count}")
+
+    if args.power_trace_case:
+        trace_output = out_dir / (
+            f"power_trace_{args.power_trace_case}_attempt_"
+            f"{args.power_trace_attempt:03d}.{extension}"
+        )
+        trace_source = plot_power_trace(
+            run_dir, args.power_trace_case, args.power_trace_attempt, trace_output,
+        )
+        print(f"power_trace_source={trace_source}")
+        print(f"power_trace_plot={trace_output}")
     print(f"format={extension}")
     print(f"cases={total}")
     print(f"out_dir={out_dir}")
