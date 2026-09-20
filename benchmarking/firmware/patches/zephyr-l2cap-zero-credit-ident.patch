@@ -1,0 +1,19 @@
+diff --git a/subsys/bluetooth/host/l2cap.c b/subsys/bluetooth/host/l2cap.c
+--- a/subsys/bluetooth/host/l2cap.c
++++ b/subsys/bluetooth/host/l2cap.c
+@@ -2324,7 +2324,14 @@ static int l2cap_recv(struct bt_l2cap_chan *chan, struct net_buf *buf)
+ 		return 0;
+ 	}
+ 
+-	if (!hdr->ident) {
++	/*
++	 * Linux kernels without the LE credit identifier release fix eventually
++	 * exhaust their 254 signaling identifiers and send LE credits with ident
++	 * zero. LE credits have no response and Zephyr does not use their ident,
++	 * so accepting only this PDU keeps long CoC transfers moving without
++	 * weakening validation for request/response signaling commands.
++	 */
++	if (!hdr->ident && hdr->code != BT_L2CAP_LE_CREDITS) {
+ 		LOG_ERR("Invalid ident value in L2CAP PDU");
+ 		return 0;
+ 	}

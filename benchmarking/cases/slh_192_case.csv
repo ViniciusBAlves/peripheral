@@ -1,0 +1,3 @@
+case_id,enabled,kex_group,kex_family,kex_nist_level,kex_public_key_bytes,kex_ciphertext_bytes,kex_shared_secret_bytes,cert_sig_alg,sig_family,sig_nist_level,sig_public_key_bytes,sig_private_key_bytes,sig_signature_bytes,certificate_verify_alg,iterations,warmup_iterations,expected_support,notes
+x25519mlkem768__slh_dsa_shake_192s,1,X25519MLKEM768,pqc,3,1216,1120,64,SLH-DSA-SHAKE-192s,pqc,3,48,96,16224,ECDSA-P-384,1,0,required,SLH-DSA signs the chain; TLS CertificateVerify uses ECDSA
+x25519mlkem768__slh_dsa_shake_128s,1,X25519MLKEM768,pqc,3,1216,1120,64,SLH-DSA-SHAKE-128s,pqc,1,32,64,7856,ECDSA-P-256,1,0,required,SLH-DSA signs the chain; TLS CertificateVerify uses ECDSA

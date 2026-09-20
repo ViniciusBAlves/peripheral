@@ -1,0 +1,10 @@
+case_id,enabled,kex_group
+kembench__ecdhe_p_256,1,ECDHE-P-256
+kembench__ecdhe_p_384,1,ECDHE-P-384
+kembench__ecdhe_p_521,1,ECDHE-P-521
+kembench__mlkem512,1,MLKEM512
+kembench__mlkem768,1,MLKEM768
+kembench__mlkem1024,1,MLKEM1024
+kembench__secp256r1mlkem768,1,SecP256r1MLKEM768
+kembench__x25519mlkem768,1,X25519MLKEM768
+kembench__secp384r1mlkem1024,1,SecP384r1MLKEM1024
